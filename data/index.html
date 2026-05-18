@@ -121,6 +121,30 @@
                         transition: width .2s; }
   .repo { margin-top: 1em; font-size: .85em; color: var(--mute); }
   .repo a { color: var(--accent); }
+
+  .automode-bar {
+    display: flex; align-items: center; gap: 1em; flex-wrap: wrap;
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: .7em 1em; margin: .8em 0 1em;
+    background: #f0ede4;
+  }
+  .automode-bar.on  { background: #e1f1e5; border-color: #b3d8b3; }
+  .automode-bar.off { background: #f5e8d8; border-color: #d8c8a8; }
+  .automode-bar.running { background: #fdf6c4; border-color: #ecd76f; }
+  .automode-bar .label { font-weight: 600; }
+  .automode-bar .pill  { margin-left: .3em; }
+  .automode-bar .detail { color: var(--mute); font-size: .9em; flex: 1 1 20em; }
+  /* iOS-like switch */
+  .switch { position: relative; display: inline-block; width: 44px; height: 24px; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch .slider { position: absolute; cursor: pointer; inset: 0;
+                    background: #bbb; border-radius: 24px; transition: .2s; }
+  .switch .slider::before { content: ''; position: absolute;
+                            width: 20px; height: 20px; left: 2px; bottom: 2px;
+                            background: #fff; border-radius: 50%; transition: .2s; }
+  .switch input:checked + .slider { background: var(--ok); }
+  .switch input:checked + .slider::before { transform: translateX(20px); }
+  .switch input:disabled + .slider { opacity: .6; cursor: wait; }
 </style>
 </head>
 <body>
@@ -131,6 +155,16 @@
 </div>
 <p class="subline">Local SoundTouch cloud replacement. Discover speakers on the LAN, migrate them, manage presets — all from this page. Source:
   <a href="https://github.com/tostmann/BoseFix32" target="_blank" rel="noopener">github.com/tostmann/BoseFix32</a>.</p>
+
+<div class="automode-bar" id="automode-bar">
+  <span class="label">Auto-Migrate at Boot:</span>
+  <label class="switch" title="Toggles auto-migration on next ESP reboot">
+    <input type="checkbox" id="am-toggle" onchange="toggleAutoMode(this.checked)">
+    <span class="slider"></span>
+  </label>
+  <span class="pill" id="am-pill">…</span>
+  <span class="detail" id="am-detail">loading…</span>
+</div>
 
 <div class="toolbar">
   <button class="primary" onclick="discover()">↻ Discover speakers (LAN scan)</button>
@@ -303,18 +337,63 @@ async function loadStatus() {
                 ? `open · ${s.wifi.improv_window_s|0}s left`
                 : 'closed',
               s.wifi.improv_active ? 'ok' : ''),
-      sysCell('WPS',
-              s.wifi.wps_active
-                ? `armed · ${s.wifi.wps_window_s|0}s left — press WPS on router`
-                : 'closed',
-              s.wifi.wps_active ? 'ok' : ''),
       sysCell('Captive AP',
               s.wifi.captive_active
-                ? `open · ${s.wifi.captive_window_s|0}s left — connect phone to BoseFix32-…`
+                ? `armed · ${s.wifi.captive_window_s|0}s left — join open BoseFix32-…`
                 : 'closed',
               s.wifi.captive_active ? 'ok' : ''),
     ].join('');
   } catch (e) { toast('Status: '+e.message, 'error'); }
+  // Auto-Mode-Bar parallel refreshen
+  loadAutoMode();
+}
+
+// ---- Auto-Mode toggle ----
+async function loadAutoMode() {
+  try {
+    const d = await api('/api/auto-mode');
+    const bar    = document.getElementById('automode-bar');
+    const toggle = document.getElementById('am-toggle');
+    const pill   = document.getElementById('am-pill');
+    const detail = document.getElementById('am-detail');
+    toggle.checked  = !!d.config.enabled;
+    toggle.disabled = false;
+    const running = !!d.status.running;
+    bar.classList.toggle('on',      d.config.enabled && !running);
+    bar.classList.toggle('off',    !d.config.enabled && !running);
+    bar.classList.toggle('running', running);
+    pill.className = 'pill ' + (running ? 'stale'
+                              : d.config.enabled ? 'migrated_us' : 'unknown');
+    pill.textContent = running ? 'RUNNING' : (d.config.enabled ? 'ON' : 'OFF');
+    let txt;
+    if (running) {
+      const dev = d.status.current_device || '';
+      txt = `${d.status.state}` + (dev ? ` · ${dev}` : '');
+    } else if (d.status.ran) {
+      const st = d.status;
+      txt = `Last run · ${st.state} · ${st.speakers_migrated}/${st.speakers_eligible} migrated · ` +
+            `${st.slots_normalized} slots (${st.slots_converted} converted, ${st.slots_abandoned} abandoned)`;
+      if (st.last_error) txt += ` · ⚠ ${st.last_error}`;
+    } else if (d.config.enabled) {
+      txt = `Will run on next ESP reboot — discovers + migrates eligible speakers (max ${d.config.max_per_boot}/boot).`;
+    } else {
+      txt = 'Manual mode — use the Migrate buttons per speaker below.';
+    }
+    detail.textContent = txt;
+  } catch (e) { /* silent */ }
+}
+
+async function toggleAutoMode(en) {
+  document.getElementById('am-toggle').disabled = true;
+  try {
+    await api('/api/auto-mode', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({enabled: !!en})
+    });
+    toast(`Auto-Migrate ${en ? 'enabled' : 'disabled'}`, 'success');
+  } catch (e) { toast('Toggle failed: '+e.message, 'error'); }
+  loadAutoMode();
 }
 
 // ---- OTA ----
@@ -388,41 +467,128 @@ function pillForStatus(s, myBase) {
   return `<span class="pill ${cls}">${label}</span>`;
 }
 
+// Diff-basiertes Render: bestehende Cards in-place updaten statt den
+// kompletten Host-innerHTML zu nuken. Wichtig waehrend pollUntilScanDone(),
+// damit nicht jeder 3-s-Tick die Presets neu laedt + Cards flackern.
 function renderSpeakers() {
   const host = document.getElementById('speakers-host');
+  const myBase = STATE.myBase || '';
+
   if (STATE.speakers.length === 0) {
     host.innerHTML = `<div class="speaker"><p style="color:var(--mute)">No speakers known yet. Click "Discover speakers" or "Add manually".</p></div>`;
     return;
   }
-  const myBase = STATE.myBase || '';
-  host.innerHTML = STATE.speakers.map(s => speakerCard(s, myBase)).join('');
-  STATE.speakers.forEach(s => loadPresetsFor(s.device_id));
+
+  // Falls vorher Placeholder-Div drinstand (kein data-device-id), wegputzen.
+  const placeholder = host.querySelector('.speaker:not([data-device-id])');
+  if (placeholder) placeholder.remove();
+
+  // Map: device_id -> bestehendes Card-Element.
+  const existing = new Map();
+  for (const el of host.querySelectorAll('.speaker[data-device-id]')) {
+    existing.set(el.dataset.deviceId, el);
+  }
+
+  const wanted = new Set();
+  for (const s of STATE.speakers) {
+    wanted.add(s.device_id);
+    const prev = existing.get(s.device_id);
+    if (prev) {
+      updateSpeakerCard(prev, s, myBase);
+    } else {
+      // Neu: anhaengen + presets EINMALIG laden.
+      const tmp = document.createElement('div');
+      tmp.innerHTML = speakerCard(s, myBase).trim();
+      host.appendChild(tmp.firstElementChild);
+      loadPresetsFor(s.device_id);
+    }
+  }
+
+  // Reihenfolge anpassen falls Backend sortiert hat.
+  let cursor = host.firstElementChild;
+  for (const s of STATE.speakers) {
+    const card = host.querySelector(`.speaker[data-device-id="${s.device_id}"]`);
+    if (!card) continue;
+    if (card !== cursor) host.insertBefore(card, cursor);
+    cursor = card.nextElementSibling;
+  }
+
+  // Cards die nicht mehr im State sind: weg.
+  for (const [id, el] of existing) {
+    if (!wanted.has(id)) el.remove();
+  }
+}
+
+// In-place Update der mutablen Card-Bestandteile (Status-Pill, Info-Zeile,
+// Cloud-URL-Zeile, Action-Buttons). Presets bleiben unangetastet.
+function updateSpeakerCard(card, s, myBase) {
+  const title = card.querySelector('.speaker-title');
+  if (title) {
+    const want = (s.name || s.device_id);
+    const tn = title.firstChild;
+    if (tn && tn.nodeType === Node.TEXT_NODE && tn.nodeValue.trim() !== want) {
+      tn.nodeValue = want + '  ';
+    }
+    const pill = title.querySelector('.pill');
+    if (pill) {
+      const [cls, label] = classify(s, myBase);
+      pill.className = 'pill ' + cls;
+      pill.textContent = label;
+    }
+  }
+
+  const info = card.querySelector('.speaker-info');
+  if (info) {
+    const line = `${s.model} · ${s.ip} · ${s.device_id} · FW ${(s.firmware||'').substring(0,15)}` +
+                 (s.group_id ? ' · group: '+s.group_id : '');
+    if (info.textContent !== line) info.textContent = line;
+  }
+
+  // Cloud-URL-Zeile kann erscheinen/verschwinden nach Migrate/Revert.
+  let cloudLine = card.querySelector('.speaker-cloud');
+  if (s.cloud_url) {
+    const desired = `cloud URL: ${s.cloud_url}`;
+    if (!cloudLine) {
+      cloudLine = document.createElement('div');
+      cloudLine.className = 'speaker-info speaker-cloud';
+      info && info.parentNode.appendChild(cloudLine);
+    }
+    if (cloudLine.textContent !== desired) {
+      cloudLine.innerHTML = `cloud URL: <code>${esc(s.cloud_url)}</code>`;
+    }
+  } else if (cloudLine) {
+    cloudLine.remove();
+  }
+
+  const actions = card.querySelector('.actions');
+  if (actions) actions.innerHTML = actionButtonsHtml(s);
+}
+
+function actionButtonsHtml(s) {
+  const migrate = s.owned_by_us
+    ? ''
+    : `<button class="primary" onclick="actSpeaker('${s.device_id}','migrate')">→ Migrate</button>`;
+  const revert = (s.owned_by_us || s.status === 'migrated')
+    ? `<button class="danger" onclick="actSpeaker('${s.device_id}','revert')">↩ Revert to original Bose</button>`
+    : '';
+  return migrate + revert +
+    `<button onclick="actSpeaker('${s.device_id}','reboot')">⟲ Reboot</button>` +
+    `<button onclick="actSpeaker('${s.device_id}','refresh')">🔄 Status</button>` +
+    `<button class="danger" onclick="removeSpeaker('${s.device_id}')">✕</button>`;
 }
 
 function speakerCard(s, myBase) {
-  const cloudLine = s.cloud_url ? `<div class="speaker-info">cloud URL: <code>${esc(s.cloud_url)}</code></div>` : '';
-  // Button logic: based on owned_by_us (persistent) rather than transient status.
-  const migrateButton = s.owned_by_us
-    ? '' // already ours — failsafe re-migrates on IP change automatically
-    : `<button class="primary" onclick="actSpeaker('${s.device_id}','migrate')">→ Migrate</button>`;
-  const revertButton = (s.owned_by_us || s.status === 'migrated')
-    ? `<button class="danger" onclick="actSpeaker('${s.device_id}','revert')">↩ Revert to original Bose</button>`
-    : '';
+  const cloudLine = s.cloud_url
+    ? `<div class="speaker-info speaker-cloud">cloud URL: <code>${esc(s.cloud_url)}</code></div>` : '';
   return `
-    <div class="speaker" id="sp-${s.device_id}">
+    <div class="speaker" id="sp-${s.device_id}" data-device-id="${esc(s.device_id)}">
       <div class="speaker-head">
         <div>
           <div class="speaker-title">${esc(s.name || s.device_id)}  ${pillForStatus(s, myBase)}</div>
           <div class="speaker-info">${esc(s.model)} · ${esc(s.ip)} · ${esc(s.device_id)} · FW ${esc((s.firmware||'').substring(0,15))}${s.group_id ? ' · group: '+esc(s.group_id) : ''}</div>
           ${cloudLine}
         </div>
-        <div class="actions">
-          ${migrateButton}
-          ${revertButton}
-          <button onclick="actSpeaker('${s.device_id}','reboot')">⟲ Reboot</button>
-          <button onclick="actSpeaker('${s.device_id}','refresh')">🔄 Status</button>
-          <button class="danger" onclick="removeSpeaker('${s.device_id}')">✕</button>
-        </div>
+        <div class="actions">${actionButtonsHtml(s)}</div>
       </div>
       <div class="presets" id="presets-${s.device_id}">
         <div style="grid-column:1/-1;color:var(--mute);font-size:.85em">Loading presets…</div>

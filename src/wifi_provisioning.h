@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// BoseFix32 — WiFi-Provisionierung via Improv (tostmann/improv-wifi-busware)
+// BoseFix32 — WiFi-Provisionierung via Improv + Captive-Portal
+// (Schwester-Pattern aus ip4knx / TUL KNX-Gateway).
 //
-// Beim Boot (RFNETHM-Pattern, Stand 2026-05-16):
+// Beim Boot:
 //   1. Improv-Window IMMER ab Boot oeffnen — egal ob NVS-Creds da sind.
 //      Idle-basierte Dauer (verlaengert sich bei UART-Aktivitaet):
 //        - Keine NVS-Creds:  120 s seit letzter Activity (volles Erstprovisioning)
@@ -13,11 +14,15 @@
 //   3. WiFi up → return; Improv laeuft im Hintergrund (via wifiProvisioningTick)
 //      bis zum Idle-Window-Ablauf weiter. So kann der User jederzeit nach
 //      Boot neue WLAN-Credentials einspeisen (Router-Wechsel etc.).
-//   4. Kein NVS-Connect → WPS-PBC zusaetzlich aktivieren (120 s — User
-//      drueckt WPS-Knopf am Router, ESP nimmt SSID/PSK direkt vom Router-
-//      Frame), parallel zu Improv. Sobald eine Quelle erfolgreich
-//      provisioniert → connected.
+//   4. Kein NVS-Connect → Captive-Portal (offener AP "BoseFix32-XXYYZZ" +
+//      DNS-Hijack + HTTP-Form) parallel zu Improv arm-en. Sobald eine
+//      Quelle erfolgreich provisioniert → connected.
 //   5. Beide Fenster zu ohne Connect → Restart nach 10 s.
+//
+// WPS wurde bewusst entfernt: esp_wifi_wps_enable() beansprucht den
+// WiFi-Event-Handler exklusiv und konkurriert mit dem Improv-eigenen
+// WiFi.scanNetworks() (Symptom: leere AP-Liste in ESP Web Tools).
+// ip4knx faehrt exakt mit dem Improv+Captive-Pattern und ist stabil.
 #ifndef BOSEFIX32_WIFI_PROVISIONING_H
 #define BOSEFIX32_WIFI_PROVISIONING_H
 
@@ -43,16 +48,16 @@ bool improvIsActive();
 // Verbleibende Sekunden bis das Idle-Window schliesst (0 wenn zu / nicht aktiv).
 uint32_t improvWindowRemainingS();
 
-// WPS-Push-Button-Config — laeuft 120 s ab Aktivierung, automatisch
-// gestartet wenn beim Boot keine NVS-Creds da sind oder der STA-Connect
-// in 20 s nicht zustande kommt.  Captive-Portal laeuft unter den gleichen
-// Bedingungen parallel; siehe `captive_portal.h`.
-bool wpsIsActive();
-uint32_t wpsWindowRemainingS();
-
 // Persistiert Credentials in die gleiche NVS-Schublade die tryConnectFromNVS
 // liest. Wird auch vom Captive-Portal verwendet.
 void persistCreds(const String& ssid, const String& psk);
+
+// Schaltet WiFi-Power-Save komplett ab, dreht TX-Power auf Max und
+// pinned CPU auf die hoechste Frequenz. Wird nach JEDEM erfolgreichen
+// STA-Connect aufgerufen — der Bose-Speaker muss die Cloud-Endpoints
+// jederzeit (auch Stunden spaeter beim Preset-Druck) ohne PS-Latenz
+// erreichen koennen, sonst gibt's gefuehlte Hangs am Speaker.
+void wifiOptimizeForReliability();
 
 } // namespace bosefix
 

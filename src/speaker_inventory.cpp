@@ -250,10 +250,11 @@ void SpeakerInventory::activeScan_() {
         char ip[20];
         snprintf(ip, sizeof(ip), "%d.%d.%d.%d", my[0], my[1], my[2], i);
         Speaker s;
-        // Kurze Timeouts fuer leere IPs: lokales LAN antwortet mit
-        // SYN-ACK oder ARP-no-reply in <50 ms. 150 ms connect / 600 ms read
-        // ergibt im worst case 254 × 150 ≈ 38 s, im average viel weniger.
-        if (probeIp_(ip, s, 150, 600)) {
+        // Moderate Timeouts fuer noch laggy WiFi-Verbindungen (C6/C3 mit
+        // WiFi 6 koennen in der Anfangsphase nach Boot 500 ms+ brauchen
+        // bis SYN-ACK). 300 ms connect / 1200 ms read ergibt im worst
+        // case 254 × 300 ≈ 76 s im Hintergrund-Task.
+        if (probeIp_(ip, s, 300, 1200)) {
             ++found;
             Serial.printf("[inv][scan] %s -> %s (%s)\n",
                           ip, s.name.c_str(), s.model.c_str());
@@ -324,13 +325,23 @@ void SpeakerInventory::refreshMigrationStatus() {
     String myBase = "http://" + WiFi.localIP().toString() + ":" + String(BOSE_HTTP_PORT);
     for (auto& s : speakers_) {
         s.status = detectStatus(s.ip, myBase, &s.cloudUrl);
-        // Auto-Claim: wenn der Speaker zeigt eh schon auf UNS hin, aber wir
-        // ihn noch nicht als ownedByUs markiert haben (Edge-Case nach
-        // Flash-Erase oder NVS-Reset), uebernehmen wir die Hoheit.
+        // Auto-Claim: zeigt eh schon auf UNS, aber ownedByUs noch False
+        // (Edge-Case nach Flash-Erase/NVS-Reset) — uebernehmen wir.
         if (!s.ownedByUs && s.cloudUrl == myBase) {
             Serial.printf("[inv] auto-claim %s (cloudUrl matches our base)\n",
                           s.name.c_str());
             s.ownedByUs = true;
+            continue;
+        }
+        // Auto-Release: zeigt auf eine ANDERE Cloud (anderes ESP oder
+        // streaming.bose.com nach Revert) — wir sind nicht mehr zustaendig.
+        // Verhindert dass ip_failsafe ihn beim naechsten IP-Wechsel
+        // zurueck-claimt und dass das UI ihn faelschlich als unsere
+        // Verantwortung zeigt. cloudUrl leer = Speaker offline -> kein Change.
+        if (s.ownedByUs && s.cloudUrl.length() > 0 && s.cloudUrl != myBase) {
+            Serial.printf("[inv] auto-release %s (cloudUrl=%s != our base %s)\n",
+                          s.name.c_str(), s.cloudUrl.c_str(), myBase.c_str());
+            s.ownedByUs = false;
         }
     }
     saveToNVS();

@@ -26,6 +26,7 @@
 #include "preset_store.h"
 #include "ip_failsafe.h"
 #include "system_health.h"
+#include "auto_mode.h"
 
 static AsyncWebServer boseServer(BOSE_HTTP_PORT);
 static AsyncWebServer uiServer(UI_HTTP_PORT);
@@ -100,6 +101,7 @@ void setup() {
     startBoseServer();
     startUiServer();
     bosefix::healthInit();        // Crash-Counter, Task-WDT, WiFi-/Heap-Watchdog
+    bosefix::startAutoModeTask(); // No-op wenn NVS-Flag auto-mode disabled
 
     Serial.println();
     Serial.printf("[setup] BoseFix32 ready - UI: http://%s.local/\n", MDNS_HOSTNAME);

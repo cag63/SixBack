@@ -7,7 +7,6 @@
 #include <WiFi.h>
 #include <Preferences.h>
 #include "ImprovWiFiLibrary.h"
-#include <esp_wps.h>
 #include <esp_wifi.h>
 
 namespace bosefix {
@@ -31,15 +30,11 @@ uint32_t    improvStartMs         = 0;
 uint32_t    improvLastActivityMs  = 0;
 uint32_t    improvIdleMs          = IMPROV_IDLE_FRESH;
 
-// WPS Push-Button-Config (laeuft autark via esp_wps + WiFi-Event-Handler).
-constexpr uint32_t WPS_WINDOW_MS = 120 * 1000;
-bool        wpsActive  = false;
-uint32_t    wpsStartMs = 0;
-
 void onImprovConnected(const char* ssid, const char* pw) {
     Serial.printf("[improv] connected -> ssid=%s\n", ssid);
     persistCreds(ssid ? ssid : "", pw ? pw : "");
     improvActive = false;
+    wifiOptimizeForReliability();   // Power-Save aus, sobald STA up ist
 }
 
 void onImprovError(ImprovTypes::Error err) {
@@ -60,13 +55,17 @@ bool tryConnectFromNVS() {
     WiFi.mode(WIFI_STA);
     WiFi.begin(ssid.c_str(), psk.c_str());
     uint32_t t0 = millis();
+    // WICHTIG: improvSerial waehrend des STA-connect-waits weiter pumpen.
+    // tryConnectFromNVS blockt sonst bis zu 20 s und ESP Web Tools
+    // bekommt keine Antwort auf seine Improv-Setup-Frames — Symptom:
+    // "Initializing Improv Serial → SCHEDULE RETRY 0,1,2" + Abbruch.
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
-        delay(250);
-        Serial.print(".");
+        improvSerial.handleSerial();
+        delay(50);
     }
-    Serial.println();
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("[wifi] connected, IP=%s\n", WiFi.localIP().toString().c_str());
+        wifiOptimizeForReliability();
         return true;
     }
     Serial.println("[wifi] NVS-credential connect timed out");
@@ -83,68 +82,35 @@ bool nvsHasCreds() {
 }
 
 
-// WPS-Event-Handler — wird bei SUCCESS/FAILED/TIMEOUT vom WiFi-Driver
-// gerufen. Bei SUCCESS holt er sich die vom Router gelieferten Creds aus
-// der STA-Config, persistiert sie und stoesst einen WiFi.begin() an.
-void onWpsEvent(arduino_event_id_t event, arduino_event_info_t /*info*/) {
-    switch (event) {
-        case ARDUINO_EVENT_WPS_ER_SUCCESS: {
-            wifi_config_t cfg;
-            esp_wifi_get_config(WIFI_IF_STA, &cfg);
-            String ssid((const char*)cfg.sta.ssid);
-            String psk((const char*)cfg.sta.password);
-            Serial.printf("[wps] SUCCESS — got ssid=%s from router\n", ssid.c_str());
-            persistCreds(ssid, psk);
-            esp_wifi_wps_disable();
-            wpsActive = false;
-            WiFi.begin(ssid.c_str(), psk.c_str());
-            break;
-        }
-        case ARDUINO_EVENT_WPS_ER_FAILED:
-            Serial.println("[wps] FAILED");
-            esp_wifi_wps_disable();
-            wpsActive = false;
-            break;
-        case ARDUINO_EVENT_WPS_ER_TIMEOUT:
-            Serial.println("[wps] TIMEOUT");
-            esp_wifi_wps_disable();
-            wpsActive = false;
-            break;
-        default: break;
-    }
-}
-
-void startWpsMode() {
-    Serial.println("[wps] arming WPS-PBC — press the WPS button on your router (120 s window)");
-    WiFi.mode(WIFI_STA);
-    WiFi.onEvent(onWpsEvent);
-    esp_wps_config_t cfg = WPS_CONFIG_INIT_DEFAULT(WPS_TYPE_PBC);
-    strncpy((char*)cfg.factory_info.manufacturer, "Busware",      sizeof(cfg.factory_info.manufacturer) - 1);
-    strncpy((char*)cfg.factory_info.model_number, FW_VERSION_STRING,
-            sizeof(cfg.factory_info.model_number) - 1);
-    strncpy((char*)cfg.factory_info.model_name,   "BoseFix32",    sizeof(cfg.factory_info.model_name) - 1);
-    strncpy((char*)cfg.factory_info.device_name,  "BoseFix32",    sizeof(cfg.factory_info.device_name) - 1);
-    esp_err_t e1 = esp_wifi_wps_enable(&cfg);
-    if (e1 != ESP_OK) {
-        Serial.printf("[wps] esp_wifi_wps_enable failed: %d\n", (int)e1);
-        return;
-    }
-    esp_err_t e2 = esp_wifi_wps_start(0);  // 0 = use default timeout
-    if (e2 != ESP_OK) {
-        Serial.printf("[wps] esp_wifi_wps_start failed: %d\n", (int)e2);
-        esp_wifi_wps_disable();
-        return;
-    }
-    wpsActive  = true;
-    wpsStartMs = millis();
-}
-
 void startImprovMode() {
     improvIdleMs = nvsHasCreds() ? IMPROV_IDLE_HASCREDS : IMPROV_IDLE_FRESH;
     Serial.printf("[improv] starting (idle-window %us, %sNVS-creds present)\n",
                   improvIdleMs / 1000, nvsHasCreds() ? "" : "no ");
+    // WiFi-STA-Mode GARANTIEREN: Improv ruft WiFi.scanNetworks() wenn
+    // ESP Web Tools "Scan WiFi" triggert.  Im no-creds-Boot ist Mode
+    // sonst noch WIFI_MODE_NULL (tryConnectFromNVS skipt vor uns), und
+    // scan returnt WIFI_SCAN_FAILED → leere Liste im UI.  Auch falls
+    // captive spaeter AP_STA setzt: STA ist bereits angefordert.
+    if (WiFi.getMode() == WIFI_MODE_NULL) {
+        WiFi.mode(WIFI_STA);
+    }
+    // Chip-Family per IDF-Target, damit ESP Web Tools die korrekte
+    // chipFamily-String fuer ihren UI-flow sieht.
+    ImprovTypes::ChipFamily cf =
+#if CONFIG_IDF_TARGET_ESP32S3
+        ImprovTypes::CF_ESP32_S3
+#elif CONFIG_IDF_TARGET_ESP32C3
+        ImprovTypes::CF_ESP32_C3
+#elif CONFIG_IDF_TARGET_ESP32C6
+        ImprovTypes::CF_ESP32_C6
+#elif CONFIG_IDF_TARGET_ESP32S2
+        ImprovTypes::CF_ESP32_S2
+#else
+        ImprovTypes::CF_ESP32
+#endif
+        ;
     improvSerial.setDeviceInfo(
-        ImprovTypes::CF_ESP32_S3,
+        cf,
         FW_NAME,
         FW_VERSION_STRING,
         "BoseFix32"
@@ -185,38 +151,32 @@ void provisionWifi() {
     if (tryConnectFromNVS()) {
         // WiFi up. Improv-Window laeuft via wifiProvisioningTick() noch
         // bis zum 120 s-Ende weiter — User kann jederzeit re-provisionieren.
-        // WPS bleibt aus, weil die NVS-Creds gut sind.
         return;
     }
 
     // Kein Connect aus NVS (oder keine Creds vorhanden) — Improv (laeuft
-    // schon), WPS und Captive-Portal parallel arm-en. Sobald eine Quelle
-    // erfolgreich provisioniert, ist WiFi.status() == WL_CONNECTED und wir
-    // brechen aus, schliessen alle drei Fenster.
-    startWpsMode();
+    // schon) und Captive-Portal parallel arm-en. Sobald eine Quelle
+    // erfolgreich provisioniert, ist WiFi.status() == WL_CONNECTED und
+    // wir brechen aus, schliessen beide Fenster.
     captiveStart();
 
-    Serial.println("[provision] no NVS connect — waiting on improv OR WPS OR captive");
-    while (improvActive || wpsActive || captiveIsActive()) {
+    Serial.println("[provision] no NVS connect — waiting on improv OR captive");
+    uint32_t connectedAtMs = 0;
+    constexpr uint32_t POST_CONNECT_GRACE_MS = 15 * 1000;
+    while (improvActive || captiveIsActive()) {
         improvTickInternal();
         captiveTick();
-        if (WiFi.status() == WL_CONNECTED) break;
-        // Safety: WPS-Lib sollte sich selbst nach WPS_WINDOW_MS deaktivieren,
-        // aber wenn der Event-Handler aus irgendwelchen Gruenden nicht feuert,
-        // ziehen wir hier mit 5 s Puffer den Stecker.
-        if (wpsActive && (millis() - wpsStartMs) > WPS_WINDOW_MS + 5000) {
-            Serial.println("[wps] safety-timeout exceeded — disabling");
-            esp_wifi_wps_disable();
-            wpsActive = false;
+        if (WiFi.status() == WL_CONNECTED && connectedAtMs == 0) {
+            connectedAtMs = millis();
+            Serial.println("[provision] STA up — keeping captive alive for 15s grace "
+                           "(browser still polling /save_status)");
+        }
+        if (connectedAtMs && millis() - connectedAtMs > POST_CONNECT_GRACE_MS) {
+            Serial.println("[provision] grace expired — tearing down captive AP");
+            break;
         }
         delay(10);
     }
-
-    // Captive ggf. noch laufen lassen, damit der User die Success-Page sieht
-    // — nur wenn der Connect NICHT via captive selbst kam (sonst hat captive
-    // schon eine response auf /save geschickt, brauchen wir nichts extra).
-    // Aber den AP muss man irgendwann zumachen. Lass den loop oben drueber
-    // entscheiden — wenn captive_idle-Window ablaeuft, stoppt es sich selbst.
     captiveStop();
 
     if (WiFi.status() != WL_CONNECTED) {
@@ -246,14 +206,6 @@ uint32_t improvWindowRemainingS() {
     return idle >= improvIdleMs ? 0 : (improvIdleMs - idle) / 1000;
 }
 
-bool wpsIsActive() { return wpsActive; }
-
-uint32_t wpsWindowRemainingS() {
-    if (!wpsActive) return 0;
-    const uint32_t elapsed = millis() - wpsStartMs;
-    return elapsed >= WPS_WINDOW_MS ? 0 : (WPS_WINDOW_MS - elapsed) / 1000;
-}
-
 // Public-API-Variante (Header-deklariert) — delegiert auf die anonyme
 // Helper-Variante oben, damit captive_portal.cpp denselben NVS-Pfad nutzt.
 void persistCreds(const String& ssid, const String& psk) {
@@ -263,6 +215,32 @@ void persistCreds(const String& ssid, const String& psk) {
     p.putString(KEY_PSK,  psk);
     p.end();
     Serial.printf("[wifi] credentials persisted (ssid=%s)\n", ssid.c_str());
+}
+
+void wifiOptimizeForReliability() {
+    // 1) WiFi-Modem-Sleep KOMPLETT AUS. Default ist WIFI_PS_MIN_MODEM
+    //    (DTIM-basiert), das auf C3/C6 mit WiFi 6 zu Ping-Latenzen
+    //    > 1 s fuehrt — und damit zu spuerbaren Verzoegerungen bzw
+    //    Hangs beim Speaker, wenn er die Cloud-Endpoints abfragt.
+    WiFi.setSleep(WIFI_PS_NONE);
+
+    // 2) TX-Power auf Maximum.
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
+
+    // 3) Auto-Reconnect explizit ein.
+    WiFi.setAutoReconnect(true);
+
+    // 4) Keine WiFi-Creds in den internen ESP-WiFi-NVS spiegeln (wir
+    //    persistieren selbst). Spart Flash-Schreibzyklen + verhindert
+    //    konkurrierende Quellen.
+    WiFi.persistent(false);
+
+    // 5) CPU auf maximale Frequenz pinnen. arduino-esp32 cappt das
+    //    automatisch auf den Chip-Max: S3/Classic 240 MHz, C3/C6 160 MHz.
+    setCpuFrequencyMhz(240);
+
+    Serial.printf("[wifi] PS=NONE TX=max CPU=%lu MHz — optimized for reliability\n",
+                  (unsigned long)getCpuFrequencyMhz());
 }
 
 } // namespace bosefix

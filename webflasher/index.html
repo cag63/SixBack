@@ -65,6 +65,30 @@
 </div>
 
 <div class="warn">
+  <strong>⚠ Auto-migration runs by default.</strong>
+  Right after WiFi provisioning, BoseFix32 will <em>automatically</em>
+  discover every SoundTouch speaker on your LAN (model whitelist
+  <code>SoundTouch 10/20/30</code>, firmware <code>27.0.6.x</code> /
+  <code>27.0.3.x</code>) and rewrite its cloud URLs to point at the stick
+  — each speaker reboots once in the process (~60 s).  Existing presets
+  are preserved automatically.<br>
+  <br>
+  If you want to drive migrations by hand, open
+  <code>http://bosefix.local/</code> right after provisioning and flip
+  the <strong>Auto-Migrate at Boot</strong> switch at the top
+  <em>before</em> the device finishes discovering your speakers.
+</div>
+
+<div class="ok">
+  <strong>Recommended hardware: ESP32-S3-DevKitC-1-N16R8</strong> —
+  16 MB flash, 8 MB PSRAM, mature WiFi 5 stack.  In extended end-to-end
+  testing this was the most robust target.  ESP32 / C3 / C6 work too
+  (factory image auto-selected), but the C6's WiFi 6 stack occasionally
+  needed a second boot to discover all speakers, and the 4-MB targets
+  are tight on flash for future features.
+</div>
+
+<div class="warn">
   <strong>Browser requirement:</strong> Web&nbsp;Serial is only implemented in
   Chromium-based desktop browsers — <strong>Chrome, Edge, Opera, Brave</strong>
   on macOS / Windows / Linux. Safari, Firefox and all mobile browsers are
@@ -119,10 +143,18 @@
   // Pull the version + target list out of the manifest so the page never drifts.
   fetch('manifest.json').then(r => r.json()).then(m => {
     document.getElementById('ver').textContent = m.version || '?';
-    document.getElementById('targets').innerHTML = (m.builds || []).map(b => {
+    // S3 first + visually marked as recommended. esp-web-tools picks the right
+    // image by chip-family automatically; the order here is purely cosmetic.
+    const order = ['ESP32-S3', 'ESP32', 'ESP32-C3', 'ESP32-C6'];
+    const sorted = (m.builds || []).slice().sort(
+      (a, b) => order.indexOf(a.chipFamily) - order.indexOf(b.chipFamily));
+    document.getElementById('targets').innerHTML = sorted.map(b => {
       const part = (b.parts || [])[0] || {};
+      const rec  = b.chipFamily === 'ESP32-S3'
+        ? ' <span style="color:var(--ok);font-weight:600">★ recommended</span>'
+        : '';
       return `<div class="target">
-                <div class="name">${b.chipFamily}</div>
+                <div class="name">${b.chipFamily}${rec}</div>
                 <div class="meta">${part.path || ''}</div>
               </div>`;
     }).join('');

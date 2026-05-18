@@ -21,7 +21,7 @@ constexpr uint32_t HEALTH_WIFI_RECONNECT_S     = 10;                   // alle 1
 constexpr uint32_t HEALTH_HEAP_LOW_BYTES       = 30 * 1024;            // <30 KB free
 constexpr uint32_t HEALTH_HEAP_LOW_REBOOT_S    = 5 * 60;               // 5 Min unter Schwelle -> Reboot
 constexpr uint32_t HEALTH_PING_INTERVAL_S      = 5 * 60;               // alle 5 Min Speaker pingen
-constexpr uint8_t  HEALTH_PING_MISS_FOR_OFFLINE = 3;                   // 3x miss -> OFFLINE
+constexpr uint8_t  HEALTH_PING_MISS_FOR_OFFLINE = 5;                   // 5x miss -> OFFLINE (5*5min = 25min stille bevor Status flippt)
 constexpr uint16_t HEALTH_PING_TIMEOUT_MS       = 800;                 // GET /info Timeout
 
 // ------ NVS-State ------------------------------------------------------------

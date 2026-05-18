@@ -19,6 +19,8 @@
 #include "tunein_resolver.h"
 #include "system_health.h"
 #include "captive_portal.h"
+#include "auto_mode.h"
+#include "source_normalizer.h"
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <WiFi.h>
@@ -27,6 +29,7 @@
 #include <esp_chip_info.h>
 #include <LittleFS.h>
 #include <Update.h>
+#include <Preferences.h>
 
 namespace {
 
@@ -82,8 +85,6 @@ void handleStatus(AsyncWebServerRequest* req) {
     wifi["hostname"]  = String(MDNS_HOSTNAME) + ".local";
     wifi["improv_active"]   = bosefix::improvIsActive();
     wifi["improv_window_s"] = bosefix::improvWindowRemainingS();
-    wifi["wps_active"]       = bosefix::wpsIsActive();
-    wifi["wps_window_s"]     = bosefix::wpsWindowRemainingS();
     wifi["captive_active"]   = bosefix::captiveIsActive();
     wifi["captive_window_s"] = bosefix::captiveWindowRemainingS();
 
@@ -322,8 +323,9 @@ void handleImportFromDevice(AsyncWebServerRequest* req) {
     http.end();
 
     JsonDocument resp;
-    JsonArray imported = resp["imported"].to<JsonArray>();
-    int count = 0;
+    JsonArray imported  = resp["imported"].to<JsonArray>();
+    JsonArray abandoned = resp["abandoned"].to<JsonArray>();
+    int countOk = 0, countAban = 0;
     int pos = 0;
     while (true) {
         int presetOpen = xml.indexOf("<preset id=\"", pos);
@@ -336,33 +338,41 @@ void handleImportFromDevice(AsyncWebServerRequest* req) {
         uint8_t slot = xml.substring(idStart, idEnd).toInt();
         if (slot < 1 || slot > 6) { pos = presetClose; continue; }
 
-        bosefix::Preset p;
-        p.slot   = slot;
-        p.source = bosefix::presetSourceFromStr(
-                       xmlExtractAttr(xml, idEnd, presetClose, "source"));
-        String loc = xmlExtractAttr(xml, idEnd, presetClose, "location");
-        if (p.source == bosefix::PresetSource::TUNEIN) {
-            int slash = loc.lastIndexOf('/');
-            if (slash >= 0) p.stationId = loc.substring(slash + 1);
-        } else {
-            p.streamUrl = loc;
-        }
-        p.name     = xmlExtractTag(xml, idEnd, presetClose, "itemName");
-        p.imageUrl = xmlExtractTag(xml, idEnd, presetClose, "containerArt");
+        String src  = xmlExtractAttr(xml, idEnd, presetClose, "source");
+        String loc  = xmlExtractAttr(xml, idEnd, presetClose, "location");
+        String name = xmlExtractTag (xml, idEnd, presetClose, "itemName");
+        String img  = xmlExtractTag (xml, idEnd, presetClose, "containerArt");
 
-        if (bosefix::PresetStore::instance().set(id, p)) {
+        bosefix::Preset p;
+        p.slot = slot;
+        auto nr = bosefix::normalizePreset(src, loc, name, img, p);
+
+        if (nr.status == bosefix::NormalizeStatus::ABANDONED) {
+            JsonObject o = abandoned.add<JsonObject>();
+            o["slot"]   = slot;
+            o["source"] = src;
+            o["reason"] = nr.reason;
+            ++countAban;
+        } else if (bosefix::PresetStore::instance().set(id, p)) {
             JsonObject o = imported.add<JsonObject>();
-            o["slot"]      = p.slot;
-            o["name"]      = p.name;
-            o["source"]    = bosefix::presetSourceToStr(p.source);
-            o["stationId"] = p.stationId;
-            ++count;
+            o["slot"]            = p.slot;
+            o["name"]            = p.name;
+            o["source"]          = bosefix::presetSourceToStr(p.source);
+            o["stationId"]       = p.stationId;
+            o["streamUrl"]       = p.streamUrl;
+            o["normalize"]       = bosefix::normalizeStatusToStr(nr.status);
+            if (nr.status == bosefix::NormalizeStatus::OK_CONVERTED) {
+                o["converted_from"] = nr.originalSource;
+                o["reason"]         = nr.reason;
+            }
+            ++countOk;
         }
         pos = presetClose;
     }
 
-    resp["ok"]    = true;
-    resp["count"] = count;
+    resp["ok"]            = true;
+    resp["count"]         = countOk;
+    resp["abandoned_count"] = countAban;
     String body; serializeJson(resp, body);
     req->send(200, "application/json", body);
 }
@@ -600,6 +610,77 @@ void handleRoot(AsyncWebServerRequest* req) {
 
 } // anon
 
+// -----------------------------------------------------------------------------
+// IP-Failsafe Test-Endpoint
+//   Setzt NVS `bosefix-net.last_ip` auf einen anderen Wert, sodass beim
+//   naechsten Boot `ipFailsafeCheck()` einen IP-Wechsel erkennt und alle
+//   owned-Speaker per Telnet re-migriert. Reine Test-Hilfe, kein Cleanup
+//   noetig — der Failsafe persistiert beim Lauf die aktuelle IP wieder.
+// -----------------------------------------------------------------------------
+void handleTestForceIpChange(AsyncWebServerRequest* req, JsonDocument& body) {
+    String fakeIp = (const char*)(body["fake_ip"] | "10.10.99.99");
+    Preferences p;
+    if (!p.begin("bosefix-net", false)) {
+        req->send(500, "application/json", "{\"error\":\"nvs open failed\"}"); return;
+    }
+    String oldStored = p.getString("last_ip", "");
+    p.putString("last_ip", fakeIp);
+    p.end();
+    JsonDocument doc;
+    doc["ok"]                = true;
+    doc["nvs_last_ip_was"]   = oldStored;
+    doc["nvs_last_ip_now"]   = fakeIp;
+    doc["esp_actual_ip"]     = WiFi.localIP().toString();
+    doc["next"]              = "POST /api/reboot to trigger ip_failsafe";
+    String b; serializeJson(doc, b);
+    req->send(200, "application/json", b);
+}
+
+// -----------------------------------------------------------------------------
+// Auto-Mode (Zero-Touch Migration beim Boot)
+// -----------------------------------------------------------------------------
+void handleGetAutoMode(AsyncWebServerRequest* req) {
+    auto cfg = bosefix::loadAutoModeConfig();
+    auto st  = bosefix::getAutoModeStatus();
+    JsonDocument doc;
+    doc["config"]["enabled"]       = cfg.enabled;
+    doc["config"]["dry_run"]       = cfg.dryRun;
+    doc["config"]["boot_delay_ms"] = cfg.bootDelayMs;
+    doc["config"]["max_per_boot"]  = cfg.maxPerBoot;
+    doc["status"]["ran"]               = st.ran;
+    doc["status"]["running"]           = st.running;
+    doc["status"]["state"]             = st.state;
+    doc["status"]["current_device"]    = st.currentDeviceId;
+    doc["status"]["speakers_seen"]     = st.speakersSeen;
+    doc["status"]["speakers_eligible"] = st.speakersEligible;
+    doc["status"]["speakers_migrated"] = st.speakersMigrated;
+    doc["status"]["slots_normalized"]  = st.slotsNormalized;
+    doc["status"]["slots_converted"]   = st.slotsConverted;
+    doc["status"]["slots_abandoned"]   = st.slotsAbandoned;
+    doc["status"]["last_error"]        = st.lastError;
+    doc["status"]["started_ms"]        = st.startedMs;
+    doc["status"]["finished_ms"]       = st.finishedMs;
+    String body; serializeJson(doc, body);
+    req->send(200, "application/json", body);
+}
+
+void handlePutAutoMode(AsyncWebServerRequest* req, JsonDocument& body) {
+    auto cfg = bosefix::loadAutoModeConfig();
+    if (body["enabled"].is<bool>())          cfg.enabled     = body["enabled"].as<bool>();
+    if (body["dry_run"].is<bool>())          cfg.dryRun      = body["dry_run"].as<bool>();
+    if (body["boot_delay_ms"].is<uint32_t>())cfg.bootDelayMs = body["boot_delay_ms"].as<uint32_t>();
+    if (body["max_per_boot"].is<uint32_t>()) cfg.maxPerBoot  = body["max_per_boot"].as<uint32_t>();
+    bosefix::saveAutoModeConfig(cfg);
+    JsonDocument resp;
+    resp["ok"]                       = true;
+    resp["config"]["enabled"]        = cfg.enabled;
+    resp["config"]["dry_run"]        = cfg.dryRun;
+    resp["config"]["boot_delay_ms"]  = cfg.bootDelayMs;
+    resp["config"]["max_per_boot"]   = cfg.maxPerBoot;
+    String b; serializeJson(resp, b);
+    req->send(200, "application/json", b);
+}
+
 void registerApiEndpoints(AsyncWebServer& ui) {
     // Statische Assets aus LittleFS (CSS, JS, etc.)
     ui.serveStatic("/assets/", LittleFS, "/assets/").setCacheControl("max-age=600");
@@ -628,6 +709,10 @@ void registerApiEndpoints(AsyncWebServer& ui) {
 
     ui.on("^/api/tunein/resolve/([^/]+)$", HTTP_GET, handleTuneInResolve);
     ui.on("/api/tunein/search",            HTTP_GET, handleTuneInSearch);
+
+    ui.on("/api/auto-mode",          HTTP_GET,  handleGetAutoMode);
+    routeJsonBody(ui, "/api/auto-mode", HTTP_PUT, handlePutAutoMode);
+    routeJsonBody(ui, "/api/test/force-ip-change", HTTP_POST, handleTestForceIpChange);
 
     ui.on("/api/factory_reset_wifi", HTTP_POST, handleFactoryResetWifi);
     ui.on("/api/reboot",             HTTP_POST, handleSelfReboot);
