@@ -22,7 +22,11 @@ namespace bosefix {
 enum class NormalizeStatus : uint8_t {
     OK_PASSTHROUGH = 0,  // Source nativ supported, 1:1 uebernommen
     OK_CONVERTED   = 1,  // Source wurde konvertiert (RADIO_BROWSER → LOCAL)
-    ABANDONED      = 2,  // Keine Konvertierung moeglich
+    ABANDONED      = 2,  // (legacy — wird nicht mehr produziert; bleibt im enum
+                         //          fuer Kompatibilitaet mit alten NVS-Snapshots)
+    OK_OPAQUE      = 3,  // Unbekannte Source. out.source==OPAQUE; Caller MUSS
+                         // out.rawContentItem + out.opaqueSourceName selbst
+                         // setzen (Normalizer kennt das XML nicht).
 };
 
 struct NormalizeResult {

@@ -183,9 +183,24 @@ static String buildDevicePresets_(const String& deviceId) {
         return String();
     }
     auto presets = bosefix::PresetStore::instance().getForSpeaker(deviceId);
+    // Erst zaehlen ob ueberhaupt non-OPAQUE-Slots ausgegeben werden. Wenn nur
+    // OPAQUE-Slots im Store sind, geben wir GAR KEIN <presets>-Element aus —
+    // der Speaker behaelt damit seinen Local-Cache mit den Original-
+    // ContentItems unangetastet (gleiche Defense wie bei komplett leerem Store).
+    int renderable = 0;
+    for (const auto& p : presets) {
+        if (p.source != bosefix::PresetSource::EMPTY &&
+            p.source != bosefix::PresetSource::OPAQUE) ++renderable;
+    }
+    if (renderable == 0) return String();
+
     String out = "<presets>";
     for (const auto& p : presets) {
         if (p.source == bosefix::PresetSource::EMPTY) continue;
+        // OPAQUE: Speaker hat das Original-ContentItem im Local-Cache. account/
+        // full-Schema hat keinen Slot fuer raw ContentItems (anderes XML-Format
+        // als /presets-direct). Slot weglassen → Speaker behaelt was er hat.
+        if (p.source == bosefix::PresetSource::OPAQUE) continue;
         out += "<preset buttonNumber=\""; out += String(p.slot); out += "\">";
         out += "<containerArt>"; out += xmlEsc_(p.imageUrl); out += "</containerArt>";
         out += "<contentItemType>stationurl</contentItemType>";
@@ -208,7 +223,8 @@ static String buildDevicePresets_(const String& deviceId) {
             out += "<sourcename></sourcename>";
             out += "<sourceSettings/>";
             out += "<updatedOn>"; out += kFakeTs; out += "</updatedOn>";
-            out += "<username></username>";
+            // username = sourceAccount-Quelle (siehe handleAccountFull-Kommentar)
+            out += "<username>TuneIn</username>";
             out += "</source>";
         } else {
             out += "<source id=\"10003\" type=\"Audio\">";
@@ -232,11 +248,6 @@ static String buildDevicePresets_(const String& deviceId) {
 
 void handleAccountFull(AsyncWebServerRequest* req) {
     String acct = req->pathArg(0);
-    String body;
-    body.reserve(3072);
-    body  = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n";
-    body += "<account id=\""; body += xmlEsc_(acct); body += "\">";
-    body += "<accountStatus>REGISTERED</accountStatus>";
 
     // <devices> — alle bekannten Speaker mit gleichem accountId.
     // Fallback wenn die Liste fuer den angefragten Account leer ist:
@@ -247,6 +258,38 @@ void handleAccountFull(AsyncWebServerRequest* req) {
     std::vector<bosefix::Speaker> matched;
     for (const auto& s : allSpeakers) if (s.accountId == acct) matched.push_back(s);
     if (matched.empty()) matched = allSpeakers;
+
+    // Defense (Race-Fix 2026-05-20): wenn KEIN matched Speaker Presets im
+    // Store hat, returnen wir 404 statt account/full mit fehlendem
+    // <presets>-Block pro Device. Symmetrisch zu handleAccountPresets +
+    // handleDevicePresets — Speaker behaelt damit seinen Local-Cache.
+    // Sobald auch nur EIN Speaker im Store seeded ist, laeuft der Pfad
+    // normal und buildDevicePresets_ greift per-Device.
+    //
+    // Vorfall 2026-05-20: alle 3 SoundTouch-Speaker im Lab verloren ihre
+    // Presets nach mehrfachen Erase+Flash-Zyklen. Defense in
+    // buildDevicePresets_ returnte leeren String (kein <presets>-Element);
+    // der Speaker hat das offenbar als "Cloud-Account hat keine Presets"
+    // interpretiert und seinen Cache geleert — anstatt wie bei 404
+    // ("Cloud antwortet nicht") seinen Cache zu behalten.
+    bool anySeeded = false;
+    for (const auto& s : matched) {
+        if (bosefix::PresetStore::instance().hasAnyFor(s.deviceId)) {
+            anySeeded = true;
+            break;
+        }
+    }
+    if (!anySeeded) {
+        Serial.println("[bmx][safe] account/full -> 404 (no preset stores seeded — schuetzt Speaker-Cache)");
+        req->send(404, "application/vnd.bose.streaming-v1.2+xml", "");
+        return;
+    }
+
+    String body;
+    body.reserve(3072);
+    body  = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n";
+    body += "<account id=\""; body += xmlEsc_(acct); body += "\">";
+    body += "<accountStatus>REGISTERED</accountStatus>";
 
     body += "<devices>";
     for (const auto& s : matched) {
@@ -314,7 +357,14 @@ void handleAccountFull(AsyncWebServerRequest* req) {
     body +=   "<sourcename></sourcename>";
     body +=   "<sourceSettings/>";
     body +=   "<updatedOn>"; body += kFakeTs; body += "</updatedOn>";
-    body +=   "<username></username>";
+    // sourceAccount-Mapping (2026-05-20): Speaker zieht den
+    // sourceAccount-String fuer ContentItem.sourceAccount aus dem
+    // <username>-Element der matching <source>-Definition. Wenn das leer
+    // ist, persistiert er Presets mit sourceAccount="" — und beim spaeteren
+    // /select-Druck am Speaker gibt's HTTP 500
+    // (siehe reference_bose_select_sourceaccount). Symptom v0.5.462: nach
+    // account/full-Sync ueberschreibt Speaker seinen Cache mit acct="".
+    body +=   "<username>TuneIn</username>";
     body += "</source>";
     body += "</sources>";
 

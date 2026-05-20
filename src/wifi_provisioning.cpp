@@ -66,6 +66,9 @@ bool tryConnectFromNVS() {
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("[wifi] connected, IP=%s\n", WiFi.localIP().toString().c_str());
         wifiOptimizeForReliability();
+        improvLastActivityMs = millis();
+        Serial.printf("[improv] reset window after AP connect — improvLastActivityMs=%lu improvActive=%d\n",
+                      (unsigned long)improvLastActivityMs, (int)improvActive);
         return true;
     }
     Serial.println("[wifi] NVS-credential connect timed out");
@@ -94,6 +97,17 @@ void startImprovMode() {
     if (WiFi.getMode() == WIFI_MODE_NULL) {
         WiFi.mode(WIFI_STA);
     }
+    // PS-Mode AUS *VOR* irgendeinem WiFi.begin() — gilt sowohl fuer
+    // tryConnectFromNVS als auch fuer den begin(), den die improv-Lib
+    // bei Send-WiFi-Settings selbst ausfuehrt. C6+WiFi-6-Defaults
+    // (WIFI_PS_MIN_MODEM, DTIM-basiert) kappen sonst das 4-way-
+    // handshake-Timing → reproduzierbarer 4WAY_HANDSHAKE_TIMEOUT auf
+    // WPA2-Mixed-APs. EULFW32 / ip4knx setzen das gleiche vor begin();
+    // BoseFix32 hat es bis v0.5.450 erst NACH Connect via
+    // wifiOptimizeForReliability() gesetzt — zu spaet wenn der Connect
+    // selbst schon scheitert.
+    WiFi.setSleep(WIFI_PS_NONE);
+    WiFi.setAutoReconnect(true);
     // Chip-Family per IDF-Target, damit ESP Web Tools die korrekte
     // chipFamily-String fuer ihren UI-flow sieht.
     ImprovTypes::ChipFamily cf =
@@ -168,6 +182,7 @@ void provisionWifi() {
         captiveTick();
         if (WiFi.status() == WL_CONNECTED && connectedAtMs == 0) {
             connectedAtMs = millis();
+            improvLastActivityMs = connectedAtMs;
             Serial.println("[provision] STA up — keeping captive alive for 15s grace "
                            "(browser still polling /save_status)");
         }

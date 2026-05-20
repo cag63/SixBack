@@ -19,15 +19,21 @@ OUT="$ROOT/webflasher"
 mkdir -p "$OUT"
 
 # --- 1) Compile all envs + their LittleFS images --------------------------
-# Pio's pre-build-hook (version_bump.py) bumpt build_number bei jedem
-# `pio run`-Aufruf — daher liest dieses Script die Version ERST NACH dem
-# letzten Bump (= nach buildfs). Sonst stuende im manifest.json ein
-# kleinerer Build als in den .bin-Dateien drin (frueher Bug, beobachtet
-# beim v0.4-Release).
-"$HOME/.platformio/penv/bin/pio" run -e esp32 -e s3 -e c3 -e c6
+# Pio's pre-build-hook (version_bump.py) bumpt build_number bei JEDEM
+# `pio run`-Aufruf — buildfs *und* firmware-build je einmal. Damit am Ende
+# manifest.json und firmware.bin DIESELBE Version tragen, muss der zuletzt
+# laufende Bump derjenige sein, der die firmware.bin produziert. Also:
+# buildfs ZUERST, firmware DANACH. version.h-Stand nach beiden Schritten
+# == FW_VERSION_STRING im aktuellen firmware.bin == manifest.json.
+#
+# Frueherer Bug (2026-05-19): umgekehrte Reihenfolge → manifest.json war
+# um +1 (oder mehr bei wiederholten Builds) hoeher als die firmware.bin
+# tatsaechlich war. C6 OTA-update zeigte "auf 0.5.422 aktualisiert" aber
+# nach dem Reboot lief 0.5.418.
 "$HOME/.platformio/penv/bin/pio" run -e esp32 -e s3 -e c3 -e c6 -t buildfs
+"$HOME/.platformio/penv/bin/pio" run -e esp32 -e s3 -e c3 -e c6
 
-# Resolve final version after all bumps (single source of truth in version.h).
+# Resolve final version after both bumps (single source of truth in version.h).
 VERSION="$(grep -oE '"[0-9]+\.[0-9]+\.[0-9]+"' "$ROOT/src/version.h" | tr -d '"')"
 echo ">>> BoseFix32 release build, version=$VERSION"
 

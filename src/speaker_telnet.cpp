@@ -172,3 +172,31 @@ bool rebootSpeaker(const String& speakerIP) {
     c.stop();
     return true;
 }
+
+bool captureSysConfigurationList(const String& speakerIP, String& out) {
+    out = "";
+    WiFiClient c;
+    if (!c.connect(speakerIP.c_str(), BOSE_TELNET_PORT, 5000)) return false;
+    delay(300);
+    while (c.available()) c.read();
+
+    c.print("getpdo CurrentSystemConfiguration\n");
+    uint32_t deadline = millis() + 4000;
+    while (millis() < deadline) {
+        while (c.available()) {
+            char ch = c.read();
+            out += ch;
+            if (out.endsWith("->")) {
+                out.remove(out.length() - 2);
+                while (out.endsWith("\r") || out.endsWith("\n")) {
+                    out.remove(out.length() - 1);
+                }
+                c.stop();
+                return true;
+            }
+        }
+        delay(20);
+    }
+    c.stop();
+    return false;
+}

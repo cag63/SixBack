@@ -56,6 +56,7 @@ const char* presetSourceToStr(PresetSource s) {
     switch (s) {
         case PresetSource::TUNEIN:               return "TUNEIN";
         case PresetSource::LOCAL_INTERNET_RADIO: return "LOCAL_INTERNET_RADIO";
+        case PresetSource::OPAQUE:               return "OPAQUE";
         default:                                  return "EMPTY";
     }
 }
@@ -63,6 +64,7 @@ const char* presetSourceToStr(PresetSource s) {
 PresetSource presetSourceFromStr(const String& s) {
     if (s == "TUNEIN")               return PresetSource::TUNEIN;
     if (s == "LOCAL_INTERNET_RADIO") return PresetSource::LOCAL_INTERNET_RADIO;
+    if (s == "OPAQUE")               return PresetSource::OPAQUE;
     return PresetSource::EMPTY;
 }
 
@@ -90,6 +92,8 @@ void PresetStore::loadFromNVS() {
             p.stationId   = (const char*)(pj["stationId"] | "");
             p.streamUrl   = (const char*)(pj["streamUrl"] | "");
             p.imageUrl    = (const char*)(pj["imageUrl"]  | "");
+            p.rawContentItem   = (const char*)(pj["rawContentItem"]   | "");
+            p.opaqueSourceName = (const char*)(pj["opaqueSourceName"] | "");
         }
         speakers_.push_back(s);
     }
@@ -115,6 +119,10 @@ void PresetStore::saveToNVS() {
             pj["stationId"] = p.stationId;
             pj["streamUrl"] = p.streamUrl;
             pj["imageUrl"]  = p.imageUrl;
+            if (p.source == PresetSource::OPAQUE) {
+                pj["rawContentItem"]   = p.rawContentItem;
+                pj["opaqueSourceName"] = p.opaqueSourceName;
+            }
         }
     }
     nvsSaveJson(NVS_NS, NVS_KEY, doc);
@@ -200,6 +208,7 @@ bool PresetStore::clear(const String& deviceId, uint8_t slot) {
     p.slot   = slot;
     p.source = PresetSource::EMPTY;
     p.name = ""; p.stationId = ""; p.streamUrl = ""; p.imageUrl = "";
+    p.rawContentItem = ""; p.opaqueSourceName = "";
     saveToNVS();
     return true;
 }
@@ -239,6 +248,10 @@ void PresetStore::exportJson(JsonDocument& out) {
             pj["stationId"] = p.stationId;
             pj["streamUrl"] = p.streamUrl;
             pj["imageUrl"]  = p.imageUrl;
+            if (p.source == PresetSource::OPAQUE) {
+                pj["rawContentItem"]   = p.rawContentItem;
+                pj["opaqueSourceName"] = p.opaqueSourceName;
+            }
         }
     }
 }
@@ -259,6 +272,8 @@ bool PresetStore::importJson(JsonDocument& in) {
             p.stationId   = (const char*)(pj["stationId"] | "");
             p.streamUrl   = (const char*)(pj["streamUrl"] | "");
             p.imageUrl    = (const char*)(pj["imageUrl"]  | "");
+            p.rawContentItem   = (const char*)(pj["rawContentItem"]   | "");
+            p.opaqueSourceName = (const char*)(pj["opaqueSourceName"] | "");
         }
         speakers_.push_back(s);
     }
@@ -303,6 +318,19 @@ String PresetStore::toBoseXml(const String& deviceId) {
         for (int i = 0; i < 6; ++i) {
             const Preset& p = s->slots[i];
             if (p.source == PresetSource::EMPTY) continue;
+            if (p.source == PresetSource::OPAQUE) {
+                // Passthrough: das ContentItem-XML wie wir es vom Speaker
+                // gesehen haben 1:1 einbetten. Speaker erkennt sein eigenes
+                // Preset wieder, kann DLNA/Bluetooth/etc. direkt ansprechen.
+                if (p.rawContentItem.length() > 0) {
+                    out += "<preset id=\"";
+                    out += String(p.slot);
+                    out += "\">";
+                    out += p.rawContentItem;
+                    out += "</preset>";
+                }
+                continue;
+            }
             out += "<preset id=\"";
             out += String(p.slot);
             out += "\"><ContentItem source=\"";

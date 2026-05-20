@@ -33,4 +33,15 @@ MigrationResult revertSpeaker(const String& speakerIP);
 // Sendet sys reboot per Telnet:17000. Liefert true bei TCP-Connect-Erfolg.
 bool rebootSpeaker(const String& speakerIP);
 
+// Fuehrt `getpdo CurrentSystemConfiguration` am Speaker aus und gibt die
+// gesamte Antwort (alles bis zum '->'-Prompt, exklusive) in `out` zurueck.
+// Liefert true wenn Telnet-Connect + Kommando erfolgreich, sonst false.
+// Eigentlich angefragt war `sys configuration list` — das gibt es bei der
+// Bose-Diag-Shell aber nicht (waere ein Setter). `getpdo` ist der Getter
+// fuer dieselben Felder und ist auch der existierende Pattern in
+// migrateSpeaker(). Eigene Lese-Schleife (kein Error-Marker-Check wie
+// bei den Set-Kommandos) — die PDO-Ausgabe enthaelt voellig legitim
+// Schluessel, die in der negativen Marker-Liste vorkommen wuerden.
+bool captureSysConfigurationList(const String& speakerIP, String& out);
+
 #endif // BOSEFIX32_SPEAKER_TELNET_H

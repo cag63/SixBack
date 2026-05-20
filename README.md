@@ -20,7 +20,10 @@ No subscription, no account, no Bose servers.  One USB stick on your LAN.
 | **scmudc telemetry** — per-device NowPlaying + event trace         | working — body-captured `/v1/scmudc/{deviceId}` JSON parsed into per-speaker store |
 | TuneIn preset resolver (`Tune.ashx` + `Describe.ashx`)             | working — stations show with correct name & artwork  |
 | Preset push to speaker (long-press emulation)                      | working — `sourceAccount="TuneIn"` set explicitly so /select doesn't 500 |
-| **Preset-loss defense** (Defense-in-Depth, v0.5.0)                 | working — `handleMigrate` pre-imports from speaker, `/presets` returns 404 instead of empty XML when store is unseeded |
+| **Preset push — serialized via FreeRTOS queue (v0.6.0)**           | working — single persistent worker drains pushes one-by-one; burst of 18 enqueues fine, queue-depth 16, 503 when full |
+| **Preset-loss defense** (Defense-in-Depth, v0.5.0 + v0.6.0)        | working — `handleMigrate` pre-imports; `/presets` returns 404 when store empty; **account/full now also 404 instead of empty-presets-block** (v0.6.0 closed a race where account/full sync wiped speaker-side presets); TUNEIN source-block carries `username=TuneIn` so the speaker keeps `sourceAccount="TuneIn"` after every sync |
+| **Opaque-source passthrough (v0.6.0)**                             | working — DLNA / UPnP / Bluetooth-presets (`STORED_MUSIC_MEDIA_RENDERER`, …) no longer abandoned; the original `<ContentItem>…</ContentItem>` is captured at import and replayed 1:1 on sync, so the speaker keeps talking to its own DLNA server / BT stack |
+| **Diagnostic snapshot (v0.6.0)**                                   | working — `GET /api/speaker/{id}/diagnostic-snapshot` returns full BMX endpoint dump + Telnet `getpdo CurrentSystemConfiguration`; one-shot pre-migrate snapshot auto-persisted to `/snapshots/{deviceId}.json`; WebUI download or "Send to maintainer" upload to `install.busware.de/bosefix/snapshot` |
 | Speaker telnet bootstrap (`sys configuration …` via TCP 17000)     | working                                              |
 | Auto-import existing presets via BMX `/presets`                    | working                                              |
 | **Stereo-Pair / Multi-Room group API**                             | working — POST/PUT/DELETE on `/streaming/account/{a}/group/`, NVS-persistent |
@@ -32,7 +35,8 @@ No subscription, no account, no Bose servers.  One USB stick on your LAN.
 | Web UI (English, mobile-friendly) with Auto-Mode toggle at top     | working                                              |
 | OTA — app & LittleFS                                               | working                                              |
 | System health — Task-WDT, WiFi / heap watchdog, crash counter, self-ping | working                                        |
-| WiFi provisioning — Improv-Serial (idle-window) + Captive AP       | working — both armed in parallel on cold boot        |
+| WiFi provisioning — Improv-Serial (idle-window) + Captive AP       | working — both armed in parallel on cold boot; **Improv idle-window now resets on successful STA connect (v0.6.0)** so the full 30 s are available _after_ the speaker is on the AP, not eaten by the connect itself |
+| **ESP32-C6 WPA2 connect reliability (v0.6.0)**                     | working — `WiFi.setSleep(WIFI_PS_NONE)` + `setAutoReconnect(true)` are now applied **before** `WiFi.begin()`; closed a reproducible 4-Way-Handshake-Timeout on WPA2-Mixed APs where the WiFi 6 default power-save dropped auth frames |
 | Builds for **ESP32 / ESP32-S3 ★ / ESP32-C3 / ESP32-C6**            | working — S3 is the recommended target               |
 | ESP-Web-Tools landing page (auto-detects chip)                     | working — <https://install.busware.de/bosefix/>      |
 

@@ -7,6 +7,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <algorithm>
+#include <esp_log.h>
 
 namespace bosefix {
 
@@ -262,10 +263,27 @@ void SpeakerInventory::activeScan_() {
             }
         }
     }
-    Serial.printf("[inv][scan] active scan %d.%d.%d.1-254 (skipping %d known) ...\n",
+    int toScan = 254 - (int)std::count(already, already + 256, true);
+    Serial.printf("[inv][scan] active scan %d.%d.%d.1-254 (skipping %d known, %d to probe) ...\n",
                   my[0], my[1], my[2],
-                  (int)std::count(already, already + 256, true) - 1);
-    int found = 0;
+                  (int)std::count(already, already + 256, true) - 1,
+                  toScan);
+
+    // Network/HTTPClient-Log-Spam waehrend des /24-Scans unterdruecken:
+    // jeder Nicht-Bose-Host loggt sonst [E] socket-reset + [W] connection-
+    // refused + [I] timeout — ca. 1000 Zeilen pro Scan. Wir wollen nur
+    // unsere eigene Progress-Anzeige sehen. NACH dem Scan sofort zurueck-
+    // setzen, damit echte HTTP-Fehler (z.B. push-to-device) wieder sichtbar
+    // werden.
+    esp_log_level_t prev_net  = esp_log_level_get("NetworkClient");
+    esp_log_level_t prev_http = esp_log_level_get("HTTPClient");
+    esp_log_level_set("NetworkClient", ESP_LOG_NONE);
+    esp_log_level_set("HTTPClient",    ESP_LOG_NONE);
+
+    int found     = 0;
+    int probed    = 0;
+    uint32_t lastDot = millis();
+    Serial.print("[inv][scan] progress: ");
     for (int i = 1; i <= 254; ++i) {
         if (already[i]) continue;
         char ip[20];
@@ -275,16 +293,35 @@ void SpeakerInventory::activeScan_() {
         // WiFi 6 koennen in der Anfangsphase nach Boot 500 ms+ brauchen
         // bis SYN-ACK). 300 ms connect / 1200 ms read ergibt im worst
         // case 254 × 300 ≈ 76 s im Hintergrund-Task.
-        if (probeIp_(ip, s, 300, 1200)) {
+        bool hit = probeIp_(ip, s, 300, 1200);
+        ++probed;
+        if (hit) {
             ++found;
-            Serial.printf("[inv][scan] %s -> %s (%s)\n",
-                          ip, s.name.c_str(), s.model.c_str());
+            // Newline vor Speaker-Treffer damit Progress-Punkte sauber bleiben:
+            Serial.printf("\n[inv][scan] %d/%d HIT %s -> %s (%s)\n",
+                          probed, toScan, ip, s.name.c_str(), s.model.c_str());
+            Serial.print("[inv][scan] progress: ");
             mergeSpeaker_(s);
+        } else if (millis() - lastDot > 2000) {
+            // alle 2 s einen Progress-Punkt setzen, damit man sieht
+            // dass der Scan lebt (nicht haengt). Counter alle 10 Probes:
+            if (probed % 10 == 0) {
+                Serial.printf("%d", probed);
+            } else {
+                Serial.print(".");
+            }
+            lastDot = millis();
         }
         // kleiner yield damit AsyncTCP nicht ausgehungert wird
         if ((i & 0xF) == 0) delay(1);
     }
-    Serial.printf("[inv][scan] active scan done, %d new speakers found\n", found);
+    Serial.printf("\n[inv][scan] active scan done, %d/%d probed, %d new speakers found\n",
+                  probed, toScan, found);
+
+    // Log-Level zurueck — damit "echte" HTTP-Errors aus push-to-device,
+    // import-from-device, migrate-telnet etc. wieder im Serial-Log auftauchen.
+    esp_log_level_set("NetworkClient", prev_net);
+    esp_log_level_set("HTTPClient",    prev_http);
 }
 
 void SpeakerInventory::activeScanTask_(void* arg) {

@@ -67,6 +67,7 @@ const char* normalizeStatusToStr(NormalizeStatus s) {
     switch (s) {
         case NormalizeStatus::OK_PASSTHROUGH: return "ok-passthrough";
         case NormalizeStatus::OK_CONVERTED:   return "ok-converted";
+        case NormalizeStatus::OK_OPAQUE:      return "ok-opaque";
         default:                              return "abandoned";
     }
 }
@@ -113,10 +114,16 @@ NormalizeResult normalizePreset(const String& sourceStr,
         }
         return r;
     }
-    // SPOTIFY (Bose-Account-Variante), PANDORA, DEEZER, AMAZON, iHeartRadio,
-    // SIRIUSXM_EVEREST, RADIOPLAYER, ...
-    r.status = NormalizeStatus::ABANDONED;
-    r.reason = String("source '") + sourceStr + "' not supported by BoseFix32";
+    // Alles andere — STORED_MUSIC, STORED_MUSIC_MEDIA_RENDERER, UPNP,
+    // BLUETOOTH, SPOTIFY-Account-Preset, etc. → OPAQUE-Passthrough.
+    // Speaker spricht solche Quellen direkt an (DLNA/UPnP-Server, BT-Stack,
+    // Spotify-Connect-Session); die Cloud (= unser ESP) ist am Playback
+    // nicht beteiligt. Wir muessen das ContentItem nur 1:1 zurueckspiegeln
+    // beim sync. Caller setzt out.rawContentItem nach dem Aufruf.
+    out.source           = PresetSource::OPAQUE;
+    out.opaqueSourceName = sourceStr;
+    r.status             = NormalizeStatus::OK_OPAQUE;
+    r.reason             = String("opaque passthrough for '") + sourceStr + "'";
     return r;
 }
 

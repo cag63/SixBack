@@ -19,10 +19,12 @@
 #include "tunein_resolver.h"
 #include "system_health.h"
 #include "captive_portal.h"
+#include "ota_pull.h"
 #include "auto_mode.h"
 #include "source_normalizer.h"
 #include "bose_endpoints.h"
 #include "event_store.h"
+#include "speaker_diagnostic.h"
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <WiFi.h>
@@ -324,6 +326,8 @@ void handleMigrate(AsyncWebServerRequest* req) {
         // damit ist nichts verloren. Speaker behaelt was er hat (= nichts).
     }
 
+    bosefix::persistPreMigrateSnapshot(id, /*force=*/false);
+
     auto* job = new MigrateJob_{id, ip, myBaseUrl(), /*doMigrate=*/true};
     BaseType_t r = xTaskCreate(migrateRevertWorker_, "bg-migrate", 4096, job,
                                 tskIDLE_PRIORITY + 1, nullptr);
@@ -397,6 +401,13 @@ void handleGetPresets(AsyncWebServerRequest* req) {
         o["stationId"] = p.stationId;
         o["streamUrl"] = p.streamUrl;
         o["imageUrl"]  = p.imageUrl;
+        if (p.source == bosefix::PresetSource::OPAQUE) {
+            o["opaqueSourceName"] = p.opaqueSourceName;
+            // rawContentItem nicht standardmaessig ausliefern (kann gross sein,
+            // und ohnehin nur fuer Diagnose interessant — Diagnostic-Snapshot
+            // hat das XML vollstaendig).
+            o["rawContentItemBytes"] = (uint16_t)p.rawContentItem.length();
+        }
     }
     String body; serializeJson(doc, body);
     req->send(200, "application/json", body);
@@ -517,6 +528,21 @@ int importPresetsFromSpeaker_(const String& id, int& countOk, int& countAban,
         p.slot = slot;
         auto nr = bosefix::normalizePreset(src, loc, name, img, p);
 
+        if (nr.status == bosefix::NormalizeStatus::OK_OPAQUE) {
+            // Vollstaendiges <ContentItem>...</ContentItem> extrahieren —
+            // wird beim Sync 1:1 ans Speaker zurueckgeschickt. Speaker spricht
+            // DLNA/UPnP/Bluetooth selbst an, unsere Cloud ist nicht
+            // beteiligt am Playback.
+            int ciOpen  = xml.indexOf("<ContentItem", idEnd);
+            int ciClose = xml.indexOf("</ContentItem>", ciOpen);
+            if (ciOpen >= 0 && ciOpen < presetClose && ciClose > ciOpen) {
+                p.rawContentItem = xml.substring(ciOpen, ciClose + 14);
+            }
+            if (p.name.length() == 0) {
+                p.name = String("[") + src + String("] preset");
+            }
+        }
+
         if (nr.status == bosefix::NormalizeStatus::ABANDONED) {
             if (!abandoned.isNull()) {
                 JsonObject o = abandoned.add<JsonObject>();
@@ -538,6 +564,10 @@ int importPresetsFromSpeaker_(const String& id, int& countOk, int& countAban,
                 if (nr.status == bosefix::NormalizeStatus::OK_CONVERTED) {
                     o["converted_from"] = nr.originalSource;
                     o["reason"]         = nr.reason;
+                }
+                if (nr.status == bosefix::NormalizeStatus::OK_OPAQUE) {
+                    o["opaque_source"]  = p.opaqueSourceName;
+                    o["raw_bytes"]      = (uint16_t)p.rawContentItem.length();
                 }
             }
             ++countOk;
@@ -589,11 +619,22 @@ struct PushPresetJob_ {
     bosefix::Preset p;
 };
 
-void pushPresetWorker_(void* arg) {
-    auto* job = static_cast<PushPresetJob_*>(arg);
+// Persistenter Single-Worker mit FreeRTOS-Queue. Vorgaenger-Designs hatten
+// pro Push einen eigenen Task spawned + Mutex serialisiert. Bei Burst >6
+// Pushes ging das gelegentlich kaputt — entweder xTaskCreate fail (Heap-
+// Druck mit N×4KB-Stacks parallel) oder Race im Mutex-Lazy-Init.
+//
+// Jetzt: eine Worker-Task wird lazy beim ersten Push-Handle erzeugt und
+// laeuft fuer immer. Handler enqueued nur `PushPresetJob_*` in die Queue,
+// Worker holt FIFO ab. Queue-Full -> 503 (statt verlorenen Tasks).
+static QueueHandle_t g_pushQueue = nullptr;
+static TaskHandle_t  g_pushTask  = nullptr;
+constexpr UBaseType_t PUSH_QUEUE_DEPTH = 16;  // ≥ 3 Speaker × 6 Slots
+
+static void doPush_(const PushPresetJob_& job) {
     HTTPClient http;
     http.setReuse(false);
-    String url = "http://" + job->spIp + ":" + String(BOSE_BMX_PORT) + "/select";
+    String url = "http://" + job.spIp + ":" + String(BOSE_BMX_PORT) + "/select";
     int selectCode = -1;
     if (http.begin(url)) {
         // sourceAccount muss zum Speaker-/sources-Eintrag passen, sonst HTTP 500:
@@ -602,17 +643,17 @@ void pushPresetWorker_(void* arg) {
         //   LOCAL_INTERNET_RADIO -> "" (das ist der ESP-eigene Stream-Proxy,
         //             Speaker akzeptiert leeren Account).
         const char* srcAcct =
-            (job->p.source == bosefix::PresetSource::TUNEIN) ? "TuneIn" : "";
+            (job.p.source == bosefix::PresetSource::TUNEIN) ? "TuneIn" : "";
         String ci = "<ContentItem source=\"";
-        ci += bosefix::presetSourceToStr(job->p.source);
+        ci += bosefix::presetSourceToStr(job.p.source);
         ci += "\" type=\"stationurl\" location=\"";
-        if (job->p.source == bosefix::PresetSource::TUNEIN) {
-            ci += "/v1/playback/station/" + job->p.stationId;
+        if (job.p.source == bosefix::PresetSource::TUNEIN) {
+            ci += "/v1/playback/station/" + job.p.stationId;
         } else {
-            ci += job->p.streamUrl;
+            ci += job.p.streamUrl;
         }
         ci += "\" sourceAccount=\""; ci += srcAcct;
-        ci += "\" isPresetable=\"true\"><itemName>" + job->p.name + "</itemName></ContentItem>";
+        ci += "\" isPresetable=\"true\"><itemName>" + job.p.name + "</itemName></ContentItem>";
         http.addHeader("Content-Type", "text/xml");
         selectCode = http.POST(ci);
         http.end();
@@ -622,10 +663,10 @@ void pushPresetWorker_(void* arg) {
     auto sendKey = [&](const String& state) {
         HTTPClient h;
         h.setReuse(false);
-        String u = "http://" + job->spIp + ":" + String(BOSE_BMX_PORT) + "/key";
+        String u = "http://" + job.spIp + ":" + String(BOSE_BMX_PORT) + "/key";
         if (!h.begin(u)) return;
         h.addHeader("Content-Type", "text/xml");
-        String body = "<key state=\"" + state + "\" sender=\"Gabbo\">PRESET_" + String(job->p.slot) + "</key>";
+        String body = "<key state=\"" + state + "\" sender=\"Gabbo\">PRESET_" + String(job.p.slot) + "</key>";
         h.POST(body);
         h.end();
     };
@@ -633,12 +674,39 @@ void pushPresetWorker_(void* arg) {
     delay(2500);  // > 2s = Long-Press
     sendKey("release");
     Serial.printf("[bg:push-preset] %s slot %u select=%d done\n",
-                  job->spIp.c_str(), job->p.slot, selectCode);
-    delete job;
-    vTaskDelete(nullptr);
+                  job.spIp.c_str(), job.p.slot, selectCode);
+}
+
+void pushPresetWorker_(void* /*arg*/) {
+    PushPresetJob_* job = nullptr;
+    while (true) {
+        if (xQueueReceive(g_pushQueue, &job, portMAX_DELAY) == pdTRUE && job) {
+            doPush_(*job);
+            delete job;
+            job = nullptr;
+        }
+    }
 }
 
 void handlePushPresetToDevice(AsyncWebServerRequest* req) {
+    // Lazy-init: erste Push-Anfrage triggert Worker + Queue. AsyncWebServer
+    // ist single-threaded, kein Race um die Init-Flags.
+    if (!g_pushQueue) {
+        g_pushQueue = xQueueCreate(PUSH_QUEUE_DEPTH, sizeof(PushPresetJob_*));
+        if (!g_pushQueue) {
+            req->send(503, "application/json", "{\"error\":\"push queue alloc failed\"}");
+            return;
+        }
+        BaseType_t tr = xTaskCreate(pushPresetWorker_, "push-worker", 4096,
+                                     nullptr, tskIDLE_PRIORITY + 1, &g_pushTask);
+        if (tr != pdPASS) {
+            vQueueDelete(g_pushQueue);
+            g_pushQueue = nullptr;
+            req->send(503, "application/json", "{\"error\":\"push worker spawn failed\"}");
+            return;
+        }
+    }
+
     String id = req->pathArg(0);
     uint8_t slot = req->pathArg(1).toInt();
     auto& inv = bosefix::SpeakerInventory::instance();
@@ -654,16 +722,17 @@ void handlePushPresetToDevice(AsyncWebServerRequest* req) {
         req->send(400, "application/json", "{\"error\":\"empty slot\"}"); return;
     }
     auto* job = new PushPresetJob_{spIp, p};
-    BaseType_t r = xTaskCreate(pushPresetWorker_, "bg-push", 4096, job,
-                                tskIDLE_PRIORITY + 1, nullptr);
-    if (r != pdPASS) {
+    if (xQueueSend(g_pushQueue, &job, 0) != pdTRUE) {
         delete job;
-        req->send(503, "application/json", "{\"error\":\"task spawn failed\"}");
+        req->send(503, "application/json",
+                  "{\"error\":\"push queue full (>=16 pending) — retry in a few seconds\"}");
         return;
     }
-    req->send(202, "application/json",
-              "{\"ok\":true,\"queued\":true,"
-              "\"message\":\"preset push started in background — physical button press in ~7s\"}");
+    UBaseType_t depth = uxQueueMessagesWaiting(g_pushQueue);
+    String body = "{\"ok\":true,\"queued\":true,\"queue_depth\":";
+    body += String((unsigned)depth);
+    body += ",\"message\":\"preset push enqueued — sequential push-worker, ~7s per slot\"}";
+    req->send(202, "application/json", body);
 }
 
 // -----------------------------------------------------------------------------
@@ -815,6 +884,75 @@ void handleOtaFsUpload(AsyncWebServerRequest* req, String filename,
                                             (unsigned)(index+len));
         else                  Update.printError(Serial);
     }
+}
+
+// -----------------------------------------------------------------------------
+// Online-Update (HTTPS-Pull von install.busware.de) — Inspired by
+// tul-knx-gateway. Drei Endpoints:
+//   GET  /api/update/check    — Manifest holen + Version vergleichen.
+//   POST /api/update/install  — Background-Task startet Firmware-Pull + Flash.
+//   GET  /api/update/status   — JSON-Snapshot fuer UI-Polling.
+// -----------------------------------------------------------------------------
+namespace {
+const char* otaStateName_(bosefix::ota::State s) {
+    using S = bosefix::ota::State;
+    switch (s) {
+        case S::IDLE:       return "idle";
+        case S::CHECKING:   return "checking";
+        case S::AVAILABLE:  return "available";
+        case S::INSTALLING: return "installing";
+        case S::DONE:       return "done";
+        case S::ERROR_:     return "error";
+    }
+    return "?";
+}
+
+void writeOtaStatus_(AsyncWebServerRequest* req) {
+    auto st = bosefix::ota::getStatus();
+    JsonDocument doc;
+    doc["state"]    = otaStateName_(st.state);
+    doc["current"]  = st.current;
+    doc["latest"]   = st.latest;
+    doc["progress"] = st.progress;
+    doc["total"]    = st.total;
+    doc["phase"]    = st.phase;
+    doc["phase_idx"]= st.phaseIdx;
+    doc["phase_n"]  = st.phaseN;
+    doc["error"]    = st.error;
+    String body; serializeJson(doc, body);
+    req->send(200, "application/json", body);
+}
+} // anon
+
+void handleOtaUpdateCheck(AsyncWebServerRequest* req) {
+    bosefix::ota::checkOnline();
+    writeOtaStatus_(req);
+}
+
+void handleOtaUpdateInstall(AsyncWebServerRequest* req) {
+    // Optional: ?force=1 erlaubt Re-Install des gleichen oder eines aelteren
+    // Versions-Standes (z.B. "ich will von install.busware.de denselben Build
+    // nochmal pullen", oder Demo des Progress-Bars wenn current >= latest).
+    bool force = req->hasParam("force") && req->getParam("force")->value() == "1";
+    bool ok = force ? bosefix::ota::installOnlineForceAsync()
+                    : bosefix::ota::installOnlineAsync();
+    if (!ok) {
+        auto st = bosefix::ota::getStatus();
+        if (!force && st.state != bosefix::ota::State::AVAILABLE) {
+            req->send(409, "application/json",
+                      String("{\"error\":\"no update available — run /api/update/check first (use ?force=1 to re-install)\",\"state\":\"")
+                       + otaStateName_(st.state) + "\"}");
+            return;
+        }
+        req->send(500, "application/json",
+                  "{\"error\":\"failed to spawn install task\"}");
+        return;
+    }
+    writeOtaStatus_(req);
+}
+
+void handleOtaUpdateStatus(AsyncWebServerRequest* req) {
+    writeOtaStatus_(req);
 }
 
 void handleRoot(AsyncWebServerRequest* req) {
@@ -999,6 +1137,58 @@ void handleUnknownRequestsClear(AsyncWebServerRequest* req) {
     req->send(200, "application/json", "{\"ok\":true}");
 }
 
+// GET /api/speaker/{id}/diagnostic-snapshot
+//   ?source=stored  → liefert den persistierten Pre-Migrate-Snapshot (404 wenn keiner da)
+//   ?source=live    → erzeugt einen frischen Live-Snapshot vom Speaker (default)
+//   ?save=1         → bei live: zusaetzlich als manueller Snapshot speichern (force)
+void handleDiagnosticSnapshot(AsyncWebServerRequest* req) {
+    String id = req->pathArg(0);
+    String src = req->hasParam("source") ? req->getParam("source")->value() : String("live");
+
+    if (src == "stored") {
+        String stored;
+        if (!bosefix::loadStoredSnapshot(id, stored)) {
+            req->send(404, "application/json",
+                      "{\"error\":\"no stored snapshot for this device\"}");
+            return;
+        }
+        AsyncWebServerResponse* resp = req->beginResponse(200, "application/json", stored);
+        resp->addHeader("Content-Disposition",
+                        "attachment; filename=\"bosefix-snapshot-" + id + "-stored.json\"");
+        req->send(resp);
+        return;
+    }
+
+    JsonDocument doc;
+    if (!bosefix::captureLiveSnapshot(id, doc)) {
+        req->send(502, "application/json",
+                  "{\"error\":\"speaker unreachable or unknown deviceId\"}");
+        return;
+    }
+    doc["snapshot_kind"] = "live";
+
+    if (req->hasParam("save") && req->getParam("save")->value() == "1") {
+        bosefix::persistPreMigrateSnapshot(id, /*force=*/true);
+    }
+
+    String body;
+    serializeJson(doc, body);
+    AsyncWebServerResponse* resp = req->beginResponse(200, "application/json", body);
+    resp->addHeader("Content-Disposition",
+                    "attachment; filename=\"bosefix-snapshot-" + id + "-live.json\"");
+    req->send(resp);
+}
+
+void handleDiagnosticSnapshotMeta(AsyncWebServerRequest* req) {
+    String id = req->pathArg(0);
+    JsonDocument doc;
+    doc["device_id"] = id;
+    doc["has_stored"] = bosefix::hasStoredSnapshot(id);
+    String body;
+    serializeJson(doc, body);
+    req->send(200, "application/json", body);
+}
+
 void registerApiEndpoints(AsyncWebServer& ui) {
     // Statische Assets aus LittleFS (CSS, JS, etc.)
     ui.serveStatic("/assets/", LittleFS, "/assets/").setCacheControl("max-age=600");
@@ -1021,6 +1211,11 @@ void registerApiEndpoints(AsyncWebServer& ui) {
           HTTP_POST, handlePushPresetToDevice);
     ui.on("^/api/speaker/([^/]+)/presets/import-from-device$",
           HTTP_POST, handleImportFromDevice);
+
+    ui.on("^/api/speaker/([^/]+)/diagnostic-snapshot$",
+          HTTP_GET, handleDiagnosticSnapshot);
+    ui.on("^/api/speaker/([^/]+)/diagnostic-snapshot/meta$",
+          HTTP_GET, handleDiagnosticSnapshotMeta);
 
     routeJsonBody(ui, "^/api/speaker/([^/]+)/group$", HTTP_PUT, handlePutGroup);
     routeJsonBody(ui, "/api/group/sync",              HTTP_POST, handleSyncGroup);
@@ -1049,4 +1244,10 @@ void registerApiEndpoints(AsyncWebServer& ui) {
     // exakt ihren Pfad.
     ui.on("^/api/ota$",    HTTP_POST, handleOtaFinalize,   handleOtaUpload);
     ui.on("^/api/ota/fs$", HTTP_POST, handleOtaFsFinalize, handleOtaFsUpload);
+
+    // Online-Update — HTTPS-Pull von install.busware.de
+    bosefix::ota::init(String(FW_VERSION_STRING));
+    ui.on("/api/update/check",   HTTP_GET,  handleOtaUpdateCheck);
+    ui.on("/api/update/install", HTTP_POST, handleOtaUpdateInstall);
+    ui.on("/api/update/status",  HTTP_GET,  handleOtaUpdateStatus);
 }

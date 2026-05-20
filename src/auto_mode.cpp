@@ -8,6 +8,7 @@
 #include "source_normalizer.h"
 #include "speaker_inventory.h"
 #include "speaker_telnet.h"
+#include "speaker_diagnostic.h"
 
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
@@ -194,6 +195,9 @@ void migrateOne_(const Speaker& snap) {
     }
     Serial.printf("[auto] === migrate %s (%s @ %s) ===\n",
                   snap.name.c_str(), snap.deviceId.c_str(), snap.ip.c_str());
+
+    setState_("pre-migrate-snapshot");
+    bosefix::persistPreMigrateSnapshot(snap.deviceId, /*force=*/false);
 
     setState_("import-presets");
     int converted = 0, abandoned = 0, total = 0;

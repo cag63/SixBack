@@ -36,3 +36,4 @@ datasheet/
 # Pre-Release-Test-Protokolle) — nicht für Public-Repo. Bleibt lokal als
 # Entwickler-Referenz.
 docs/
+compile_commands.json

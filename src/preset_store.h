@@ -25,6 +25,13 @@ enum class PresetSource : uint8_t {
     EMPTY                = 0,
     TUNEIN               = 1,
     LOCAL_INTERNET_RADIO = 2,
+    // OPAQUE = Preset einer Source-Klasse die BoseFix32 nicht selbst
+    // aufloest (z.B. STORED_MUSIC, UPNP, BLUETOOTH-Preset). Wir speichern
+    // das komplette urspruengliche <ContentItem>-XML in rawContentItem und
+    // reichen es beim Sync 1:1 zurueck — der Speaker kommuniziert direkt
+    // mit dem DLNA-Server / Bluetooth-Stack, die Cloud (= unser ESP) ist
+    // am Playback nicht beteiligt.
+    OPAQUE               = 3,
 };
 
 struct Preset {
@@ -34,6 +41,14 @@ struct Preset {
     String       stationId;     // bei TUNEIN: "s24896"
     String       streamUrl;     // bei LOCAL_INTERNET_RADIO: "http://liveradio.swr.de/tn2d2ac/swr3"
     String       imageUrl;      // optional
+    // Bei source==OPAQUE: das vollstaendige <ContentItem>...</ContentItem>
+    // XML wie wir es vom Speaker gesehen haben. Wird 1:1 ins toBoseXml
+    // eingebettet. Bei allen anderen Source-Typen leer.
+    String       rawContentItem;
+    // Original-Source-Bezeichnung bei OPAQUE (z.B. "STORED_MUSIC_MEDIA_RENDERER")
+    // — fuer UI-Anzeige und Debugging. Bei native Sources (TUNEIN, ...)
+    // leer.
+    String       opaqueSourceName;
 };
 
 class PresetStore {

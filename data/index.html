@@ -96,10 +96,16 @@
   details { margin-top: .5em; }
   details summary { cursor: pointer; color: var(--mute); font-size: .85em; }
 
-  /* System panel */
-  .syspanel { background: var(--card); border: 1px solid var(--line);
+  /* System panel + Firmware card share the same outer shell */
+  .syspanel, .fwcard { background: var(--card); border: 1px solid var(--line);
               border-radius: 8px; padding: 1em; margin-top: 1em; }
-  .syspanel h2 { margin-top: 0; }
+  .syspanel h2, .fwcard h2 { margin-top: 0; }
+  .fwcard .fwmeta { display: flex; gap: 1em; flex-wrap: wrap; font-size: .9em;
+                    color: var(--mute); margin: 0 0 .8em; }
+  .fwcard .fwmeta b { color: var(--ink); font-family: ui-monospace, Menlo, monospace; }
+  .fwcard hr { border: 0; border-top: 1px dashed var(--line); margin: .8em 0; }
+  .fwcard .hint { font-size: .82em; color: var(--mute); margin: .2em 0 0; }
+  .fwcard .hint a { color: var(--accent); }
   .sys-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(11em, 1fr));
               gap: .6em; margin: .6em 0 1em; }
   .sys-cell { background: #fbfaf6; border: 1px solid var(--line); border-radius: 6px;
@@ -113,12 +119,18 @@
   .ota-row { display: flex; gap: .8em; flex-wrap: wrap; align-items: center;
              margin-top: .5em; }
   .ota-row label { display: inline-flex; align-items: center; gap: .4em; }
-  .ota-progress { display: none; width: 100%; height: .6em;
+  .ota-progress { display: none; width: 100%; height: .55em;
                   background: var(--line); border-radius: 99px; overflow: hidden;
                   margin-top: .4em; }
   .ota-progress.active { display: block; }
   .ota-progress > div { height: 100%; background: var(--accent); width: 0%;
                         transition: width .2s; }
+  /* Text-Label gehoert UNTER den Bar, zentriert. JS toggelt das .active.
+     Falls leer / inaktiv, nimmt es keinen Platz weg.                    */
+  .ota-progress-label { display: none; text-align: center; font-size: .85em;
+                        color: var(--ink); font-family: ui-monospace, Menlo, monospace;
+                        margin-top: .3em; }
+  .ota-progress-label.active { display: block; }
   .repo { margin-top: 1em; font-size: .85em; color: var(--mute); }
   .repo a { color: var(--accent); }
 
@@ -177,23 +189,67 @@
 
 <div id="speakers-host">Loading…</div>
 
-<div class="syspanel">
-  <h2>System</h2>
-  <div class="sys-grid" id="sys-grid">…</div>
+<div class="fwcard">
+  <h2>⬆ Firmware update (OTA over WiFi)</h2>
+  <div class="fwmeta">
+    <div>Installed: <b id="fw-installed">…</b></div>
+    <div>Build date: <b id="fw-builddate">…</b></div>
+  </div>
+
+  <!-- Online-Update: ESP pulled firmware vom Distributions-Host ohne Datei-Pick -->
+  <div style="font-weight:600; margin:.4em 0 .3em;">Online update</div>
+  <p class="hint" style="margin-top:0">
+    The ESP fetches the matching firmware-image for its chip directly
+    from <a href="https://install.busware.de/bosefix/" target="_blank" rel="noopener">install.busware.de</a>
+    — no local file needed.
+  </p>
+  <div class="fwmeta">
+    <div>Latest available: <b id="fw-latest">—</b></div>
+    <div id="fw-online-status" style="color:var(--mute)">status: idle</div>
+  </div>
+  <div class="ota-progress" id="fw-online-prog"><div></div></div>
+  <div class="ota-progress-label" id="fw-online-prog-label"></div>
+  <div class="ota-row" style="margin-top:.4em">
+    <button id="fw-check-btn"   onclick="onlineCheck()">↻ Check for update</button>
+    <button id="fw-install-btn" class="primary" onclick="onlineInstall(false)" disabled>⬇ Install update</button>
+    <button id="fw-force-btn"   style="font-size:.85em" onclick="onlineInstall(true)">⟳ Force re-install</button>
+  </div>
+
+  <hr>
+
+  <!-- Manueller Upload — bleibt fuer Dev / Custom-Builds / Offline-Flashing -->
+  <div style="font-weight:600; margin:.4em 0 .3em;">Manual upload (Dev / custom builds)</div>
   <div class="ota-row">
-    <label>App firmware (firmware.bin):
+    <label>App firmware (<code>*-firmware.bin</code>):
       <input type="file" id="ota-app-file" accept=".bin">
     </label>
-    <button class="primary" onclick="uploadOta('app')">Flash app</button>
+    <button onclick="uploadOta('app')">Flash app</button>
   </div>
   <div class="ota-progress" id="ota-app-prog"><div></div></div>
-  <div class="ota-row">
-    <label>Web UI (littlefs.bin):
+  <div class="ota-progress-label" id="ota-app-prog-label"></div>
+
+  <div class="ota-row" style="margin-top:.6em">
+    <label>Web UI (<code>*-littlefs.bin</code>):
       <input type="file" id="ota-fs-file" accept=".bin">
     </label>
     <button onclick="uploadOta('fs')">Flash web UI</button>
   </div>
   <div class="ota-progress" id="ota-fs-prog"><div></div></div>
+  <div class="ota-progress-label" id="ota-fs-prog-label"></div>
+
+  <p class="hint">
+    Manual upload writes via <code>POST /api/ota</code> (app) or
+    <code>POST /api/ota/fs</code> (LittleFS). After a successful flash the
+    ESP reboots automatically; the page reloads ~9 s later. Get the latest
+    <code>-firmware.bin</code> + <code>-littlefs.bin</code> matching your
+    chip from the
+    <a href="https://github.com/tostmann/BoseFix32/releases" target="_blank" rel="noopener">GitHub releases page</a>.
+  </p>
+</div>
+
+<div class="syspanel">
+  <h2>System</h2>
+  <div class="sys-grid" id="sys-grid">…</div>
   <div class="repo">
     Repository:
     <a href="https://github.com/tostmann/BoseFix32" target="_blank" rel="noopener">github.com/tostmann/BoseFix32</a>
@@ -258,6 +314,39 @@
   </div>
 </div>
 
+<div class="modal" id="modal-snapshot">
+  <div class="box">
+    <h3 id="snap-title">Diagnostic snapshot</h3>
+    <p id="snap-info" style="margin:.5em 0;font-size:.9em;color:var(--mute)"></p>
+    <label style="display:flex;align-items:center;gap:.5em;font-weight:normal;margin-top:.6em">
+      <input type="checkbox" id="snap-fresh" style="width:auto;margin:0"> Capture fresh live state from speaker
+    </label>
+    <p style="margin:.3em 0 0;font-size:.8em;color:var(--mute)">
+      Live capture probes 8 BMX endpoints + Telnet config — typically 5&ndash;15&nbsp;s.
+    </p>
+    <p style="margin:.5em 0 0;font-size:.8em;color:var(--mute);border-left:3px solid var(--accent);padding-left:.5em">
+      Slots shown as <em>empty</em> in this UI (DLNA, Bluetooth, AUX) are
+      <strong>not actually empty on the speaker</strong> — BoseFix32 just can't replay
+      those source types yet. A fresh live capture reveals the real ContentItem
+      so we can add support. Please share the JSON if you have unsupported
+      presets.
+    </p>
+    <div class="ota-progress" id="snap-prog" style="margin-top:1em"><div></div></div>
+    <div class="ota-progress-label" id="snap-prog-label"></div>
+    <p style="margin:.8em 0 .2em;font-size:.78em;color:var(--mute)">
+      <strong>Send to maintainer</strong> uploads the snapshot to
+      <code>install.busware.de</code> for unsupported-source debugging.
+      Includes speaker MAC, IP, firmware version, source XMLs. No WiFi
+      credentials or personal data.
+    </p>
+    <div class="row">
+      <button id="snap-cancel" onclick="closeModal('modal-snapshot')">Cancel</button>
+      <button id="snap-send" onclick="snapshotSend()">📤 Send to maintainer</button>
+      <button id="snap-ok" class="primary" onclick="snapshotDownload()">Download</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -301,9 +390,13 @@ async function loadStatus() {
   try {
     const s = await api('/api/status');
     STATE.myBase = (s.cloud_replacement && s.cloud_replacement.base_url) || '';
+    STATE.installedVersion = s.version;
     document.getElementById('status-meta').textContent =
       `v${s.version} · ${s.wifi.ip} · RSSI ${s.wifi.rssi} dBm · ${s.chip.model} · Heap ${Math.round(s.heap.free/1024)}KB · ${s.speakers_count} speaker(s) known`;
     document.getElementById('raw-status').textContent = JSON.stringify(s, null, 2);
+    // Firmware-Tile: installed + build date populieren
+    document.getElementById('fw-installed').textContent = s.version;
+    document.getElementById('fw-builddate').textContent = s.build;
 
     const h = s.health || {};
     const heapKind  = s.heap.free < 30*1024 ? 'bad'
@@ -407,37 +500,229 @@ async function toggleAutoMode(en) {
   loadAutoMode();
 }
 
-// ---- OTA ----
+// ---- OTA (Firmware-Tile) ----
+// Sanity-Limits — eher grob aber faengt offensichtliche Fehlauswahl ab
+// (jemand laed das LittleFS-Image als App-Firmware hoch oder umgekehrt).
+const FW_LIMITS = {
+  app: { min:  512*1024, max: 4*1024*1024, label: 'App firmware',
+         hint: 'name muss *-firmware.bin sein' },
+  fs:  { min:   32*1024, max: 1*1024*1024, label: 'Web UI (LittleFS)',
+         hint: 'name muss *-littlefs.bin sein' }
+};
+
+function fmtBytes(n) {
+  if (n >= 1024*1024) return (n/1024/1024).toFixed(2) + ' MB';
+  if (n >= 1024)      return (n/1024).toFixed(0) + ' KB';
+  return n + ' B';
+}
+
 function uploadOta(kind) {
+  const lim = FW_LIMITS[kind] || FW_LIMITS.app;
   const fileEl = document.getElementById('ota-'+kind+'-file');
   const file = fileEl.files[0];
   if (!file) { toast('Please pick a .bin file first', 'error'); return; }
-  const label = kind === 'app' ? 'App firmware' : 'Web UI';
-  if (!confirm(`Flash ${label} (${Math.round(file.size/1024)} KB)? ESP reboots after upload.`)) return;
+
+  // Pre-Flight-Checks:
+  if (!/\.bin$/i.test(file.name)) {
+    toast(`${lim.label}: expected a .bin file (got "${file.name}")`, 'error');
+    return;
+  }
+  if (file.size < lim.min) {
+    toast(`${lim.label}: file is suspiciously small (${fmtBytes(file.size)}) — ${lim.hint}`, 'error');
+    return;
+  }
+  if (file.size > lim.max) {
+    toast(`${lim.label}: file is too big (${fmtBytes(file.size)}, max ${fmtBytes(lim.max)}) — ${lim.hint}`, 'error');
+    return;
+  }
+  // Soft-warning fuer wahrscheinlich-vertauschte Pfade.
+  if (kind === 'app' && /littlefs|spiffs|web.?ui|-fs[.-]/i.test(file.name)) {
+    if (!confirm(`Filename "${file.name}" looks like a Web UI image, not app firmware. Flash it as APP anyway?`)) return;
+  }
+  if (kind === 'fs' && /firmware|app[.-]/i.test(file.name)) {
+    if (!confirm(`Filename "${file.name}" looks like app firmware, not a Web UI image. Flash it as FS anyway?`)) return;
+  }
+
+  if (!confirm(`Flash ${lim.label} (${fmtBytes(file.size)})?\n\nESP reboots automatically after upload.`)) return;
+
   const prog = document.getElementById('ota-'+kind+'-prog');
+  const lab  = document.getElementById('ota-'+kind+'-prog-label');
   const bar  = prog.querySelector('div');
-  prog.classList.add('active'); bar.style.width = '0%';
+  prog.classList.add('active');
+  lab.classList.add('active');
+  bar.style.width = '0%';
+  lab.textContent = 'starting…';
+
   const fd = new FormData();
   fd.append('firmware', file, file.name);
+
   const xhr = new XMLHttpRequest();
   xhr.open('POST', '/api/ota'+(kind === 'fs' ? '/fs' : ''));
   xhr.upload.onprogress = e => {
-    if (e.lengthComputable) bar.style.width = Math.round(e.loaded*100/e.total)+'%';
+    if (e.lengthComputable) {
+      const pct = Math.round(e.loaded*100/e.total);
+      bar.style.width = pct + '%';
+      lab.textContent = pct + '% · ' + fmtBytes(e.loaded) + ' / ' + fmtBytes(e.total);
+    }
   };
   xhr.onload = () => {
-    prog.classList.remove('active');
+    bar.style.width = '100%';
     if (xhr.status >= 200 && xhr.status < 300) {
-      toast(`${label}: flash succeeded, ESP rebooting…`, 'success');
-      setTimeout(loadStatus, 8000);
+      lab.textContent = '✓ flashed · ESP rebooting…';
+      toast(`${lim.label}: flash succeeded, ESP rebooting…`, 'success');
+      setTimeout(() => {
+        loadStatus();
+        pollOnline();  // status sync nach reboot
+        setTimeout(() => {
+          prog.classList.remove('active');
+          lab.classList.remove('active');
+        }, 4000);
+      }, 9000);
     } else {
-      toast(`${label} failed: HTTP ${xhr.status} — ${xhr.responseText}`, 'error');
+      prog.classList.remove('active');
+      lab.classList.remove('active');
+      let msg = xhr.responseText;
+      try { msg = JSON.parse(xhr.responseText).error || msg; } catch (_) {}
+      toast(`${lim.label} failed: HTTP ${xhr.status} — ${msg}`, 'error');
     }
   };
   xhr.onerror = () => {
     prog.classList.remove('active');
-    toast(`${label}: upload error`, 'error');
+    lab.classList.remove('active');
+    toast(`${lim.label}: upload error (network / ESP rebooted mid-upload?)`, 'error');
   };
   xhr.send(fd);
+}
+
+// ---- Online-Update (ESP pulls firmware from install.busware.de) ----
+// Pattern stammt aus tul-knx-gateway / ip4knx — der ESP zieht selbst per
+// HTTPS aus dem Distributions-Host. UI ruft check/install und pollt status.
+let OTA_POLL = null;
+
+function renderOnline(d) {
+  const latestEl = document.getElementById('fw-latest');
+  const statEl   = document.getElementById('fw-online-status');
+  const prog     = document.getElementById('fw-online-prog');
+  const bar      = prog.querySelector('div');
+  const checkBtn = document.getElementById('fw-check-btn');
+  const instBtn  = document.getElementById('fw-install-btn');
+
+  latestEl.textContent = d.latest || '—';
+  let msg = '';
+  let cls = 'color:var(--mute)';
+  switch (d.state) {
+    case 'idle':
+      msg = d.latest ? `up-to-date (${d.latest})` : 'status: idle — run Check';
+      cls = d.latest ? 'color:var(--ok)' : 'color:var(--mute)';
+      break;
+    case 'checking':
+      msg = 'fetching manifest…';
+      break;
+    case 'available':
+      msg = `update available: ${d.latest} (current ${d.current})`;
+      cls = 'color:var(--warn)';
+      break;
+    case 'installing':
+      msg = `installing… ${fmtBytes(d.progress)}` + (d.total ? ` / ${fmtBytes(d.total)}` : '');
+      cls = 'color:var(--accent)';
+      break;
+    case 'done':
+      msg = '✓ flashed — ESP rebooting, page will reload…';
+      cls = 'color:var(--ok)';
+      break;
+    case 'error':
+      msg = '✗ ' + (d.error || 'unknown error');
+      cls = 'color:var(--bad)';
+      break;
+  }
+  statEl.textContent = 'status: ' + msg;
+  statEl.style.cssText = cls;
+
+  // Progress-Bar — IMMER waehrend installing/done sichtbar (auch wenn
+  // Content-Length=0, dann indeterminate-Style ohne Prozent, nur Bytes).
+  // Text-Label sitzt UNTER dem Bar, zentriert (eigenes Element).
+  const lab = document.getElementById('fw-online-prog-label');
+  // Zwei-Phasen-Pull (FS dann FW) wird im Label angezeigt:
+  // "[1/2 fs] 30% · 120 KB / 384 KB"
+  const phaseTag = (d.phase && d.phase_idx)
+    ? `[${d.phase_idx}/${d.phase_n} ${d.phase}] ` : '';
+  if (d.state === 'installing') {
+    prog.classList.add('active');
+    lab.classList.add('active');
+    if (d.total > 0) {
+      const pct = Math.round(d.progress*100/d.total);
+      bar.style.width = pct + '%';
+      bar.style.background = '';
+      lab.textContent = phaseTag + pct + '% · ' + fmtBytes(d.progress) + ' / ' + fmtBytes(d.total);
+    } else {
+      // Indeterminate: streifenmuster, nur Bytes-Counter im Label
+      bar.style.width = '100%';
+      bar.style.background =
+        'repeating-linear-gradient(45deg, var(--accent), var(--accent) 12px, ' +
+        'rgba(122,62,0,0.6) 12px, rgba(122,62,0,0.6) 24px)';
+      lab.textContent = phaseTag + fmtBytes(d.progress) + ' downloaded…';
+    }
+  } else if (d.state === 'done') {
+    prog.classList.add('active');
+    lab.classList.add('active');
+    bar.style.background = '';
+    bar.style.width = '100%';
+    lab.textContent = '✓ done · ESP rebooting';
+  } else {
+    prog.classList.remove('active');
+    lab.classList.remove('active');
+    bar.style.background = '';
+  }
+
+  // Button-Enable-State
+  checkBtn.disabled = (d.state === 'checking' || d.state === 'installing');
+  instBtn.disabled  = (d.state !== 'available');
+
+  // Polling: nur waehrend installing, Reload nach done.
+  if (d.state === 'installing') {
+    if (!OTA_POLL) OTA_POLL = setInterval(pollOnline, 1000);
+  } else if (d.state === 'done') {
+    if (OTA_POLL) { clearInterval(OTA_POLL); OTA_POLL = null; }
+    setTimeout(() => location.reload(), 12000);
+  } else {
+    if (OTA_POLL) { clearInterval(OTA_POLL); OTA_POLL = null; }
+  }
+}
+
+async function pollOnline() {
+  try {
+    const r = await fetch('/api/update/status', { cache: 'no-store' });
+    if (!r.ok) return;
+    renderOnline(await r.json());
+  } catch (_) { /* tolerate transient errors during reboot window */ }
+}
+
+async function onlineCheck() {
+  document.getElementById('fw-online-status').textContent = 'status: fetching manifest…';
+  document.getElementById('fw-check-btn').disabled = true;
+  try {
+    const r = await fetch('/api/update/check', { cache: 'no-store' });
+    renderOnline(await r.json());
+  } catch (e) {
+    toast('Update check failed: ' + e.message, 'error');
+    document.getElementById('fw-check-btn').disabled = false;
+  }
+}
+
+async function onlineInstall(force) {
+  const what = force
+    ? 'Re-install current/older firmware from install.busware.de?\n\nESP will fetch the firmware via HTTPS and reboot when done.'
+    : 'Install update from install.busware.de?\n\nESP will fetch the firmware via HTTPS and reboot when done.';
+  if (!confirm(what)) return;
+  try {
+    const url = '/api/update/install' + (force ? '?force=1' : '');
+    const r = await fetch(url, { method: 'POST', cache: 'no-store' });
+    const d = await r.json();
+    if (!r.ok) { toast('Install failed: ' + (d.error || 'HTTP '+r.status), 'error'); return; }
+    renderOnline(d);
+  } catch (e) {
+    toast('Install request failed: ' + e.message, 'error');
+  }
 }
 
 // ---- Speakers ----
@@ -585,6 +870,7 @@ function actionButtonsHtml(s) {
   return migrate + revert +
     `<button onclick="actSpeaker('${s.device_id}','reboot')">⟲ Reboot</button>` +
     `<button onclick="actSpeaker('${s.device_id}','refresh')">🔄 Status</button>` +
+    `<button title="Download diagnostic snapshot — BMX endpoints + Telnet config — to send us for unsupported-source debugging" onclick="downloadSnapshot('${s.device_id}')">📋 Snapshot</button>` +
     `<button class="danger" onclick="removeSpeaker('${s.device_id}')">✕</button>`;
 }
 
@@ -635,13 +921,21 @@ async function loadPresetsFor(devId) {
 function presetCard(devId, p, idx) {
   const slot = idx + 1;
   const empty = (p.source === 'EMPTY' || !p.source);
+  const opaque = (p.source === 'OPAQUE');
   const cls = empty ? 'preset empty' : 'preset';
-  const meta = empty ? '' :
-    (p.source === 'TUNEIN' ? 'TuneIn '+p.stationId : 'URL: '+p.streamUrl);
+  let meta = '';
+  let pname = 'empty';
+  if (opaque) {
+    pname = p.name || ('['+(p.opaqueSourceName||'opaque')+'] preset');
+    meta = 'Passthrough: '+(p.opaqueSourceName || 'unknown source')+' ('+(p.rawContentItemBytes||0)+' B)';
+  } else if (!empty) {
+    pname = p.name;
+    meta = p.source === 'TUNEIN' ? 'TuneIn '+p.stationId : 'URL: '+p.streamUrl;
+  }
   return `
     <div class="${cls}" onclick="editPreset('${devId}', ${slot}, ${JSON.stringify(p).replace(/"/g,'&quot;')})">
       <div class="slot">Preset ${slot}</div>
-      <div class="pname">${empty ? 'empty' : esc(p.name)}</div>
+      <div class="pname">${esc(pname)}</div>
       <div class="pmeta">${esc(meta)}</div>
     </div>`;
 }
@@ -670,6 +964,178 @@ async function removeSpeaker(devId) {
   if (!confirm('Remove speaker from ESP inventory? (The speaker itself is untouched.)')) return;
   try { await api('/api/speakers/'+encodeURIComponent(devId), {method:'DELETE'}); await loadSpeakers(); toast('Removed'); }
   catch(e) { toast(e.message, 'error'); }
+}
+
+let g_snapDev = null;
+let g_snapHasStored = false;
+
+async function downloadSnapshot(devId) {
+  g_snapDev = devId;
+  g_snapHasStored = false;
+
+  // Reset UI state
+  const fresh = document.getElementById('snap-fresh');
+  const prog  = document.getElementById('snap-prog');
+  const lbl   = document.getElementById('snap-prog-label');
+  document.getElementById('snap-title').textContent = 'Snapshot — ' + devId;
+  fresh.checked = false;
+  fresh.disabled = false;
+  prog.classList.remove('active');
+  lbl.classList.remove('active');
+  lbl.textContent = '';
+  prog.querySelector('div').style.width = '0%';
+  document.getElementById('snap-ok').disabled = false;
+  document.getElementById('snap-cancel').disabled = false;
+
+  // Probe meta — sets default + info text
+  let info;
+  try {
+    const meta = await api('/api/speaker/'+encodeURIComponent(devId)+'/diagnostic-snapshot/meta');
+    if (meta && meta.has_stored) {
+      g_snapHasStored = true;
+      info = 'A pre-migrate snapshot is stored on the ESP — default is instant download. ' +
+             'Tick the box for a fresh live probe.';
+    } else {
+      // No stored data — only option is fresh live; force checkbox on + lock
+      fresh.checked = true;
+      fresh.disabled = true;
+      info = 'No stored snapshot for this speaker — will do a live capture.';
+    }
+  } catch (e) {
+    fresh.checked = true;
+    fresh.disabled = true;
+    info = 'Meta endpoint unavailable — will do a live capture.';
+  }
+  document.getElementById('snap-info').textContent = info;
+  openModal('modal-snapshot');
+}
+
+const SNAPSHOT_UPLOAD_URL = 'https://install.busware.de/bosefix/snapshot';
+
+async function snapshotSend() {
+  const devId = g_snapDev;
+  if (!devId) return;
+  const useFresh = document.getElementById('snap-fresh').checked;
+  const src = (g_snapHasStored && !useFresh) ? 'stored' : 'live';
+
+  const prog = document.getElementById('snap-prog');
+  const bar  = prog.querySelector('div');
+  const lbl  = document.getElementById('snap-prog-label');
+  const okBtn = document.getElementById('snap-ok');
+  const sendBtn = document.getElementById('snap-send');
+  const cancelBtn = document.getElementById('snap-cancel');
+
+  okBtn.disabled = true; sendBtn.disabled = true; cancelBtn.disabled = true;
+  prog.classList.add('active');
+  lbl.classList.add('active');
+  lbl.textContent = 'Step 1/2 — fetching snapshot from ESP…';
+  bar.style.width = '0%';
+
+  let pct = 0;
+  const tick = setInterval(() => { pct = Math.min(40, pct + 2); bar.style.width = pct + '%'; },
+                            src === 'live' ? 200 : 30);
+
+  try {
+    // Step 1: pull snapshot from ESP
+    const url1 = '/api/speaker/'+encodeURIComponent(devId)+'/diagnostic-snapshot?source='+src;
+    const r1 = await fetch(url1);
+    if (!r1.ok) {
+      let body=null; try{ body = await r1.json(); }catch(_){}
+      throw new Error('ESP: ' + (body && body.error ? body.error : ('HTTP '+r1.status)));
+    }
+    const snapJson = await r1.text();
+    bar.style.width = '50%';
+    lbl.textContent = 'Step 2/2 — uploading to install.busware.de…';
+
+    // Step 2: POST to maintainer endpoint
+    const r2 = await fetch(SNAPSHOT_UPLOAD_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: snapJson,
+    });
+    clearInterval(tick);
+    if (!r2.ok) {
+      let detail = '';
+      try { detail = (await r2.text()).slice(0, 200); } catch(_){}
+      throw new Error('Server: HTTP '+r2.status+(detail?' — '+detail:''));
+    }
+    let serverInfo = '';
+    try {
+      const j = await r2.json();
+      if (j.stored) serverInfo = ' as '+j.stored;
+    } catch(_) {}
+    bar.style.width = '100%';
+    lbl.textContent = 'Uploaded ('+snapJson.length+' bytes)'+serverInfo;
+    toast('Snapshot sent to maintainer — thank you!', 'success');
+    setTimeout(()=> closeModal('modal-snapshot'), 1200);
+  } catch(e) {
+    clearInterval(tick);
+    bar.style.width = '0%';
+    lbl.textContent = 'Upload failed: '+e.message+' — try Download instead';
+    toast('Send failed: '+e.message, 'error');
+    okBtn.disabled = false; sendBtn.disabled = false; cancelBtn.disabled = false;
+  }
+}
+
+async function snapshotDownload() {
+  const devId = g_snapDev;
+  if (!devId) return;
+  const useFresh = document.getElementById('snap-fresh').checked;
+  const src = (g_snapHasStored && !useFresh) ? 'stored' : 'live';
+
+  const prog = document.getElementById('snap-prog');
+  const bar  = prog.querySelector('div');
+  const lbl  = document.getElementById('snap-prog-label');
+  const okBtn = document.getElementById('snap-ok');
+  const cancelBtn = document.getElementById('snap-cancel');
+
+  okBtn.disabled = true;
+  cancelBtn.disabled = true;
+  prog.classList.add('active');
+  lbl.classList.add('active');
+  lbl.textContent = src === 'live'
+    ? 'Probing speaker — 8 BMX endpoints + Telnet…'
+    : 'Reading stored snapshot…';
+
+  // Indeterminate-looking progress: ramp 0->85% over expected window.
+  // For stored (~instant) we still flash a quick bar so the user sees it ran.
+  let pct = 0;
+  bar.style.width = '0%';
+  const stepMs = src === 'live' ? 200 : 30;
+  const target = 85;
+  const tick = setInterval(() => {
+    pct = Math.min(target, pct + 2);
+    bar.style.width = pct + '%';
+  }, stepMs);
+
+  try {
+    const url = '/api/speaker/'+encodeURIComponent(devId)+'/diagnostic-snapshot?source='+src;
+    const r = await fetch(url);
+    if (!r.ok) {
+      let body=null; try{ body = await r.json(); }catch(_){}
+      throw new Error(body && body.error ? body.error : ('HTTP '+r.status));
+    }
+    const blob = await r.blob();
+    clearInterval(tick);
+    bar.style.width = '100%';
+    lbl.textContent = 'Downloaded ('+blob.size+' bytes)';
+
+    const a = document.createElement('a');
+    const ts = new Date().toISOString().replace(/[:.]/g,'-');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'bosefix-snapshot-'+devId+'-'+src+'-'+ts+'.json';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(a.href), 5000);
+    toast('Snapshot downloaded', 'success');
+    setTimeout(()=> closeModal('modal-snapshot'), 700);
+  } catch(e) {
+    clearInterval(tick);
+    bar.style.width = '0%';
+    lbl.textContent = 'Failed: '+e.message;
+    toast('Snapshot: '+e.message, 'error');
+    okBtn.disabled = false;
+    cancelBtn.disabled = false;
+  }
 }
 
 async function discover() {
@@ -828,6 +1294,10 @@ function esc(s) { return String(s||'').replace(/[&<>"]/g, c=>({'&':'&amp;','<':'
 loadStatus();
 loadSpeakers();
 setInterval(loadStatus, 10000);
+// Online-Update: nicht automatisch checken (kein Polling von extern), nur
+// status sync ziehen — falls zwischenzeitlich ein Install laeuft, zeigt
+// das die UI sofort wieder an.
+setTimeout(pollOnline, 1500);
 </script>
 </body>
 </html>

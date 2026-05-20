@@ -1,6 +1,6 @@
 {
   "name": "BoseFix32",
-  "version": "0.5.372",
+  "version": "0.5.438",
   "funding_url": "https://github.com/tostmann/BoseFix32",
   "new_install_prompt_erase": true,
   "builds": [
