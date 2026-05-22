@@ -373,6 +373,28 @@ void handleAccountFull(AsyncWebServerRequest* req) {
     for (const auto& s : allSpeakers) if (s.accountId == acct) matched.push_back(s);
     if (matched.empty()) matched = allSpeakers;
 
+    // Per-Request-Disambiguation 2026-05-22: Bose-Speaker parsen /full nicht
+    // per <device deviceid=...>-Match, sondern uebernehmen den ERSTEN <device>-
+    // Block als ihren eigenen State. Bei Multi-Device-Account (Emma+Küche
+    // share accountId) bekam jeder Speaker den state des ersten Eintrags.
+    //
+    // Loesung: aus der gemeinsamen matched-Liste den anfragenden Speaker per
+    // Remote-IP identifizieren und an Position 0 sortieren — sodass jeder
+    // Speaker seinen eigenen Block "vorne" sieht. Schwester-Block bleibt
+    // dran (Bose-App + group-orchestration brauchen das ggf.), aber der
+    // anfragende Speaker greift das erste = sein eigenes.
+    String remoteIp = req->client() ? req->client()->remoteIP().toString() : String();
+    if (!remoteIp.isEmpty() && matched.size() > 1) {
+        for (size_t i = 0; i < matched.size(); ++i) {
+            if (matched[i].ip == remoteIp) {
+                if (i != 0) std::swap(matched[0], matched[i]);
+                Serial.printf("[bmx] account/full: requesting speaker ip=%s -> %s (block re-ordered to first)\n",
+                              remoteIp.c_str(), matched[0].deviceId.c_str());
+                break;
+            }
+        }
+    }
+
     // Defense (Race-Fix 2026-05-20): wenn KEIN matched Speaker Presets im
     // Store hat, returnen wir 404 statt account/full mit fehlendem
     // <presets>-Block pro Device. Symmetrisch zu handleAccountPresets +
@@ -740,23 +762,36 @@ void handleProviderSettings(AsyncWebServerRequest* req) {
 // Preset-Endpoints: Speaker fragt nach Account-/Device-Presets
 // -----------------------------------------------------------------------------
 void handleAccountPresets(AsyncWebServerRequest* req) {
-    // Legacy /presets-Endpoint — alte Bose-Cloud-Variante.
-    // Gleiche Schutzlogik wie handleDevicePresets: wenn kein bekannter Speaker
-    // Presets im Store hat, 404 statt <presets/>, damit der Speaker seinen
-    // Local-Cache nicht ueberschreibt.
-    auto speakers = sixback::SpeakerInventory::instance().list();
-    sixback::Speaker* withPresets = nullptr;
-    for (auto& s : speakers) {
-        if (sixback::PresetStore::instance().hasAnyFor(s.deviceId)) {
-            withPresets = &s; break;
-        }
+    // Legacy /streaming/account/<a>/presets — alte Bose-Cloud-Variante ohne
+    // device-disambiguation im Pfad. Bug 2026-05-22: returnte First-Match
+    // ueber alle Speaker, sodass bei Multi-Device-Account jeder Speaker die
+    // Presets des ERSTEN Inventory-Eintrags bekam (Emma).
+    //
+    // Fix: anfragenden Speaker per Remote-IP identifizieren. Speaker baut
+    // Cloud-HTTP von seiner eigenen IP auf, also matcht Inventory.findByIp_.
+    String remoteIp = req->client() ? req->client()->remoteIP().toString() : String();
+    String matchedDevId;
+    {
+        auto& inv = sixback::SpeakerInventory::instance();
+        sixback::SpeakerInventory::LockGuard g(inv);
+        auto* sp = inv.findByIp(remoteIp);
+        if (sp) matchedDevId = sp->deviceId;
     }
-    if (!withPresets) {
-        Serial.println("[bmx][safe] /presets account-level -> 404 (alle Stores leer)");
+    if (matchedDevId.isEmpty()) {
+        Serial.printf("[bmx][safe] /presets account-level -> 404 "
+                      "(kein Speaker mit ip=%s im Inventory)\n", remoteIp.c_str());
         req->send(404, "application/vnd.bose.streaming-v1.2+xml", "");
         return;
     }
-    String body = sixback::PresetStore::instance().toBoseXml(withPresets->deviceId);
+    if (!sixback::PresetStore::instance().hasAnyFor(matchedDevId)) {
+        Serial.printf("[bmx][safe] /presets %s -> 404 (store empty)\n",
+                      matchedDevId.c_str());
+        req->send(404, "application/vnd.bose.streaming-v1.2+xml", "");
+        return;
+    }
+    Serial.printf("[bmx] /presets account-level -> per-device-fix for %s (ip=%s)\n",
+                  matchedDevId.c_str(), remoteIp.c_str());
+    String body = sixback::PresetStore::instance().toBoseXml(matchedDevId);
     req->send(200, "application/vnd.bose.streaming-v1.2+xml", body);
 }
 
