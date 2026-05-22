@@ -67,14 +67,30 @@
     .presets { grid-template-columns: repeat(2, 1fr); }
   }
   .preset { border: 1px solid var(--line); border-radius: 6px; padding: .5em;
-            background: #fbfaf6; display: flex; flex-direction: column; gap: .3em; }
+            background: #fbfaf6; display: flex; flex-direction: column; gap: .3em;
+            position: relative; cursor: pointer; transition: border-color .12s, background .12s, transform .08s; }
+  .preset[draggable="true"] { cursor: grab; }
+  .preset[draggable="true"]:active { cursor: grabbing; }
   .preset .slot { font-size: .7em; color: var(--mute); font-weight: 600; }
+  .preset .pcover { width: 100%; aspect-ratio: 1 / 1; max-height: 96px;
+                    object-fit: contain; background: #fff; border-radius: 4px;
+                    border: 1px solid var(--line); padding: 4px;
+                    pointer-events: none; /* let drag fire on the .preset */ }
+  .preset .pcover-placeholder { width: 100%; aspect-ratio: 1 / 1; max-height: 96px;
+                    display: flex; align-items: center; justify-content: center;
+                    background: #fff; border-radius: 4px; border: 1px dashed var(--line);
+                    font-size: 1.4em; color: var(--mute); pointer-events: none; }
   .preset .pname { font-weight: 600; }
   .preset .pmeta { font-size: .75em; color: var(--mute); font-family: ui-monospace, Menlo, monospace;
                    word-break: break-all; }
   .preset .pactions { display: flex; gap: .25em; margin-top: .25em; }
   .preset.empty { background: #f0ede4; }
   .preset.empty .pname { color: var(--mute); font-style: italic; font-weight: 400; }
+  .preset.opaque { background: #fdf6e7; }
+  .preset.dragging { opacity: .35; transform: scale(.97); }
+  .preset.drop-target { border-color: var(--accent); background: #eaf3ff;
+                        box-shadow: 0 0 0 2px var(--accent) inset; }
+  .preset.drop-blocked { border-color: #c44; background: #fcecec; cursor: not-allowed; }
 
   .modal { position: fixed; inset: 0; background: rgba(0,0,0,.4);
            display: none; align-items: center; justify-content: center; padding: 1em; z-index:99; }
@@ -358,7 +374,7 @@
 <div class="toast" id="toast"></div>
 
 <script>
-let STATE = { speakers: [], editing: null };
+let STATE = { speakers: [], editing: null, dragSource: null, _lastDragEndedAt: 0 };
 
 // ---- Toast ----
 function toast(msg, kind='success') {
@@ -940,22 +956,130 @@ function presetCard(devId, p, idx) {
   const slot = idx + 1;
   const empty = (p.source === 'EMPTY' || !p.source);
   const opaque = (p.source === 'OPAQUE');
-  const cls = empty ? 'preset empty' : 'preset';
+  const cls = 'preset' + (empty ? ' empty' : '') + (opaque ? ' opaque' : '');
+  // Draggable: nur belegte, nicht-OPAQUE Slots. OPAQUE und EMPTY sind valide
+  // Drop-Targets (EMPTY = MOVE, OPAQUE = blockiert mit Toast).
+  const draggable = (!empty && !opaque) ? 'true' : 'false';
   let meta = '';
   let pname = 'empty';
+  let cover = '';
   if (opaque) {
     pname = p.name || ('['+(p.opaqueSourceName||'opaque')+'] preset');
     meta = 'Passthrough: '+(p.opaqueSourceName || 'unknown source')+' ('+(p.rawContentItemBytes||0)+' B)';
+    cover = `<div class="pcover-placeholder" title="speaker-managed">🔒</div>`;
   } else if (!empty) {
     pname = p.name;
     meta = p.source === 'TUNEIN' ? 'TuneIn '+p.stationId : 'URL: '+p.streamUrl;
+    cover = p.imageUrl
+      ? `<img class="pcover" src="${esc(p.imageUrl)}" alt="" loading="lazy" onerror="this.outerHTML='<div class=&quot;pcover-placeholder&quot;>📻</div>'">`
+      : `<div class="pcover-placeholder">📻</div>`;
+  } else {
+    cover = `<div class="pcover-placeholder" title="drop a station here">＋</div>`;
   }
+  // dnd handlers in code (delegation would lose target-specific data on nested img).
+  const dndAttrs = `draggable="${draggable}"
+       data-dev="${esc(devId)}" data-slot="${slot}"
+       data-source="${esc(p.source||'EMPTY')}"
+       ondragstart="onPresetDragStart(event)"
+       ondragend="onPresetDragEnd(event)"
+       ondragover="onPresetDragOver(event)"
+       ondragleave="onPresetDragLeave(event)"
+       ondrop="onPresetDrop(event)"`;
   return `
-    <div class="${cls}" onclick="editPreset('${devId}', ${slot}, ${JSON.stringify(p).replace(/"/g,'&quot;')})">
+    <div class="${cls}" ${dndAttrs} onclick="onPresetClick(event, '${devId}', ${slot}, ${JSON.stringify(p).replace(/"/g,'&quot;')})">
       <div class="slot">Preset ${slot}</div>
+      ${cover}
       <div class="pname">${esc(pname)}</div>
       <div class="pmeta">${esc(meta)}</div>
     </div>`;
+}
+
+// ---- Drag & Drop für Preset-Slots ----
+// STATE.dragSource: {dev, slot, source} solange ein Drag läuft, sonst null.
+// Click-Handler suppress'd den Edit-Modal wenn ein Drag gerade beendet wurde.
+STATE._lastDragEndedAt = 0;
+
+function onPresetClick(ev, devId, slot, p) {
+  // HTML5 dispatcht click NACH dragend wenn der Drag im selben Element startete
+  // und endete. Suppress click für 200ms nach dragend.
+  if (Date.now() - STATE._lastDragEndedAt < 200) return;
+  editPreset(devId, slot, p);
+}
+
+function onPresetDragStart(ev) {
+  const el = ev.currentTarget;
+  if (el.getAttribute('draggable') !== 'true') { ev.preventDefault(); return; }
+  STATE.dragSource = {
+    dev: el.dataset.dev,
+    slot: parseInt(el.dataset.slot, 10),
+    source: el.dataset.source,
+  };
+  el.classList.add('dragging');
+  ev.dataTransfer.effectAllowed = 'move';
+  // Firefox braucht setData um Drag zu starten
+  try { ev.dataTransfer.setData('text/plain', `${STATE.dragSource.dev}#${STATE.dragSource.slot}`); } catch(e){}
+}
+
+function onPresetDragEnd(ev) {
+  ev.currentTarget.classList.remove('dragging');
+  STATE.dragSource = null;
+  STATE._lastDragEndedAt = Date.now();
+  // Säubere drop-target-Klassen falls dragleave nicht für alle gefired hat
+  document.querySelectorAll('.preset.drop-target, .preset.drop-blocked')
+    .forEach(e => e.classList.remove('drop-target','drop-blocked'));
+}
+
+function onPresetDragOver(ev) {
+  if (!STATE.dragSource) return;
+  ev.preventDefault();   // erlaubt Drop
+  const el = ev.currentTarget;
+  const tgtSource = el.dataset.source;
+  // Drop auf eigenen Slot = noop, keine Visualisierung
+  if (el.dataset.dev === STATE.dragSource.dev &&
+      parseInt(el.dataset.slot,10) === STATE.dragSource.slot) return;
+  if (tgtSource === 'OPAQUE') {
+    el.classList.add('drop-blocked');
+    ev.dataTransfer.dropEffect = 'none';
+  } else {
+    el.classList.add('drop-target');
+    ev.dataTransfer.dropEffect = 'move';
+  }
+}
+
+function onPresetDragLeave(ev) {
+  ev.currentTarget.classList.remove('drop-target','drop-blocked');
+}
+
+async function onPresetDrop(ev) {
+  ev.preventDefault();
+  const el = ev.currentTarget;
+  el.classList.remove('drop-target','drop-blocked');
+  const src = STATE.dragSource;
+  if (!src) return;
+  const dst = { dev: el.dataset.dev, slot: parseInt(el.dataset.slot, 10) };
+  if (src.dev === dst.dev && src.slot === dst.slot) return;
+  if (el.dataset.source === 'OPAQUE') {
+    toast('Speaker-managed slot — re-record at speaker via long-press');
+    return;
+  }
+  toast('Swapping…');
+  try {
+    const r = await api('/api/preset/swap', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ src: {dev:src.dev,slot:src.slot}, dst })
+    });
+    if (r && r.ok) {
+      toast(`Swap queued (${r.enqueued||0} pushes) — speakers update in ~7s/slot`);
+      // beide Speaker-Cards neu laden
+      loadPresetsFor(src.dev);
+      if (dst.dev !== src.dev) loadPresetsFor(dst.dev);
+    } else {
+      toast('Swap failed: '+(r && r.error || 'unknown'));
+    }
+  } catch (e) {
+    toast('Swap failed: '+e.message);
+  }
 }
 
 // ---- Speaker actions ----

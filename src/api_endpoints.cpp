@@ -779,6 +779,109 @@ void handlePushPresetToDevice(AsyncWebServerRequest* req) {
 }
 
 // -----------------------------------------------------------------------------
+// POST /api/preset/swap
+//   body: { "src": {"dev":"...", "slot":N}, "dst": {"dev":"...", "slot":M} }
+//   Tauscht zwei Slots (zwischen oder innerhalb von Speakern). Beide Stores
+//   atomic update, beide Pushes in die existierende push-queue enqueued.
+//   OPAQUE als Source oder Target verboten (rawContentItem ist DLNA-source-
+//   spezifisch, Cross-Speaker-Replay nicht garantiert). Empty-Source ist
+//   erlaubt = effektiv MOVE.
+// -----------------------------------------------------------------------------
+void handleSwapPresets(AsyncWebServerRequest* req, JsonDocument& body) {
+    if (!body["src"].is<JsonObject>() || !body["dst"].is<JsonObject>()) {
+        req->send(400, "application/json",
+                  "{\"error\":\"src/dst required as objects\"}");
+        return;
+    }
+    String srcDev = (const char*)(body["src"]["dev"] | "");
+    String dstDev = (const char*)(body["dst"]["dev"] | "");
+    int srcSlot = body["src"]["slot"] | 0;
+    int dstSlot = body["dst"]["slot"] | 0;
+    if (srcDev.isEmpty() || dstDev.isEmpty() ||
+        srcSlot < 1 || srcSlot > 6 || dstSlot < 1 || dstSlot > 6) {
+        req->send(400, "application/json",
+                  "{\"error\":\"src.dev/dst.dev required, slots 1..6\"}");
+        return;
+    }
+    if (srcDev == dstDev && srcSlot == dstSlot) {
+        req->send(200, "application/json", "{\"ok\":true,\"noop\":true}");
+        return;
+    }
+
+    auto& inv = sixback::SpeakerInventory::instance();
+    String srcIp, dstIp;
+    {
+        sixback::SpeakerInventory::LockGuard g(inv);
+        auto* sp1 = inv.findById(srcDev);
+        auto* sp2 = inv.findById(dstDev);
+        if (!sp1) { req->send(404, "application/json", "{\"error\":\"unknown src.dev\"}"); return; }
+        if (!sp2) { req->send(404, "application/json", "{\"error\":\"unknown dst.dev\"}"); return; }
+        srcIp = sp1->ip;
+        dstIp = sp2->ip;
+    }
+
+    auto& store = sixback::PresetStore::instance();
+    auto pSrc = store.get(srcDev, srcSlot);
+    auto pDst = store.get(dstDev, dstSlot);
+
+    if (pSrc.source == sixback::PresetSource::OPAQUE ||
+        pDst.source == sixback::PresetSource::OPAQUE) {
+        req->send(400, "application/json",
+            "{\"error\":\"OPAQUE preset cannot be swapped via WebUI — "
+            "re-record at speaker via long-press\"}");
+        return;
+    }
+
+    if (!g_pushQueue) {
+        g_pushQueue = xQueueCreate(PUSH_QUEUE_DEPTH, sizeof(PushPresetJob_*));
+        if (!g_pushQueue) {
+            req->send(503, "application/json", "{\"error\":\"push queue alloc failed\"}");
+            return;
+        }
+        BaseType_t tr = xTaskCreate(pushPresetWorker_, "push-worker", 4096,
+                                     nullptr, tskIDLE_PRIORITY + 1, &g_pushTask);
+        if (tr != pdPASS) {
+            vQueueDelete(g_pushQueue);
+            g_pushQueue = nullptr;
+            req->send(503, "application/json", "{\"error\":\"push worker spawn failed\"}");
+            return;
+        }
+    }
+
+    sixback::Preset newDst = pSrc; newDst.slot = (uint8_t)dstSlot;
+    sixback::Preset newSrc = pDst; newSrc.slot = (uint8_t)srcSlot;
+
+    bool ok1 = (newDst.source == sixback::PresetSource::EMPTY)
+               ? store.clear(dstDev, dstSlot)
+               : store.set(dstDev, newDst);
+    bool ok2 = (newSrc.source == sixback::PresetSource::EMPTY)
+               ? store.clear(srcDev, srcSlot)
+               : store.set(srcDev, newSrc);
+    if (!ok1 || !ok2) {
+        req->send(500, "application/json", "{\"error\":\"store update failed\"}");
+        return;
+    }
+
+    int enqueued = 0;
+    if (newDst.source != sixback::PresetSource::EMPTY) {
+        auto* job = new PushPresetJob_{dstIp, newDst};
+        if (xQueueSend(g_pushQueue, &job, 0) == pdTRUE) enqueued++;
+        else delete job;
+    }
+    if (newSrc.source != sixback::PresetSource::EMPTY) {
+        auto* job = new PushPresetJob_{srcIp, newSrc};
+        if (xQueueSend(g_pushQueue, &job, 0) == pdTRUE) enqueued++;
+        else delete job;
+    }
+
+    JsonDocument out;
+    out["ok"] = true;
+    out["enqueued"] = enqueued;
+    String s; serializeJson(out, s);
+    req->send(202, "application/json", s);
+}
+
+// -----------------------------------------------------------------------------
 // Gruppen
 // -----------------------------------------------------------------------------
 void handlePutGroup(AsyncWebServerRequest* req, JsonDocument& body) {
@@ -1254,6 +1357,7 @@ void registerApiEndpoints(AsyncWebServer& ui) {
           HTTP_POST, handlePushPresetToDevice);
     ui.on("^/api/speaker/([^/]+)/presets/import-from-device$",
           HTTP_POST, handleImportFromDevice);
+    routeJsonBody(ui, "/api/preset/swap", HTTP_POST, handleSwapPresets);
 
     ui.on("^/api/speaker/([^/]+)/diagnostic-snapshot$",
           HTTP_GET, handleDiagnosticSnapshot);
