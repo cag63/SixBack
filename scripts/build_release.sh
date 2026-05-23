@@ -18,23 +18,50 @@ PIO_BUILD="/root/pio-build/bosefix32"   # Build-Dir keep (path on disk, not user
 OUT="$ROOT/webflasher"
 mkdir -p "$OUT"
 
+# --- 0) Release-tag handling ---------------------------------------------
+# v0.7.6: tag-based versioning. When invoked with a release tag (arg or
+# RELEASE_TAG env), all 4 targets are built with the SAME version string
+# baked in — eliminates the multi-target build drift (where the build
+# counter advanced per `pio run`, so s3-firmware.bin reported a different
+# version than c6-firmware.bin from the same release). Manifest.version
+# also gets the tag, so /api/update/check compares cleanly.
+#
+# Usage:
+#   bash scripts/build_release.sh                # dev build, counter as before
+#   bash scripts/build_release.sh v0.7.6         # release build, tag-based
+#   RELEASE_TAG=v0.7.6 bash scripts/build_release.sh   # same
+RELEASE_TAG="${1:-${RELEASE_TAG:-}}"
+if [ -n "$RELEASE_TAG" ]; then
+  # strip leading 'v' if present (v0.7.6 -> 0.7.6) for both manifest and FW
+  RELEASE_TAG_STRIPPED="${RELEASE_TAG#v}"
+  export RELEASE_TAG  # picked up by scripts/version_bump.py
+  echo ">>> Release build with tag $RELEASE_TAG (FW + manifest = $RELEASE_TAG_STRIPPED)"
+else
+  RELEASE_TAG_STRIPPED=""
+  echo ">>> Dev build (no RELEASE_TAG) — FW + manifest use build counter"
+fi
+
 # --- 1) Compile all envs + their LittleFS images --------------------------
 # Pio's pre-build-hook (version_bump.py) bumpt build_number bei JEDEM
-# `pio run`-Aufruf — buildfs *und* firmware-build je einmal. Damit am Ende
-# manifest.json und firmware.bin DIESELBE Version tragen, muss der zuletzt
-# laufende Bump derjenige sein, der die firmware.bin produziert. Also:
-# buildfs ZUERST, firmware DANACH. version.h-Stand nach beiden Schritten
-# == FW_VERSION_STRING im aktuellen firmware.bin == manifest.json.
+# `pio run`-Aufruf. Beim Dev-Build (kein RELEASE_TAG) wandert der Counter
+# pro Target weiter und der Counter im finalen version.h wird ins manifest
+# geschrieben — multi-target drift bekannt aus v0.7.5 ([[reference-bosefix32-multitarget-build-drift]]).
+# Beim Release-Build (RELEASE_TAG gesetzt) liest version_bump.py das
+# RELEASE_TAG env und uebernimmt es als FW_VERSION_STRING ueberschreibt
+# damit den Counter-Wert. Counter bumpt trotzdem (fuer git-snapshots
+# und FW_VERSION_BUILD-Tracking), aber nicht user-facing.
 #
-# Frueherer Bug (2026-05-19): umgekehrte Reihenfolge → manifest.json war
-# um +1 (oder mehr bei wiederholten Builds) hoeher als die firmware.bin
-# tatsaechlich war. C6 OTA-update zeigte "auf 0.5.422 aktualisiert" aber
-# nach dem Reboot lief 0.5.418.
+# Reihenfolge buildfs vor firmware bleibt aus historischen Gruenden:
+# (frueherer bug 2026-05-19, umgekehrt zeigte manifest.json +1 vs firmware.bin)
 "$HOME/.platformio/penv/bin/pio" run -e esp32 -e s3 -e c3 -e c6 -t buildfs
 "$HOME/.platformio/penv/bin/pio" run -e esp32 -e s3 -e c3 -e c6
 
-# Resolve final version after both bumps (single source of truth in version.h).
-VERSION="$(grep -oE '"[0-9]+\.[0-9]+\.[0-9]+"' "$ROOT/src/version.h" | tr -d '"')"
+# Resolve final version: tag if set, else read counter from version.h.
+if [ -n "$RELEASE_TAG_STRIPPED" ]; then
+  VERSION="$RELEASE_TAG_STRIPPED"
+else
+  VERSION="$(grep -oE '"[0-9]+\.[0-9]+\.[0-9]+"' "$ROOT/src/version.h" | tr -d '"')"
+fi
 echo ">>> SixBack release build, version=$VERSION"
 
 # --- 1.5) Size gate: refuse to publish images that don't fit -------------
