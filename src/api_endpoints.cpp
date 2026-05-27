@@ -28,6 +28,7 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include "speaker_diagnostic.h"
+#include "diag_settings.h"
 #include "spotify_player.h"
 #include <Arduino.h>
 #include <ArduinoJson.h>
@@ -1076,24 +1077,38 @@ void pushPresetWorker_(void* /*arg*/) {
     }
 }
 
-void handlePushPresetToDevice(AsyncWebServerRequest* req) {
-    // Lazy-init: erste Push-Anfrage triggert Worker + Queue. AsyncWebServer
-    // ist single-threaded, kein Race um die Init-Flags.
-    if (!g_pushQueue) {
-        g_pushQueue = xQueueCreate(PUSH_QUEUE_DEPTH, sizeof(PushPresetJob_*));
-        if (!g_pushQueue) {
-            req->send(503, "application/json", "{\"error\":\"push queue alloc failed\"}");
-            return;
-        }
-        BaseType_t tr = xTaskCreate(pushPresetWorker_, "push-worker", 4096,
-                                     nullptr, tskIDLE_PRIORITY + 1, &g_pushTask);
-        if (tr != pdPASS) {
-            vQueueDelete(g_pushQueue);
-            g_pushQueue = nullptr;
-            req->send(503, "application/json", "{\"error\":\"push worker spawn failed\"}");
-            return;
-        }
+// Lazy-init push queue+worker on demand. Single-threaded AsyncWebServer
+// caller, so no init race. Returns 0=ready, -1=queue alloc, -2=task spawn.
+static int ensurePushQueueReady_() {
+    if (g_pushQueue) return 0;
+    g_pushQueue = xQueueCreate(PUSH_QUEUE_DEPTH, sizeof(PushPresetJob_*));
+    if (!g_pushQueue) return -1;
+    BaseType_t tr = xTaskCreate(pushPresetWorker_, "push-worker", 4096,
+                                 nullptr, tskIDLE_PRIORITY + 1, &g_pushTask);
+    if (tr != pdPASS) {
+        vQueueDelete(g_pushQueue);
+        g_pushQueue = nullptr;
+        return -2;
     }
+    return 0;
+}
+
+// Enqueue one push-job. Caller owns the Preset content (we copy by value).
+// Returns 0=enqueued, -1=queue full. Caller must have ensurePushQueueReady_
+// returned 0 already.
+static int enqueuePushJob_(const String& spIp, const sixback::Preset& p) {
+    auto* job = new PushPresetJob_{spIp, p};
+    if (xQueueSend(g_pushQueue, &job, 0) != pdTRUE) {
+        delete job;
+        return -1;
+    }
+    return 0;
+}
+
+void handlePushPresetToDevice(AsyncWebServerRequest* req) {
+    int qr = ensurePushQueueReady_();
+    if (qr == -1) { req->send(503, "application/json", "{\"error\":\"push queue alloc failed\"}"); return; }
+    if (qr == -2) { req->send(503, "application/json", "{\"error\":\"push worker spawn failed\"}"); return; }
 
     String id = req->pathArg(0);
     uint8_t slot = req->pathArg(1).toInt();
@@ -1109,9 +1124,7 @@ void handlePushPresetToDevice(AsyncWebServerRequest* req) {
     if (p.source == sixback::PresetSource::EMPTY) {
         req->send(400, "application/json", "{\"error\":\"empty slot\"}"); return;
     }
-    auto* job = new PushPresetJob_{spIp, p};
-    if (xQueueSend(g_pushQueue, &job, 0) != pdTRUE) {
-        delete job;
+    if (enqueuePushJob_(spIp, p) != 0) {
         req->send(503, "application/json",
                   "{\"error\":\"push queue full (>=16 pending) — retry in a few seconds\"}");
         return;
@@ -1121,6 +1134,228 @@ void handlePushPresetToDevice(AsyncWebServerRequest* req) {
     body += String((unsigned)depth);
     body += ",\"message\":\"preset push enqueued — sequential push-worker, ~7s per slot\"}";
     req->send(202, "application/json", body);
+}
+
+// -----------------------------------------------------------------------------
+// Pre-Migration Restore (Issue #3) — recovery for users who overwrote slots
+// while experimenting with SixBack. Reads the snapshot captured at first
+// migration (/snapshots/<dev>.json, snapshot_kind=pre_migrate), reconstructs
+// the 6 original presets, writes them to PresetStore, and pushes the
+// non-OPAQUE slots via doPush_. OPAQUE (STORED_MUSIC/DLNA) slots get picked
+// up by the speaker on its next /full poll (~30s).
+// -----------------------------------------------------------------------------
+
+// Parse <presets><preset id="N">...</preset></presets> XML out of the
+// snapshot's bmx.presets.body field. Populates outPresets (normalized,
+// ready for PresetStore::setSlots) and outInfo (per-slot summary for
+// the UI preview / response report). Identical parsing logic to
+// importPresetsFromSpeaker_ — kept inline rather than refactored because
+// the live-import path uses xmlExtractAttr/Tag with positional offsets
+// against a different buffer (speaker HTTP response vs snapshot field).
+struct RestoreSlotInfo_ {
+    uint8_t slot;
+    String  source;        // raw, as in snapshot
+    String  name;
+    String  stationId;
+    String  streamUrl;
+    bool    abandoned;
+    bool    opaque;
+    String  reason;        // for abandoned
+};
+
+static void parseSnapshotPresetsXml_(const String& presetsXml,
+                                     std::vector<sixback::Preset>& outPresets,
+                                     std::vector<RestoreSlotInfo_>& outInfo) {
+    int pos = 0;
+    while (true) {
+        int presetOpen = presetsXml.indexOf("<preset id=\"", pos);
+        if (presetOpen < 0) break;
+        int idStart = presetOpen + 12;
+        int idEnd = presetsXml.indexOf('"', idStart);
+        if (idEnd < 0) break;
+        int presetClose = presetsXml.indexOf("</preset>", idEnd);
+        if (presetClose < 0) break;
+        uint8_t slot = presetsXml.substring(idStart, idEnd).toInt();
+        if (slot < 1 || slot > 6) { pos = presetClose; continue; }
+
+        String src  = xmlExtractAttr(presetsXml, idEnd, presetClose, "source");
+        String loc  = xmlExtractAttr(presetsXml, idEnd, presetClose, "location");
+        String name = xmlExtractTag (presetsXml, idEnd, presetClose, "itemName");
+        String img  = xmlExtractTag (presetsXml, idEnd, presetClose, "containerArt");
+
+        sixback::Preset p;
+        p.slot = slot;
+        auto nr = sixback::normalizePreset(src, loc, name, img, p);
+
+        RestoreSlotInfo_ info;
+        info.slot = slot; info.source = src; info.name = name;
+        info.stationId = p.stationId; info.streamUrl = p.streamUrl;
+        info.abandoned = false; info.opaque = false;
+
+        if (nr.status == sixback::NormalizeStatus::OK_OPAQUE) {
+            int ciOpen  = presetsXml.indexOf("<ContentItem", idEnd);
+            int ciClose = presetsXml.indexOf("</ContentItem>", ciOpen);
+            if (ciOpen >= 0 && ciOpen < presetClose && ciClose > ciOpen) {
+                p.rawContentItem = presetsXml.substring(ciOpen, ciClose + 14);
+            }
+            if (p.name.length() == 0) p.name = String("[") + src + String("] preset");
+            info.opaque = true;
+        }
+        if (nr.status == sixback::NormalizeStatus::ABANDONED) {
+            info.abandoned = true;
+            info.reason    = nr.reason;
+        } else {
+            outPresets.push_back(p);
+        }
+        outInfo.push_back(info);
+        pos = presetClose;
+    }
+}
+
+// Common: load + parse the stored snapshot for a deviceId.
+// Returns 0=ok / 404=no snapshot / 500=parse fail. On 0, fills outDoc.
+//
+// Accepts any snapshot_kind ("pre_migrate" written at first migrate,
+// "manual" written from `/diagnostic-snapshot?save=1`, "live" from
+// live-capture-without-save). User sees the kind in the preview and
+// decides whether to restore. The original spec was pre_migrate-only;
+// in practice a manual snapshot is equally valid recovery material —
+// the *user* knows whether they captured it before or after the bad
+// edits.
+static int loadPreMigrateSnapshotDoc_(const String& id, JsonDocument& outDoc,
+                                       String& errOut) {
+    String snapJson;
+    if (!sixback::loadStoredSnapshot(id, snapJson)) {
+        errOut = "no stored snapshot for this speaker";
+        return 404;
+    }
+    if (deserializeJson(outDoc, snapJson)) {
+        errOut = "snapshot JSON parse failed";
+        return 500;
+    }
+    return 0;
+}
+
+// GET /api/speaker/{id}/restore-pre-migration/preview
+//   Returns the slot-by-slot view of what restore WOULD do, without pushing.
+//   UI uses this to render the confirm dialog ("you're about to overwrite
+//   these N slots — proceed?"). No state change.
+void handleRestorePreMigrationPreview(AsyncWebServerRequest* req) {
+    String id = req->pathArg(0);
+    JsonDocument snap;
+    String err;
+    int rc = loadPreMigrateSnapshotDoc_(id, snap, err);
+    if (rc != 0) {
+        JsonDocument e; e["error"] = err;
+        String b; serializeJson(e, b);
+        req->send(rc, "application/json", b);
+        return;
+    }
+    String presetsXml = snap["bmx"]["presets"]["body"] | "";
+    if (presetsXml.length() == 0) {
+        req->send(500, "application/json", "{\"error\":\"snapshot has no bmx.presets.body\"}");
+        return;
+    }
+    std::vector<sixback::Preset>   presets;
+    std::vector<RestoreSlotInfo_>  info;
+    parseSnapshotPresetsXml_(presetsXml, presets, info);
+
+    JsonDocument out;
+    out["ok"] = true;
+    out["captured_at_ms"]    = snap["captured_at_ms"] | (uint32_t)0;
+    out["snapshot_kind"]     = snap["snapshot_kind"] | "";
+    out["speaker_name"]      = snap["speaker"]["name"]      | "";
+    out["speaker_firmware"]  = snap["speaker"]["firmware"]  | "";
+    out["restorable_count"]  = (int)presets.size();
+    out["abandoned_count"]   = (int)(info.size() - presets.size());
+    JsonArray slots = out["slots"].to<JsonArray>();
+    for (const auto& s : info) {
+        JsonObject o = slots.add<JsonObject>();
+        o["slot"]      = s.slot;
+        o["source"]    = s.source;
+        o["name"]      = s.name;
+        o["stationId"] = s.stationId;
+        o["streamUrl"] = s.streamUrl;
+        o["opaque"]    = s.opaque;
+        o["abandoned"] = s.abandoned;
+        if (s.abandoned) o["reason"] = s.reason;
+        o["will_push"] = !s.abandoned && !s.opaque;
+        o["sync_via"]  = s.abandoned ? "n/a (abandoned source — speaker can't play it)"
+                       : s.opaque    ? "speaker /full poll (~30s)"
+                                     : "doPush_ queue (~7s)";
+    }
+    String body; serializeJson(out, body);
+    req->send(200, "application/json", body);
+}
+
+// POST /api/speaker/{id}/restore-pre-migration
+//   Commit the restore: write all reconstructed presets to PresetStore +
+//   enqueue doPush_ for non-OPAQUE/non-abandoned slots. OPAQUE slots are
+//   speaker-managed via /full poll, so we only update the store and trust
+//   the speaker to pick them up on its next poll cycle.
+void handleRestorePreMigration(AsyncWebServerRequest* req) {
+    int qr = ensurePushQueueReady_();
+    if (qr == -1) { req->send(503, "application/json", "{\"error\":\"push queue alloc failed\"}"); return; }
+    if (qr == -2) { req->send(503, "application/json", "{\"error\":\"push worker spawn failed\"}"); return; }
+
+    String id = req->pathArg(0);
+    auto& inv = sixback::SpeakerInventory::instance();
+    String spIp;
+    {
+        sixback::SpeakerInventory::LockGuard g(inv);
+        auto* sp = inv.findById(id);
+        if (!sp) { req->send(404, "application/json", "{\"error\":\"unknown deviceId\"}"); return; }
+        spIp = sp->ip;
+    }
+    JsonDocument snap;
+    String err;
+    int rc = loadPreMigrateSnapshotDoc_(id, snap, err);
+    if (rc != 0) {
+        JsonDocument e; e["error"] = err;
+        String b; serializeJson(e, b);
+        req->send(rc, "application/json", b);
+        return;
+    }
+    String presetsXml = snap["bmx"]["presets"]["body"] | "";
+    if (presetsXml.length() == 0) {
+        req->send(500, "application/json", "{\"error\":\"snapshot has no bmx.presets.body\"}");
+        return;
+    }
+    std::vector<sixback::Preset>   presets;
+    std::vector<RestoreSlotInfo_>  info;
+    parseSnapshotPresetsXml_(presetsXml, presets, info);
+    if (presets.empty()) {
+        req->send(422, "application/json",
+                  "{\"error\":\"no restorable presets in snapshot (all 6 slots abandoned)\"}");
+        return;
+    }
+
+    // Write to PresetStore in one batch. The speaker will pick up OPAQUE
+    // slots automatically on its next /full poll.
+    sixback::PresetStore::instance().setSlots(id, presets);
+
+    // Push the non-OPAQUE / non-abandoned slots via the existing pipeline.
+    int pushedCount = 0, opaqueCount = 0, abandonedCount = 0, queueFull = 0;
+    for (const auto& p : presets) {
+        if (p.source == sixback::PresetSource::OPAQUE) { ++opaqueCount; continue; }
+        if (enqueuePushJob_(spIp, p) == 0) ++pushedCount;
+        else                                ++queueFull;
+    }
+    for (const auto& s : info) if (s.abandoned) ++abandonedCount;
+
+    JsonDocument out;
+    out["ok"]              = true;
+    out["restored_count"]  = (int)presets.size();
+    out["pushed_count"]    = pushedCount;
+    out["opaque_count"]    = opaqueCount;
+    out["abandoned_count"] = abandonedCount;
+    out["queue_full"]      = queueFull;
+    out["message"]         = String("restored ") + presets.size() +
+                             " slot(s); pushing " + pushedCount +
+                             " via /select+long-press (~7s each), " + opaqueCount +
+                             " OPAQUE slot(s) will sync on speaker's next /full poll";
+    String body; serializeJson(out, body);
+    req->send(200, "application/json", body);
 }
 
 // -----------------------------------------------------------------------------
@@ -1992,6 +2227,43 @@ void handlePutAutoMode(AsyncWebServerRequest* req, JsonDocument& body) {
 }
 
 // -----------------------------------------------------------------------------
+// Diagnostic-Sharing — Opt-In fuer Snapshot-Upload zum Maintainer-Receiver
+// (Issue #4). Default OFF. Bei Aktivierung wird einmalig der retroaktive
+// Upload-Worker getriggert, der existierende /snapshots/*.json hochlaedt.
+// -----------------------------------------------------------------------------
+void handleGetDiagShare(AsyncWebServerRequest* req) {
+    auto cfg = sixback::loadDiagShareConfig();
+    JsonDocument doc;
+    doc["upload_enabled"] = cfg.uploadEnabled;
+    doc["receiver"]       = "https://sixback.io/snapshots/bosefix/snapshot";
+    doc["notice"]         = "Snapshot enthaelt: Speaker-Identitaet (MAC, Modell, "
+                            "Firmware), Presets + Sources + Now-Playing, "
+                            "Speaker-System-Konfiguration. Wird nur bei Debug-"
+                            "Anfragen vom Maintainer verwendet.";
+    String b; serializeJson(doc, b);
+    req->send(200, "application/json", b);
+}
+
+void handlePutDiagShare(AsyncWebServerRequest* req, JsonDocument& body) {
+    auto cfg = sixback::loadDiagShareConfig();
+    bool wasEnabled = cfg.uploadEnabled;
+    if (body["upload_enabled"].is<bool>()) {
+        cfg.uploadEnabled = body["upload_enabled"].as<bool>();
+    }
+    sixback::saveDiagShareConfig(cfg);
+    // Just-now-aktiviert → retroaktiven Upload der lokal gesammelten
+    // Snapshots starten (best-effort, async).
+    if (!wasEnabled && cfg.uploadEnabled) {
+        sixback::uploadAllStoredSnapshots();
+    }
+    JsonDocument resp;
+    resp["ok"]             = true;
+    resp["upload_enabled"] = cfg.uploadEnabled;
+    String b; serializeJson(resp, b);
+    req->send(200, "application/json", b);
+}
+
+// -----------------------------------------------------------------------------
 // P2 — Event-Capture / Now-Playing-UI.
 //   GET  /api/events                       — all devices, latest now-playing per
 //   GET  /api/speaker/{deviceId}/now-playing  — single device
@@ -2497,6 +2769,12 @@ void registerApiEndpoints(AsyncWebServer& ui) {
     ui.on("^/api/speaker/([^/]+)/diagnostic-snapshot/meta$",
           HTTP_GET, handleDiagnosticSnapshotMeta);
 
+    // Issue #3: Pre-Migration Restore — preview (diff) + commit.
+    ui.on("^/api/speaker/([^/]+)/restore-pre-migration/preview$",
+          HTTP_GET,  handleRestorePreMigrationPreview);
+    ui.on("^/api/speaker/([^/]+)/restore-pre-migration$",
+          HTTP_POST, handleRestorePreMigration);
+
     routeJsonBody(ui, "^/api/speaker/([^/]+)/group$", HTTP_PUT, handlePutGroup);
     routeJsonBody(ui, "/api/group/sync",              HTTP_POST, handleSyncGroup);
 
@@ -2505,6 +2783,9 @@ void registerApiEndpoints(AsyncWebServer& ui) {
 
     ui.on("/api/auto-mode",          HTTP_GET,  handleGetAutoMode);
     routeJsonBody(ui, "/api/auto-mode", HTTP_PUT, handlePutAutoMode);
+
+    ui.on("/api/diag-share",         HTTP_GET,  handleGetDiagShare);
+    routeJsonBody(ui, "/api/diag-share", HTTP_PUT, handlePutDiagShare);
     routeJsonBody(ui, "/api/test/force-ip-change", HTTP_POST, handleTestForceIpChange);
 
     ui.on("/api/factory_reset_wifi", HTTP_POST, handleFactoryResetWifi);

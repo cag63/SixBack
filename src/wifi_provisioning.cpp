@@ -67,6 +67,13 @@ bool tryConnectFromNVS() {
     }
     Serial.printf("[wifi] NVS credentials present, trying ssid=%s\n", ssid.c_str());
     WiFi.mode(WIFI_STA);
+    // C6 4WAY_HANDSHAKE-Fix (siehe Memo reference_esp32_c6_wifi_ps_handshake).
+    // Arduino-Wrapper WiFi.setSleep + direkter IDF-Call esp_wifi_set_ps —
+    // bei Framework 3.3.7 reicht der Wrapper allein nicht mehr aus, der
+    // IDF-Default WIFI_PS_MIN_MODEM ueberlebt sonst den Mode-Switch und
+    // killt das 4-way-handshake-Timing auf WPA2-Mixed-APs.
+    WiFi.setSleep(WIFI_PS_NONE);
+    esp_wifi_set_ps(WIFI_PS_NONE);
     WiFi.begin(ssid.c_str(), psk.c_str());
     uint32_t t0 = millis();
     // WICHTIG: improvSerial waehrend des STA-connect-waits weiter pumpen.
@@ -138,7 +145,12 @@ void startImprovMode() {
     // SixBack hat es bis v0.5.450 erst NACH Connect via
     // wifiOptimizeForReliability() gesetzt — zu spaet wenn der Connect
     // selbst schon scheitert.
+    //
+    // 2026-05-27: Arduino-Wrapper WiFi.setSleep reicht bei Framework
+    // 3.3.7 nicht mehr; der IDF-Default WIFI_PS_MIN_MODEM ueberlebt den
+    // Mode-Switch. Zusaetzlich esp_wifi_set_ps direkt aufrufen.
     WiFi.setSleep(WIFI_PS_NONE);
+    esp_wifi_set_ps(WIFI_PS_NONE);
     WiFi.setAutoReconnect(true);
     // Chip-Family per IDF-Target, damit ESP Web Tools die korrekte
     // chipFamily-String fuer ihren UI-flow sieht.

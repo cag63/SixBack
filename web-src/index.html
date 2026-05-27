@@ -620,6 +620,21 @@
   </details>
 </div>
 
+<div class="automode-bar" id="diagshare-bar" style="margin-top:1em">
+  <span class="label">Share diagnostic snapshots:</span>
+  <label class="switch" title="Off by default — uploads pre-migration snapshots to sixback.io for the maintainer">
+    <input type="checkbox" id="ds-toggle" onchange="toggleDiagShare(this.checked)">
+    <span class="slider"></span>
+  </label>
+  <span class="pill" id="ds-pill">…</span>
+  <span class="detail" id="ds-detail">
+    Off by default. When on, the ESP uploads pre-migration snapshots to
+    <code>sixback.io</code> for the maintainer to debug support requests.
+    Sent data: speaker identity (MAC, model, firmware) + preset + source
+    state + speaker configuration.
+  </span>
+</div>
+
 <!-- Modals -->
 <div class="modal" id="modal-add">
   <div class="box">
@@ -737,6 +752,26 @@
   </div>
 </div>
 
+<div class="modal" id="modal-restore">
+  <div class="box" style="max-width:640px">
+    <h3 id="restore-title">⏮ Restore pre-migration state</h3>
+    <p id="restore-info" style="margin:.5em 0;font-size:.9em;color:var(--mute)">…</p>
+    <div id="restore-slots" style="margin:.6em 0;font-size:.9em"></div>
+    <p style="margin:.5em 0 0;font-size:.78em;color:var(--mute);border-left:3px solid var(--accent);padding-left:.5em">
+      Non-OPAQUE slots (TuneIn / Internet Radio) are pushed via <code>/select</code> +
+      long-press at ~7&nbsp;s per slot. OPAQUE slots (DLNA / Bluetooth / Stored Music) get
+      synced on the speaker's next <code>/full</code> poll (~30&nbsp;s). Abandoned slots are
+      skipped (source no longer representable). Your current store will be replaced.
+    </p>
+    <div class="row">
+      <button onclick="closeModal('modal-restore')">Cancel</button>
+      <button id="restore-go" class="primary" onclick="restorePreMigrationCommit()">
+        ⏮ Restore now
+      </button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -767,7 +802,25 @@ const STATIONS_API_BASES = [
 let STATIONS_API_BASE = STATIONS_API_BASES[0];   // updated to whichever base actually works
 
 // ---- Toast ----
+// Dedup: identical msg+kind within DEDUP_MS is treated as the same event —
+// we refresh the on-screen toast lifetime but don't blink/restack it. This
+// kills the spam wave when transient backend errors fire on every poll-tick.
+const TOAST_DEDUP_MS = 8000;
+let _lastToastKey = '';
+let _lastToastAt  = 0;
 function toast(msg, kind='success') {
+  const key = kind + '|' + msg;
+  const now = Date.now();
+  if (key === _lastToastKey && (now - _lastToastAt) < TOAST_DEDUP_MS) {
+    _lastToastAt = now;                                  // extend window
+    clearTimeout(window._toastT);
+    window._toastT = setTimeout(() => {
+      document.getElementById('toast').className = 'toast';
+    }, 4000);
+    return;
+  }
+  _lastToastKey = key;
+  _lastToastAt  = now;
   const t = document.getElementById('toast');
   t.textContent = msg;
   t.className = 'toast show ' + kind;
@@ -850,9 +903,16 @@ async function loadStatus() {
                 : 'closed',
               s.wifi.captive_active ? 'ok' : ''),
     ].join('');
-  } catch (e) { toast('Status: '+e.message, 'error'); }
+  } catch (e) {
+    // Transient: ESP mid-reboot / WiFi blip / page background-throttled.
+    // Show as inline indicator (NOT a toast — would spam on every poll-tick).
+    const meta = document.getElementById('status-meta');
+    if (meta) meta.textContent = 'status unreachable — retrying… (' + e.message + ')';
+    console.warn('loadStatus failed:', e.message);
+  }
   // Auto-Mode-Bar parallel refreshen
   loadAutoMode();
+  loadDiagShare();
 }
 
 // ---- Auto-Mode toggle ----
@@ -912,6 +972,36 @@ async function toggleAutoMode(en) {
     toast(`Auto-Migrate ${en ? 'enabled' : 'disabled'}`, 'success');
   } catch (e) { toast('Toggle failed: '+e.message, 'error'); }
   loadAutoMode();
+}
+
+// ---- Diagnostic-Sharing toggle (Issue #4: default OFF, opt-in via UI) ----
+async function loadDiagShare() {
+  try {
+    const d = await api('/api/diag-share');
+    const bar    = document.getElementById('diagshare-bar');
+    const toggle = document.getElementById('ds-toggle');
+    const pill   = document.getElementById('ds-pill');
+    toggle.checked  = !!d.upload_enabled;
+    toggle.disabled = false;
+    bar.classList.toggle('on',  d.upload_enabled);
+    bar.classList.toggle('off', !d.upload_enabled);
+    pill.className   = 'pill ' + (d.upload_enabled ? 'migrated_us' : 'unknown');
+    pill.textContent = d.upload_enabled ? 'ON' : 'OFF';
+  } catch (e) { /* silent — page-load tick, no toast (see #1) */ }
+}
+
+async function toggleDiagShare(en) {
+  document.getElementById('ds-toggle').disabled = true;
+  try {
+    await api('/api/diag-share', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({upload_enabled: !!en})
+    });
+    toast(en ? 'Diagnostic sharing enabled — uploading any local snapshots in background'
+             : 'Diagnostic sharing disabled', 'success');
+  } catch (e) { toast('Diag-Share toggle failed: '+e.message, 'error'); }
+  loadDiagShare();
 }
 
 // ---- OTA (Firmware-Tile) ----
@@ -1146,7 +1236,17 @@ async function loadSpeakers() {
     STATE.speakers = r.speakers || [];
     renderSpeakers();
     refreshSidebarTargets();
-  } catch (e) { toast('Speaker list: '+e.message, 'error'); }
+  } catch (e) {
+    // Don't toast — this refreshes on a timer and would spam on every tick
+    // during transient backend failures (mid-OTA, WiFi blip). Render an
+    // inline placeholder in the speakers container and log to console.
+    const host = document.getElementById('speakers');
+    if (host && !host.querySelector('.speaker')) {
+      host.innerHTML = '<div style="color:var(--mute);font-size:.9em;padding:.6em">'
+                     + 'Speaker list unreachable — retrying…</div>';
+    }
+    console.warn('loadSpeakers failed:', e.message);
+  }
 }
 
 // Status classification combines the Telnet probe (status, cloud_url) with the
@@ -1304,6 +1404,7 @@ function actionButtonsHtml(s) {
     `<button title="Download all 6 store-side preset slots of this speaker as a JSON file" onclick="exportPresetsSet('${s.device_id}')">⬇ Export</button>` +
     `<button title="Upload a previously exported preset-set JSON for this speaker (replaces store; push to hardware afterwards)" onclick="importPresetsSet('${s.device_id}')">⬆ Import</button>` +
     `<button title="Download diagnostic snapshot — BMX endpoints + Telnet config — to send us for unsupported-source debugging" onclick="downloadSnapshot('${s.device_id}')">📋 Snapshot</button>` +
+    `<button title="Restore the speaker's preset state captured at first migration. Useful if you overwrote slots while experimenting." onclick="openRestorePreMigration('${s.device_id}')">⏮ Restore</button>` +
     `<button class="danger" onclick="removeSpeaker('${s.device_id}')">✕</button>`;
 }
 
@@ -1343,17 +1444,39 @@ function speakerCard(s, myBase) {
 // Fetch both ESP-store and hardware-presets in parallel, store both in
 // STATE.presetsByDev[devId] for the dual-row renderer. Auto-import from
 // device only if the ESP store has never been populated (legacy behavior).
+//
+// Failure mode that bit us before: a transient backend failure on the store
+// fetch used to fall through `storeR.presets || []` as an empty array, which
+// then convinced the auto-import block that the store was "empty" — leading
+// it to silently overwrite a just-dropped slot with hardware state. The
+// error-shape detection below bails BEFORE touching STATE in that case.
 async function loadPresetsFor(devId) {
   try {
     const [storeR, hwR] = await Promise.all([
       api('/api/speaker/'+encodeURIComponent(devId)+'/presets').catch(e => ({error: e.message})),
       api('/api/speaker/'+encodeURIComponent(devId)+'/hardware-presets').catch(e => ({error: e.message})),
     ]);
+    // Bail BEFORE overwriting STATE if either fetch failed: keep last-known-
+    // good state in STATE.presetsByDev[devId], retry once after 600ms.
+    if (storeR && storeR.error) {
+      console.warn('loadPresetsFor: store fetch failed for', devId, '—', storeR.error);
+      STATE._presetsRetry = STATE._presetsRetry || {};
+      if (!STATE._presetsRetry[devId]) {
+        STATE._presetsRetry[devId] = true;
+        setTimeout(() => { delete STATE._presetsRetry[devId]; loadPresetsFor(devId); }, 600);
+      }
+      return;
+    }
     let storeSlots = normalizeStoreSlots_(storeR.presets || []);
-    const hwSlots  = normalizeHwSlots_(hwR.slots || [], hwR.ok);
+    const hwSlots  = normalizeHwSlots_(hwR && hwR.slots || [], hwR && hwR.ok);
     // First-contact import: if store empty, pull from hardware.
+    // Only allowed when there's NO prior STATE for this device (== true cold
+    // start). Once we've already populated presetsByDev[devId] once, any
+    // subsequent "all empty" reading must be authoritative — otherwise a
+    // user-initiated clear-all gets silently undone by re-import.
     const storeAllEmpty = storeSlots.every(s => isSlotEmpty_(s));
-    if (storeAllEmpty && !hwSlots.every(s => isSlotEmpty_(s))) {
+    const hadPriorState = !!STATE.presetsByDev[devId];
+    if (!hadPriorState && storeAllEmpty && hwSlots.length && !hwSlots.every(s => isSlotEmpty_(s))) {
       try {
         const ir = await api('/api/speaker/'+encodeURIComponent(devId)+'/presets/import-from-device',
                               {method:'POST'});
@@ -1364,14 +1487,57 @@ async function loadPresetsFor(devId) {
       } catch(_) {}
     }
     STATE.presetsByDev[devId] = { store: storeSlots, hw: hwSlots,
-                                   hwReachable: hwR.ok !== false, loadedAt: Date.now() };
+                                   hwReachable: hwR && hwR.ok !== false, loadedAt: Date.now() };
     renderSpeakerSlots(devId);
     // Index slots for fast now-playing match lookups
     STATE.slotIndex = STATE.slotIndex || {};
     storeSlots.forEach((p, i) => { STATE.slotIndex[`${devId}#${i+1}`] = p; });
     applyPlayingHighlight(devId);
     updatePushVisibility(devId);
-  } catch(e) { /* ignore */ }
+  } catch(e) { console.warn('loadPresetsFor outer:', e.message); }
+}
+
+// Optimistic store-side patch — call right after a successful PUT on a slot
+// so the dual-row diff and "push" button visibility update instantly,
+// regardless of when the subsequent loadPresetsFor() round-trip completes.
+// `body` matches the PUT payload (source/name/stationId/streamUrl/imageUrl).
+function patchStoreSlot_(devId, slot, body) {
+  const d = STATE.presetsByDev[devId];
+  if (!d || !d.store) return;
+  d.store[slot-1] = {
+    slot,
+    source:    body.source    || 'EMPTY',
+    name:      body.name      || '',
+    stationId: body.stationId || '',
+    streamUrl: body.streamUrl || '',
+    imageUrl:  body.imageUrl  || '',
+  };
+  STATE.slotIndex = STATE.slotIndex || {};
+  STATE.slotIndex[devId+'#'+slot] = d.store[slot-1];
+  renderSpeakerSlots(devId);
+  // markDirty is called by the drop handlers themselves — don't double up here.
+  updatePushVisibility(devId);
+}
+
+// Optimistic in-store swap — applied right after a successful /api/preset/swap
+// so the dual-row diff visibility update is instant on both slots.
+function swapStoreSlots_(srcDev, srcSlot, dstDev, dstSlot) {
+  const sd = STATE.presetsByDev[srcDev];
+  const dd = STATE.presetsByDev[dstDev];
+  if (!sd || !sd.store || !dd || !dd.store) return;
+  const tmp = sd.store[srcSlot-1];
+  sd.store[srcSlot-1] = dd.store[dstSlot-1];
+  dd.store[dstSlot-1] = tmp;
+  // Restore positional slot numbers (the slot field is the new index).
+  sd.store[srcSlot-1].slot = srcSlot;
+  dd.store[dstSlot-1].slot = dstSlot;
+  STATE.slotIndex = STATE.slotIndex || {};
+  STATE.slotIndex[srcDev+'#'+srcSlot] = sd.store[srcSlot-1];
+  STATE.slotIndex[dstDev+'#'+dstSlot] = dd.store[dstSlot-1];
+  renderSpeakerSlots(srcDev);
+  if (srcDev !== dstDev) renderSpeakerSlots(dstDev);
+  updatePushVisibility(srcDev);
+  if (srcDev !== dstDev) updatePushVisibility(dstDev);
 }
 
 // Normalize backend `/presets` JSON to a length-6 array indexed 0..5.
@@ -1836,6 +2002,7 @@ async function applyExternalPreset(payload, dst) {
                         body: JSON.stringify(body)});
     if (r && r.ok) {
       markDirty(dst.dev);
+      patchStoreSlot_(dst.dev, dst.slot, body);   // optimistic — instant diff
       const spotMsg = payload.spotify && payload.spotify.uri ? ' + Spotify mapping' : '';
       toast(`Imported "${payload.name || payload.source}"${spotMsg} → slot ${dst.slot}` +
             (payload.exported_from ? ` (from ${payload.exported_from})` : ''));
@@ -1931,6 +2098,7 @@ async function onPresetDrop(ev) {
       });
       if (r && r.ok) {
         markDirty(dst.dev);
+        patchStoreSlot_(dst.dev, dst.slot, putBody);   // optimistic — instant diff
         const note = src.libSource === 'TUNEIN' ? ''
                    : ' (stream-tunnel — HTTP-only streams work best; HTTPS streams may fail on older Bose-FW)';
         toast(`"${src.name}" → slot ${dst.slot}${note}. Click the slot's push button to save to speaker.`);
@@ -1985,6 +2153,7 @@ async function onPresetDrop(ev) {
       });
       if (r && r.ok) {
         markDirty(dst.dev);
+        patchStoreSlot_(dst.dev, dst.slot, putBody);   // optimistic — instant diff
         toast(`Copied "${putBody.name || srcSlot.source}" → ${dst.dev.substring(0,6)}… slot ${dst.slot}. Click push to save on speaker.`);
         loadPresetsFor(dst.dev);
         kickPoll(dst.dev);
@@ -2007,6 +2176,7 @@ async function onPresetDrop(ev) {
     });
     if (r && r.ok) {
       markDirty(src.dev);
+      swapStoreSlots_(src.dev, src.slot, dst.dev, dst.slot);   // optimistic — instant diff
       toast(`Swap done in store — click per-slot push (or Push-All) to save to hardware`);
       loadPresetsFor(src.dev);
       kickPoll(src.dev);
@@ -2864,6 +3034,87 @@ async function downloadSnapshot(devId) {
   }
   document.getElementById('snap-info').textContent = info;
   openModal('modal-snapshot');
+}
+
+// ---- Pre-Migration Restore (Issue #3) ----
+// Opens the restore confirm modal: fetches /preview, renders slot-by-slot
+// table, lets user confirm or cancel. Disables the speaker from receiving
+// new drag/drop while the modal is open (modal blocks interaction anyway).
+let g_restoreDev = '';
+
+async function openRestorePreMigration(devId) {
+  g_restoreDev = devId;
+  document.getElementById('restore-title').textContent = '⏮ Restore pre-migration — ' + devId;
+  document.getElementById('restore-info').textContent = 'Loading snapshot…';
+  document.getElementById('restore-slots').innerHTML = '';
+  document.getElementById('restore-go').disabled = true;
+  openModal('modal-restore');
+  let prev;
+  try {
+    prev = await api('/api/speaker/'+encodeURIComponent(devId)+'/restore-pre-migration/preview');
+  } catch (e) {
+    document.getElementById('restore-info').innerHTML =
+      `<span style="color:var(--danger)">Cannot restore: ${esc(e.message)}</span><br>` +
+      `Most likely no pre-migrate snapshot was captured for this speaker — that only happens on the very first migration.`;
+    return;
+  }
+  const ts = prev.captured_at_ms ? new Date(prev.captured_at_ms).toLocaleString() : '?';
+  const kindWarn = (prev.snapshot_kind && prev.snapshot_kind !== 'pre_migrate')
+    ? ` <span style="color:var(--danger)">(kind: ${esc(prev.snapshot_kind)} — captured manually, not at first migration)</span>`
+    : '';
+  document.getElementById('restore-info').innerHTML =
+    `Captured <b>${esc(ts)}</b>${kindWarn}` +
+    (prev.speaker_firmware ? ` · Bose-FW <code>${esc(String(prev.speaker_firmware).substring(0,15))}</code>` : '') +
+    ` · <b>${prev.restorable_count}</b> restorable, <b>${prev.abandoned_count}</b> abandoned.`;
+  const cur = (STATE.presetsByDev[devId] && STATE.presetsByDev[devId].store) || [];
+  const rows = (prev.slots || []).map(s => {
+    const curSlot = cur[s.slot - 1] || {};
+    const sameName = curSlot.name && s.name && curSlot.name === s.name;
+    const status = s.abandoned ? `<span style="color:var(--danger)">abandoned</span> — ${esc(s.reason || 'source unsupported')}`
+                 : s.opaque    ? `<span style="color:var(--accent)">OPAQUE</span> — speaker /full sync`
+                                : `push via /select+long-press`;
+    return `<tr>
+      <td style="padding:.18em .5em;font-weight:600">${s.slot}</td>
+      <td style="padding:.18em .5em"><code>${esc(s.source)}</code></td>
+      <td style="padding:.18em .5em">${esc(s.name) || '<i>—</i>'}</td>
+      <td style="padding:.18em .5em;color:var(--mute)">${sameName ? '✓ matches current' : esc(curSlot.name || '<empty>')}</td>
+      <td style="padding:.18em .5em;font-size:.85em">${status}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('restore-slots').innerHTML =
+    `<table style="border-collapse:collapse;width:100%;font-size:.88em">
+       <thead><tr style="text-align:left;color:var(--mute);border-bottom:1px solid var(--line)">
+         <th style="padding:.18em .5em">Slot</th>
+         <th style="padding:.18em .5em">Source</th>
+         <th style="padding:.18em .5em">Pre-migrate name</th>
+         <th style="padding:.18em .5em">Current store</th>
+         <th style="padding:.18em .5em">Restore action</th>
+       </tr></thead>
+       <tbody>${rows}</tbody>
+     </table>`;
+  document.getElementById('restore-go').disabled = (prev.restorable_count === 0);
+}
+
+async function restorePreMigrationCommit() {
+  const devId = g_restoreDev;
+  if (!devId) return;
+  const btn = document.getElementById('restore-go');
+  btn.disabled = true;
+  btn.textContent = '⏳ Restoring…';
+  try {
+    const r = await api('/api/speaker/'+encodeURIComponent(devId)+'/restore-pre-migration', {method:'POST'});
+    toast(r.message || `Restored ${r.restored_count} slot(s) — pushing ${r.pushed_count}, ${r.opaque_count} OPAQUE sync via /full`,
+          'success');
+    closeModal('modal-restore');
+    markDirty(devId);   // store changed — sync indicator visible until push completes
+    loadPresetsFor(devId);
+    kickPoll(devId);
+  } catch (e) {
+    toast('Restore failed: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '⏮ Restore now';
+  }
 }
 
 const SNAPSHOT_UPLOAD_URL = 'https://sixback.io/snapshots/bosefix/snapshot';

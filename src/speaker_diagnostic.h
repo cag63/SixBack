@@ -43,6 +43,16 @@ bool loadStoredSnapshot(const String& deviceId, String& outJson);
 // True wenn fuer das Geraet ein persistierter Snapshot vorliegt.
 bool hasStoredSnapshot(const String& deviceId);
 
+// Enumeriert alle persistierten /snapshots/<dev>.json und uploadet jeden
+// noch nicht hochgeladenen (Marker: /snapshots/<dev>.uploaded). Async via
+// xTaskCreate (HTTPS aus AsyncWebServer-Handler-Stack waere instabil),
+// best-effort. No-op wenn DiagShareConfig.uploadEnabled == false.
+//
+// Aufruf-Pfad: User aktiviert "Share diagnostic snapshots" im WebUI →
+// `handlePutDiagShare` triggert diese Funktion einmal; danach faengt
+// `persistPreMigrateSnapshot` zukuenftige Snapshots regulaer ab.
+void uploadAllStoredSnapshots();
+
 } // namespace sixback
 
 #endif

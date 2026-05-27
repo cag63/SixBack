@@ -3,6 +3,7 @@
 
 #include "speaker_diagnostic.h"
 #include "config.h"
+#include "diag_settings.h"
 #include "speaker_inventory.h"
 #include "speaker_telnet.h"
 #include "version.h"
@@ -10,6 +11,8 @@
 #include <LittleFS.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 namespace sixback {
 
@@ -224,10 +227,23 @@ void persistPreMigrateSnapshot(const String& deviceId, bool force) {
                       path.c_str(), (unsigned)n);
     }
 
-    // Auto-Upload zum Maintainer-Receiver — best-effort. Schutz gegen den
-    // Fall "User reflasht ESP, LittleFS leer, Original-Presets weg".
-    // sixback.io/snapshots/bosefix/snapshot via Apache-Proxy zu Pi5:8788.
-    uploadSnapshotToMaintainer_(jsonBody);
+    // Auto-Upload zum Maintainer-Receiver — opt-in, default OFF
+    // (Issue #4: Auto-Migrate triggert vor jedem UI-Kontakt, deshalb
+    // muss der Schalter auf Code-Ebene default-off sein). User aktiviert
+    // es via WebUI → DiagShareConfig.uploadEnabled, danach laeuft der
+    // Upload pro neuem Snapshot regulaer.
+    auto diagCfg = loadDiagShareConfig();
+    if (!diagCfg.uploadEnabled) {
+        Serial.printf("[diag] upload skipped (diagnostic-sharing opt-in OFF)\n");
+        return;
+    }
+    if (uploadSnapshotToMaintainer_(jsonBody)) {
+        // Erfolgs-Marker — verhindert Doppelupload beim retroaktiven
+        // Worker (uploadAllStoredSnapshots).
+        String marker = path + ".uploaded";
+        File mf = LittleFS.open(marker, "w");
+        if (mf) { mf.print((uint32_t)millis()); mf.close(); }
+    }
 }
 
 bool loadStoredSnapshot(const String& deviceId, String& outJson) {
@@ -242,6 +258,64 @@ bool loadStoredSnapshot(const String& deviceId, String& outJson) {
 
 bool hasStoredSnapshot(const String& deviceId) {
     return LittleFS.exists(snapshotPath_(deviceId));
+}
+
+namespace {
+
+// Async-Worker fuer den retroaktiven Upload nach Opt-In. Enumeriert
+// /snapshots/*.json, ueberspringt jene mit existierendem *.uploaded
+// Marker, uploadet die uebrigen sequentiell mit kleiner Pause. Self-
+// deletes am Ende. Re-Check der Config in jeder Iteration falls der
+// User mid-flight wieder opt-out macht.
+void uploadAllStoredSnapshotsTask_(void* /*arg*/) {
+    int uploaded = 0, skipped = 0, failed = 0;
+    File root = LittleFS.open(SNAPSHOT_DIR);
+    if (!root || !root.isDirectory()) {
+        Serial.printf("[diag] retroactive upload: no /snapshots dir\n");
+        vTaskDelete(nullptr);
+        return;
+    }
+    File entry = root.openNextFile();
+    while (entry) {
+        String name = entry.name();
+        // Nur primaere Snapshots, keine .prev/.prev2/.uploaded
+        if (name.endsWith(".json") && !name.endsWith(".prev.json")
+            && !name.endsWith(".prev2.json")) {
+            String full = String(SNAPSHOT_DIR) + "/" + name;
+            String marker = full + ".uploaded";
+            if (LittleFS.exists(marker)) {
+                ++skipped;
+            } else {
+                // Re-Check Opt-In — falls User mittendrin abdreht.
+                if (!loadDiagShareConfig().uploadEnabled) break;
+                File sf = LittleFS.open(full, "r");
+                if (sf) {
+                    String body = sf.readString();
+                    sf.close();
+                    if (uploadSnapshotToMaintainer_(body)) {
+                        File mf = LittleFS.open(marker, "w");
+                        if (mf) { mf.print((uint32_t)millis()); mf.close(); }
+                        ++uploaded;
+                    } else {
+                        ++failed;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(1500));
+                }
+            }
+        }
+        entry = root.openNextFile();
+    }
+    Serial.printf("[diag] retroactive upload done: %d uploaded, %d skipped, %d failed\n",
+                  uploaded, skipped, failed);
+    vTaskDelete(nullptr);
+}
+
+} // namespace
+
+void uploadAllStoredSnapshots() {
+    if (!loadDiagShareConfig().uploadEnabled) return;
+    xTaskCreate(uploadAllStoredSnapshotsTask_, "diag-upload",
+                8192, nullptr, 1, nullptr);
 }
 
 } // namespace sixback
