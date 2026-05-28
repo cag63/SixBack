@@ -181,6 +181,19 @@ bool pullAndFlashOne_(const char* path, int updateType,
         return false;
     }
     int contentLen = http.getSize();
+    // 2026-05-28 (Fred-S3-OTA-Brick): Ohne verlaessliches Content-Length koennen
+    // wir den Download nicht auf Vollstaendigkeit pruefen — der Truncation-Guard
+    // weiter unten greift nur bei contentLen>0. Auf dem direkten Apache-Pfad
+    // (sixback.io ist seit 2026-05-28 DNS-only, KEIN Cloudflare mehr) liefert der
+    // Server IMMER ein Content-Length. Ein <=0 hiesse: eine Middlebox/CDN chunked't
+    // den Stream — genau der Pfad, auf dem ein truncated Image committed + gebootet
+    // wuerde (= Brick). Lieber hart abbrechen als blind committen.
+    if (contentLen <= 0) {
+        setError_(String(phaseName) +
+                  ": no Content-Length (chunked/proxy?) — refusing to flash");
+        http.end();
+        return false;
+    }
     // 2026-05-22 Pre-Release: empirisch sieht WiFiClientSecure-HTTPClient auf
     // C6 + S3 fuer einzelne .bin-Downloads ein Content-Length kleiner als
     // die Apache-tatsaechlich-Antwort (z.B. C6-firmware.bin: file=1822160 B,
@@ -229,15 +242,23 @@ bool pullAndFlashOne_(const char* path, int updateType,
     uint32_t written = 0;
     uint32_t lastReport = millis();
     uint32_t lastDataMs = millis();
-    // Read until connection closes OR no new bytes for 5s (idle-timeout).
+    // Read until connection closes OR no new bytes for kIdleTimeoutMs (idle-EOF).
     // Pre-Release-fix: NICHT auf written>=total brechen — total ist
     // (auf ESP HTTPS) unzuverlaessig.
+    // 2026-05-28 (Fred-S3-OTA-Brick): 5s war fuer die ~10MB-FS-Phase des S3 zu
+    // knapp — ein langsamer mbedTLS-Read ueber WiFi kann laenger als 5s stocken,
+    // wodurch der Loop faelschlich "EOF" annimmt, der Truncation-Guard abbricht
+    // und die spiffs-Partition halb-beschrieben + die UI zerstoert zurueckbleibt.
+    // 30s gibt langsamen Geraeten Luft, ohne bei echtem Abriss ewig zu haengen
+    // (http.connected() faengt den sauberen Close ohnehin sofort).
+    const uint32_t kIdleTimeoutMs = 30000;
     while (http.connected()) {
         size_t avail = stream->available();
         if (avail == 0) {
-            if (millis() - lastDataMs > 5000) {
-                Serial.printf("[ota-pull] phase %d idle >5s — assume EOF at %u bytes\n",
-                              phaseIdx, (unsigned)written);
+            if (millis() - lastDataMs > kIdleTimeoutMs) {
+                Serial.printf("[ota-pull] phase %d idle >%lus — assume EOF at %u bytes\n",
+                              phaseIdx, (unsigned long)(kIdleTimeoutMs / 1000),
+                              (unsigned)written);
                 break;
             }
             delay(5);

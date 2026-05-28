@@ -35,7 +35,7 @@ struct Speaker {
     String name;            // "Bose SoundTouch Kueche"
     String model;           // "SoundTouch 30"
     String firmware;        // "27.0.6.46330.5043500..."
-    String ip;              // "10.10.11.196"
+    String ip;              // "192.168.1.50"
     String accountId;       // margeAccountUUID
     MigrationStatus status; // siehe oben
     String cloudUrl;        // aktuelle margeServerUrl am Speaker (fuer UI-Anzeige)

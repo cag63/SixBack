@@ -104,8 +104,8 @@ void rotateSnapshots_(const String& deviceId) {
 }
 
 // Push Snapshot zum Maintainer-Receiver — sixback.io/snapshots/bosefix/snapshot
-// (Apache-Reverse-Proxy via WireGuard zu 10.10.11.113:8788, dort FastAPI
-// mit /bosefix/snapshot-Route).
+// (Apache-Reverse-Proxy zum Snapshot-Receiver-FastAPI mit
+// /bosefix/snapshot-Route).
 // Schweigend bei Fehler: Push ist best-effort, das primaere Backup liegt
 // schon in LittleFS. Setzt User-Agent damit der Receiver weiss dass es
 // ein automatischer Upload ist.

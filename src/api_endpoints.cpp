@@ -10,6 +10,7 @@
 //   - TuneIn-Lookup + Suche
 
 #include "api_endpoints.h"
+#include "web_router.h"
 #include "version.h"
 #include "config.h"
 #include "speaker_telnet.h"
@@ -20,6 +21,7 @@
 #include "system_health.h"
 #include "captive_portal.h"
 #include "ota_pull.h"
+#include "dlna_browse.h"
 #include "auto_mode.h"
 #include "source_normalizer.h"
 #include "bose_endpoints.h"
@@ -49,7 +51,7 @@ using JsonHandler = std::function<void(AsyncWebServerRequest*, JsonDocument&)>;
 
 void routeJsonBody(AsyncWebServer& s, const String& uri, WebRequestMethodComposite m,
                    JsonHandler cb) {
-    s.on(uri.c_str(), m,
+    routeT(s, uri.c_str(), m,
         [](AsyncWebServerRequest* req){ /* finalized by body handler */ },
         nullptr,
         [cb](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t idx, size_t total){
@@ -276,7 +278,7 @@ void handleSpeakerAdd(AsyncWebServerRequest* req, JsonDocument& body) {
 }
 
 void handleSpeakerDelete(AsyncWebServerRequest* req) {
-    String id = req->pathArg(0);
+    String id = pathParam(0);
     bool ok = sixback::SpeakerInventory::instance().remove(id);
     req->send(ok ? 200 : 404, "application/json", ok ? "{\"ok\":true}" : "{\"error\":\"not found\"}");
 }
@@ -342,7 +344,7 @@ void migrateRevertWorker_(void* arg) {
 }
 
 void handleMigrate(AsyncWebServerRequest* req) {
-    String id = req->pathArg(0);
+    String id = pathParam(0);
     auto& inv = sixback::SpeakerInventory::instance();
     String ip;
     {
@@ -400,7 +402,7 @@ void handleMigrate(AsyncWebServerRequest* req) {
 }
 
 void handleReboot(AsyncWebServerRequest* req) {
-    String id = req->pathArg(0);
+    String id = pathParam(0);
     auto& inv = sixback::SpeakerInventory::instance();
     String ip;
     {
@@ -433,7 +435,7 @@ void handleRefreshStatus(AsyncWebServerRequest* req) {
 // Preset-Verwaltung
 // -----------------------------------------------------------------------------
 void handleGetPresets(AsyncWebServerRequest* req) {
-    String id = req->pathArg(0);
+    String id = pathParam(0);
     JsonDocument doc;
     JsonArray arr = doc["presets"].to<JsonArray>();
     for (auto& p : sixback::PresetStore::instance().getForSpeaker(id)) {
@@ -467,8 +469,8 @@ void handleGetPresets(AsyncWebServerRequest* req) {
 }
 
 void handlePutPreset(AsyncWebServerRequest* req, JsonDocument& body) {
-    String id  = req->pathArg(0);
-    uint8_t slot = req->pathArg(1).toInt();
+    String id  = pathParam(0);
+    uint8_t slot = pathParam(1).toInt();
     if (slot < 1 || slot > 6) { req->send(400, "application/json", "{\"error\":\"slot 1..6\"}"); return; }
     sixback::Preset p;
     p.slot      = slot;
@@ -521,8 +523,8 @@ void handlePutPreset(AsyncWebServerRequest* req, JsonDocument& body) {
 //     { source, name, stationId, streamUrl, imageUrl, sixback_preset:1, exported_from }
 // -----------------------------------------------------------------------------
 void handleExportPreset(AsyncWebServerRequest* req) {
-    String id  = req->pathArg(0);
-    uint8_t slot = req->pathArg(1).toInt();
+    String id  = pathParam(0);
+    uint8_t slot = pathParam(1).toInt();
     if (slot < 1 || slot > 6) { req->send(400, "application/json", "{\"error\":\"slot 1..6\"}"); return; }
     auto p = sixback::PresetStore::instance().get(id, slot);
     JsonDocument doc;
@@ -571,8 +573,8 @@ void handleExportPreset(AsyncWebServerRequest* req) {
 }
 
 void handleDeletePreset(AsyncWebServerRequest* req) {
-    String id = req->pathArg(0);
-    uint8_t slot = req->pathArg(1).toInt();
+    String id = pathParam(0);
+    uint8_t slot = pathParam(1).toInt();
     bool ok = sixback::PresetStore::instance().clear(id, slot);
     req->send(ok ? 200 : 404, "application/json", ok ? "{\"ok\":true}" : "{\"error\":\"unknown\"}");
 }
@@ -583,7 +585,7 @@ void handleDeletePreset(AsyncWebServerRequest* req) {
 //   Schema kompatibel zum Import-Endpunkt (siehe handleImportPresetsSet).
 // -----------------------------------------------------------------------------
 void handleExportPresetsSet(AsyncWebServerRequest* req) {
-    String id = req->pathArg(0);
+    String id = pathParam(0);
     auto slots = sixback::PresetStore::instance().getForSpeaker(id);
 
     JsonDocument doc;
@@ -645,7 +647,7 @@ void handleExportPresetsSet(AsyncWebServerRequest* req) {
 //   automatisch — User klickt danach den per-Slot- oder Push-All-Button.
 // -----------------------------------------------------------------------------
 void handleImportPresetsSet(AsyncWebServerRequest* req, JsonDocument& body) {
-    String id = req->pathArg(0);
+    String id = pathParam(0);
     auto& inv = sixback::SpeakerInventory::instance();
     {
         sixback::SpeakerInventory::LockGuard g(inv);
@@ -752,8 +754,8 @@ String xmlExtractTag(const String& xml, int start, int end, const String& tag) {
 //   Wenn der Speaker den Slot leer hat → Store-Slot loeschen.
 // -----------------------------------------------------------------------------
 void handleRevertPresetToHw(AsyncWebServerRequest* req) {
-    String id = req->pathArg(0);
-    uint8_t slot = req->pathArg(1).toInt();
+    String id = pathParam(0);
+    uint8_t slot = pathParam(1).toInt();
     if (slot < 1 || slot > 6) {
         req->send(400, "application/json", "{\"error\":\"slot 1..6\"}");
         return;
@@ -951,7 +953,7 @@ int importPresetsFromSpeaker_(const String& id, int& countOk, int& countAban,
 }
 
 void handleImportFromDevice(AsyncWebServerRequest* req) {
-    String id = req->pathArg(0);
+    String id = pathParam(0);
     JsonDocument resp;
     JsonArray imported  = resp["imported"].to<JsonArray>();
     JsonArray abandoned = resp["abandoned"].to<JsonArray>();
@@ -1110,8 +1112,8 @@ void handlePushPresetToDevice(AsyncWebServerRequest* req) {
     if (qr == -1) { req->send(503, "application/json", "{\"error\":\"push queue alloc failed\"}"); return; }
     if (qr == -2) { req->send(503, "application/json", "{\"error\":\"push worker spawn failed\"}"); return; }
 
-    String id = req->pathArg(0);
-    uint8_t slot = req->pathArg(1).toInt();
+    String id = pathParam(0);
+    uint8_t slot = pathParam(1).toInt();
     auto& inv = sixback::SpeakerInventory::instance();
     String spIp;
     {
@@ -1241,7 +1243,7 @@ static int loadPreMigrateSnapshotDoc_(const String& id, JsonDocument& outDoc,
 //   UI uses this to render the confirm dialog ("you're about to overwrite
 //   these N slots — proceed?"). No state change.
 void handleRestorePreMigrationPreview(AsyncWebServerRequest* req) {
-    String id = req->pathArg(0);
+    String id = pathParam(0);
     JsonDocument snap;
     String err;
     int rc = loadPreMigrateSnapshotDoc_(id, snap, err);
@@ -1298,7 +1300,7 @@ void handleRestorePreMigration(AsyncWebServerRequest* req) {
     if (qr == -1) { req->send(503, "application/json", "{\"error\":\"push queue alloc failed\"}"); return; }
     if (qr == -2) { req->send(503, "application/json", "{\"error\":\"push worker spawn failed\"}"); return; }
 
-    String id = req->pathArg(0);
+    String id = pathParam(0);
     auto& inv = sixback::SpeakerInventory::instance();
     String spIp;
     {
@@ -1366,8 +1368,8 @@ void handleRestorePreMigration(AsyncWebServerRequest* req) {
 //   CORS-Probleme mit dem Speaker-Endpoint.
 // -----------------------------------------------------------------------------
 void handleSpeakerKey(AsyncWebServerRequest* req) {
-    String id = req->pathArg(0);
-    String key = req->pathArg(1);
+    String id = pathParam(0);
+    String key = pathParam(1);
     auto& inv = sixback::SpeakerInventory::instance();
     String spIp;
     {
@@ -1406,8 +1408,8 @@ void handleSpeakerKey(AsyncWebServerRequest* req) {
 //   Wenn Slot leer ist, macht der Speaker meistens nichts.
 // -----------------------------------------------------------------------------
 void handlePlayPreset(AsyncWebServerRequest* req) {
-    String id = req->pathArg(0);
-    int slot = req->pathArg(1).toInt();
+    String id = pathParam(0);
+    int slot = pathParam(1).toInt();
     if (slot < 1 || slot > 6) { req->send(400, "application/json", "{\"error\":\"slot 1..6\"}"); return; }
     auto& inv = sixback::SpeakerInventory::instance();
     String spIp;
@@ -1452,7 +1454,7 @@ void handlePlayPreset(AsyncWebServerRequest* req) {
 //     "streamUrl": "http://…"      (LOCAL_INTERNET_RADIO only) }
 // -----------------------------------------------------------------------------
 void handlePlaySource(AsyncWebServerRequest* req, JsonDocument& body) {
-    String id = req->pathArg(0);
+    String id = pathParam(0);
     auto& inv = sixback::SpeakerInventory::instance();
     String spIp;
     {
@@ -1518,7 +1520,7 @@ void handlePlaySource(AsyncWebServerRequest* req, JsonDocument& body) {
 //   per stationId/streamUrl zu matchen, was die SCMUDC-Variante nicht kennt.
 // -----------------------------------------------------------------------------
 void handleNowPlayingLive(AsyncWebServerRequest* req) {
-    String id = req->pathArg(0);
+    String id = pathParam(0);
     auto& inv = sixback::SpeakerInventory::instance();
     String spIp;
     {
@@ -1690,8 +1692,8 @@ static void recordDlnaWorker_(void* arg) {
 }
 
 void handleDlnaRecordPreset(AsyncWebServerRequest* req, JsonDocument& body) {
-    String id = req->pathArg(0);
-    uint8_t slot = req->pathArg(1).toInt();
+    String id = pathParam(0);
+    uint8_t slot = pathParam(1).toInt();
     if (slot < 1 || slot > 6) {
         req->send(400, "application/json", "{\"error\":\"slot 1..6\"}");
         return;
@@ -1751,10 +1753,10 @@ void handleDlnaRecordPreset(AsyncWebServerRequest* req, JsonDocument& body) {
 //   Server als JSON zurueck. Die UI braucht hier mehr als die in
 //   SpeakerInventory gecachten UUIDs — sie braucht auch location (zur
 //   MediaServerDevDesc.xml) und friendly_name. Browse selbst macht dann
-//   der Pi5-Proxy unter sixback-dlna (Port 8790).
+//   der sixback-dlna-Proxy (Port 8790).
 // -----------------------------------------------------------------------------
 void handleDlnaServers(AsyncWebServerRequest* req) {
-    String id = req->pathArg(0);
+    String id = pathParam(0);
     auto& inv = sixback::SpeakerInventory::instance();
     String spIp;
     {
@@ -1823,6 +1825,40 @@ void handleDlnaServers(AsyncWebServerRequest* req) {
 }
 
 // -----------------------------------------------------------------------------
+// GET /api/dlna/describe?location=<MediaServerDevDesc-URL>
+// GET /api/dlna/browse?control_url=<CDS-controlURL>&object_id=&start=&count=
+//   Same-origin replacement for the old LAN-bound sixback-dlna proxy. The
+//   firmware talks UPnP ContentDirectory directly to the media server (plain
+//   HTTP on the LAN). Browse uses a streaming parser so peak heap depends on
+//   the page size, not the folder size. Target+location are RFC1918-guarded in
+//   dlna_browse.cpp. These are server-scoped (not speaker-scoped): the URL
+//   from /dlna/servers fully identifies the target.
+// -----------------------------------------------------------------------------
+void handleDlnaDescribe(AsyncWebServerRequest* req) {
+    if (!req->hasParam("location")) {
+        req->send(400, "application/json", "{\"ok\":false,\"detail\":\"location required\"}");
+        return;
+    }
+    String out;
+    int code = sixback::dlnaDescribe(req->getParam("location")->value(), out);
+    req->send(code, "application/json", out);
+}
+
+void handleDlnaBrowse(AsyncWebServerRequest* req) {
+    if (!req->hasParam("control_url")) {
+        req->send(400, "application/json", "{\"ok\":false,\"detail\":\"control_url required\"}");
+        return;
+    }
+    String control = req->getParam("control_url")->value();
+    String objectId = req->hasParam("object_id") ? req->getParam("object_id")->value() : String("0");
+    long start = req->hasParam("start") ? req->getParam("start")->value().toInt() : 0;
+    long count = req->hasParam("count") ? req->getParam("count")->value().toInt() : 50;
+    String out;
+    int code = sixback::dlnaBrowse(control, objectId, start, count, out);
+    req->send(code, "application/json", out);
+}
+
+// -----------------------------------------------------------------------------
 // Helper: Speaker-Side /presets-XML fetchen + grob parsen.
 // Returnt true wenn Fetch+Parse erfolgreich. Slot-Slots ohne preset bleiben
 // mit leerem source. Synchroner HTTP-Call (~100-300 ms) — akzeptabel weil
@@ -1881,7 +1917,7 @@ static bool fetchHardwarePresets_(const String& spIp, HwSlotInfo_ out[6]) {
 //   Zeile in der Slot-Karte gebraucht, parallel zum Store-Endpoint.
 // -----------------------------------------------------------------------------
 void handleGetHardwarePresets(AsyncWebServerRequest* req) {
-    String id = req->pathArg(0);
+    String id = pathParam(0);
     auto& inv = sixback::SpeakerInventory::instance();
     String spIp;
     {
@@ -1923,7 +1959,7 @@ void handleGetHardwarePresets(AsyncWebServerRequest* req) {
 //   handleSwapPresets — auto-push war flaky.
 // -----------------------------------------------------------------------------
 void handleBulkPushPresets(AsyncWebServerRequest* req) {
-    String id = req->pathArg(0);
+    String id = pathParam(0);
     auto& inv = sixback::SpeakerInventory::instance();
     String spIp;
     {
@@ -2106,7 +2142,7 @@ void handleSwapPresets(AsyncWebServerRequest* req, JsonDocument& body) {
 // Gruppen
 // -----------------------------------------------------------------------------
 void handlePutGroup(AsyncWebServerRequest* req, JsonDocument& body) {
-    String id = req->pathArg(0);
+    String id = pathParam(0);
     String groupId = (const char*)(body["group_id"] | "");
     auto& inv = sixback::SpeakerInventory::instance();
     sixback::SpeakerInventory::LockGuard g(inv);
@@ -2140,7 +2176,7 @@ void handleSyncGroup(AsyncWebServerRequest* req, JsonDocument& body) {
 // TuneIn — Resolve fuer UI-Preview
 // -----------------------------------------------------------------------------
 void handleTuneInResolve(AsyncWebServerRequest* req) {
-    String id = req->pathArg(0);
+    String id = pathParam(0);
     auto r = sixback::resolveTuneInStruct(id);
     JsonDocument doc;
     doc["ok"]        = r.ok;
@@ -2325,18 +2361,26 @@ void handleOtaUpdateStatus(AsyncWebServerRequest* req) {
     writeOtaStatus_(req);
 }
 #else // SIXBACK_OTA_ENABLED
-// Single-app builds (c3/c6): /api/update/* returns 410 Gone with hint.
+// Single-app builds (c3/c6): kein OTA-Pull moeglich, Partition zu eng.
+// Antwort enthaelt `state:"error"` damit die UI's error-Branch greift und
+// dem User die Web-Serial-Updater-URL zeigt (statt leerer Zeile, weil ein
+// fehlendes state-Feld den UI-Switch nicht matched — Bug-Report 2026-05-27).
+namespace {
+constexpr const char* kOtaDisabledBody =
+    "{\"state\":\"error\","
+    "\"error\":\"OTA disabled on this chip — use the Web-Serial Updater at https://sixback.io/\","
+    "\"current\":\"\",\"latest\":\"\",\"progress\":0,\"total\":0,"
+    "\"phase\":\"\",\"phase_idx\":0,\"phase_n\":0,"
+    "\"updater\":\"https://sixback.io/\"}";
+}
 void handleOtaUpdateCheck(AsyncWebServerRequest* req) {
-    req->send(410, "application/json",
-              "{\"error\":\"OTA disabled on this chip — use the Web-Serial Updater\","
-              "\"updater\":\"https://sixback.io/\"}");
+    req->send(200, "application/json", kOtaDisabledBody);
 }
 void handleOtaUpdateInstall(AsyncWebServerRequest* req) {
-    handleOtaUpdateCheck(req);
+    req->send(200, "application/json", kOtaDisabledBody);
 }
 void handleOtaUpdateStatus(AsyncWebServerRequest* req) {
-    req->send(200, "application/json",
-              "{\"state\":\"disabled\",\"error\":\"OTA disabled on this chip — use the Web-Serial Updater\"}");
+    req->send(200, "application/json", kOtaDisabledBody);
 }
 #endif // SIXBACK_OTA_ENABLED
 
@@ -2521,7 +2565,7 @@ void handleEventsAll(AsyncWebServerRequest* req) {
 }
 
 void handleNowPlaying(AsyncWebServerRequest* req) {
-    String id = req->pathArg(0);
+    String id = pathParam(0);
     JsonDocument doc;
     JsonObject now = doc["now"].to<JsonObject>();
     sixback::eventStoreNowPlayingJson(id, now);
@@ -2531,7 +2575,7 @@ void handleNowPlaying(AsyncWebServerRequest* req) {
 }
 
 void handleSpeakerEvents(AsyncWebServerRequest* req) {
-    String id = req->pathArg(0);
+    String id = pathParam(0);
     JsonDocument doc;
     JsonArray arr = doc["events"].to<JsonArray>();
     sixback::eventStoreEventsJson(id, arr);
@@ -2571,7 +2615,7 @@ void handleUnknownRequestsClear(AsyncWebServerRequest* req) {
 //   ?source=live    → erzeugt einen frischen Live-Snapshot vom Speaker (default)
 //   ?save=1         → bei live: zusaetzlich als manueller Snapshot speichern (force)
 void handleDiagnosticSnapshot(AsyncWebServerRequest* req) {
-    String id = req->pathArg(0);
+    String id = pathParam(0);
     String src = req->hasParam("source") ? req->getParam("source")->value() : String("live");
 
     if (src == "stored") {
@@ -2609,7 +2653,7 @@ void handleDiagnosticSnapshot(AsyncWebServerRequest* req) {
 }
 
 void handleDiagnosticSnapshotMeta(AsyncWebServerRequest* req) {
-    String id = req->pathArg(0);
+    String id = pathParam(0);
     JsonDocument doc;
     doc["device_id"] = id;
     doc["has_stored"] = sixback::hasStoredSnapshot(id);
@@ -2645,8 +2689,8 @@ void handleSpotifySlotsList(AsyncWebServerRequest* req) {
 // Body: {"uri":"spotify:...","name":"...","shuffle":true|false,"repeat":"off|track|context"}
 // Empty uri -> Mapping loeschen.
 void handleSpotifySlotPut(AsyncWebServerRequest* req, JsonDocument& body) {
-    String deviceId = req->pathArg(0);
-    int slot = req->pathArg(1).toInt();
+    String deviceId = pathParam(0);
+    int slot = pathParam(1).toInt();
     if (slot < 1 || slot > 6) {
         req->send(400, "application/json", "{\"error\":\"slot 1..6\"}");
         return;
@@ -2886,8 +2930,8 @@ void handleSpotifyAppCredsDelete(AsyncWebServerRequest* req) {
 
 // DELETE /api/spotify/slot/{deviceId}/{slot}
 void handleSpotifySlotDelete(AsyncWebServerRequest* req) {
-    String deviceId = req->pathArg(0);
-    int slot = req->pathArg(1).toInt();
+    String deviceId = pathParam(0);
+    int slot = pathParam(1).toInt();
     if (slot < 1 || slot > 6) {
         req->send(400, "application/json", "{\"error\":\"slot 1..6\"}");
         return;
@@ -2969,52 +3013,54 @@ void registerApiEndpoints(AsyncWebServer& ui) {
     ui.on("/api/speakers",            HTTP_GET,    handleSpeakersList);
     ui.on("/api/speakers/discover",   HTTP_POST,   handleDiscover);
     routeJsonBody(ui, "/api/speakers/add", HTTP_POST, handleSpeakerAdd);
-    ui.on("^/api/speakers/([^/]+)$",  HTTP_DELETE, handleSpeakerDelete);
-    ui.on("^/api/speaker/([^/]+)/migrate$",        HTTP_POST, handleMigrate);
-    ui.on("^/api/speaker/([^/]+)/reboot$",         HTTP_POST, handleReboot);
+    routeT(ui, "^/api/speakers/([^/]+)$",  HTTP_DELETE, handleSpeakerDelete);
+    routeT(ui, "^/api/speaker/([^/]+)/migrate$",        HTTP_POST, handleMigrate);
+    routeT(ui, "^/api/speaker/([^/]+)/reboot$",         HTTP_POST, handleReboot);
     ui.on("/api/speakers/refresh-status",          HTTP_POST, handleRefreshStatus);
 
-    ui.on("^/api/speaker/([^/]+)/presets$",        HTTP_GET,    handleGetPresets);
+    routeT(ui, "^/api/speaker/([^/]+)/presets$",        HTTP_GET,    handleGetPresets);
     routeJsonBody(ui, "^/api/speaker/([^/]+)/preset/([1-6])$", HTTP_PUT, handlePutPreset);
-    ui.on("^/api/speaker/([^/]+)/preset/([1-6])$", HTTP_DELETE, handleDeletePreset);
-    ui.on("^/api/speaker/([^/]+)/preset/([1-6])/export$", HTTP_GET, handleExportPreset);
-    ui.on("^/api/speaker/([^/]+)/preset/([1-6])/push-to-device$",
+    routeT(ui, "^/api/speaker/([^/]+)/preset/([1-6])$", HTTP_DELETE, handleDeletePreset);
+    routeT(ui, "^/api/speaker/([^/]+)/preset/([1-6])/export$", HTTP_GET, handleExportPreset);
+    routeT(ui, "^/api/speaker/([^/]+)/preset/([1-6])/push-to-device$",
           HTTP_POST, handlePushPresetToDevice);
-    ui.on("^/api/speaker/([^/]+)/preset/([1-6])/revert$",
+    routeT(ui, "^/api/speaker/([^/]+)/preset/([1-6])/revert$",
           HTTP_POST, handleRevertPresetToHw);
-    ui.on("^/api/speaker/([^/]+)/presets/import-from-device$",
+    routeT(ui, "^/api/speaker/([^/]+)/presets/import-from-device$",
           HTTP_POST, handleImportFromDevice);
-    ui.on("^/api/speaker/([^/]+)/presets/export-set$",
+    routeT(ui, "^/api/speaker/([^/]+)/presets/export-set$",
           HTTP_GET, handleExportPresetsSet);
     routeJsonBody(ui, "^/api/speaker/([^/]+)/presets/import-set$",
                   HTTP_POST, handleImportPresetsSet);
     routeJsonBody(ui, "/api/preset/swap", HTTP_POST, handleSwapPresets);
-    ui.on("^/api/speaker/([^/]+)/push-all$", HTTP_POST, handleBulkPushPresets);
-    ui.on("^/api/speaker/([^/]+)/key/([A-Z_0-9]+)$", HTTP_POST, handleSpeakerKey);
-    ui.on("^/api/speaker/([^/]+)/play-preset/([1-6])$", HTTP_POST, handlePlayPreset);
+    routeT(ui, "^/api/speaker/([^/]+)/push-all$", HTTP_POST, handleBulkPushPresets);
+    routeT(ui, "^/api/speaker/([^/]+)/key/([A-Z_0-9]+)$", HTTP_POST, handleSpeakerKey);
+    routeT(ui, "^/api/speaker/([^/]+)/play-preset/([1-6])$", HTTP_POST, handlePlayPreset);
     routeJsonBody(ui, "^/api/speaker/([^/]+)/play-source$", HTTP_POST, handlePlaySource);
-    ui.on("^/api/speaker/([^/]+)/hardware-presets$", HTTP_GET, handleGetHardwarePresets);
-    ui.on("^/api/speaker/([^/]+)/now-playing-live$", HTTP_GET, handleNowPlayingLive);
+    routeT(ui, "^/api/speaker/([^/]+)/hardware-presets$", HTTP_GET, handleGetHardwarePresets);
+    routeT(ui, "^/api/speaker/([^/]+)/now-playing-live$", HTTP_GET, handleNowPlayingLive);
 
-    ui.on("^/api/speaker/([^/]+)/dlna/servers$", HTTP_GET, handleDlnaServers);
+    routeT(ui, "^/api/speaker/([^/]+)/dlna/servers$", HTTP_GET, handleDlnaServers);
+    routeT(ui, "/api/dlna/describe", HTTP_GET, handleDlnaDescribe);
+    routeT(ui, "/api/dlna/browse",   HTTP_GET, handleDlnaBrowse);
     routeJsonBody(ui, "^/api/speaker/([^/]+)/dlna/preset/([1-6])$",
                   HTTP_POST, handleDlnaRecordPreset);
 
-    ui.on("^/api/speaker/([^/]+)/diagnostic-snapshot$",
+    routeT(ui, "^/api/speaker/([^/]+)/diagnostic-snapshot$",
           HTTP_GET, handleDiagnosticSnapshot);
-    ui.on("^/api/speaker/([^/]+)/diagnostic-snapshot/meta$",
+    routeT(ui, "^/api/speaker/([^/]+)/diagnostic-snapshot/meta$",
           HTTP_GET, handleDiagnosticSnapshotMeta);
 
     // Issue #3: Pre-Migration Restore — preview (diff) + commit.
-    ui.on("^/api/speaker/([^/]+)/restore-pre-migration/preview$",
+    routeT(ui, "^/api/speaker/([^/]+)/restore-pre-migration/preview$",
           HTTP_GET,  handleRestorePreMigrationPreview);
-    ui.on("^/api/speaker/([^/]+)/restore-pre-migration$",
+    routeT(ui, "^/api/speaker/([^/]+)/restore-pre-migration$",
           HTTP_POST, handleRestorePreMigration);
 
     routeJsonBody(ui, "^/api/speaker/([^/]+)/group$", HTTP_PUT, handlePutGroup);
     routeJsonBody(ui, "/api/group/sync",              HTTP_POST, handleSyncGroup);
 
-    ui.on("^/api/tunein/resolve/([^/]+)$", HTTP_GET, handleTuneInResolve);
+    routeT(ui, "^/api/tunein/resolve/([^/]+)$", HTTP_GET, handleTuneInResolve);
     ui.on("/api/tunein/search",            HTTP_GET, handleTuneInSearch);
 
     ui.on("/api/auto-mode",          HTTP_GET,  handleGetAutoMode);
@@ -3032,25 +3078,25 @@ void registerApiEndpoints(AsyncWebServer& ui) {
 
     ui.on("/api/events",                                   HTTP_GET,    handleEventsAll);
     ui.on("/api/events",                                   HTTP_DELETE, handleEventsClear);
-    ui.on("^/api/speaker/([^/]+)/now-playing$",            HTTP_GET,    handleNowPlaying);
-    ui.on("^/api/speaker/([^/]+)/events$",                 HTTP_GET,    handleSpeakerEvents);
+    routeT(ui, "^/api/speaker/([^/]+)/now-playing$",            HTTP_GET,    handleNowPlaying);
+    routeT(ui, "^/api/speaker/([^/]+)/events$",                 HTTP_GET,    handleSpeakerEvents);
 
 #ifdef SIXBACK_SPOTIFY_ENABLED
     ui.on("/api/spotify/slots",                            HTTP_GET,    handleSpotifySlotsList);
     routeJsonBody(ui, "^/api/spotify/slot/([^/]+)/([1-6])$", HTTP_PUT,  handleSpotifySlotPut);
-    ui.on("^/api/spotify/slot/([^/]+)/([1-6])$",           HTTP_DELETE, handleSpotifySlotDelete);
+    routeT(ui, "^/api/spotify/slot/([^/]+)/([1-6])$",           HTTP_DELETE, handleSpotifySlotDelete);
     // ASYNCWEBSERVER_REGEX=1 — Path-strings ohne ^$ matchen als Prefix.
     // /api/spotify/auth wuerde sonst /api/spotify/auth/url + /exchange
     // mitschlucken. Explizit anchored:
-    ui.on("^/api/spotify/auth$",                           HTTP_GET,    handleSpotifyAuthGet);
+    routeT(ui, "^/api/spotify/auth$",                           HTTP_GET,    handleSpotifyAuthGet);
     routeJsonBody(ui, "^/api/spotify/auth$",               HTTP_PUT,    handleSpotifyAuthPut);
-    ui.on("^/api/spotify/auth$",                           HTTP_DELETE, handleSpotifyAuthDelete);
-    ui.on("^/api/spotify/auth/url$",                       HTTP_GET,    handleSpotifyAuthUrl);
+    routeT(ui, "^/api/spotify/auth$",                           HTTP_DELETE, handleSpotifyAuthDelete);
+    routeT(ui, "^/api/spotify/auth/url$",                       HTTP_GET,    handleSpotifyAuthUrl);
     routeJsonBody(ui, "^/api/spotify/auth/exchange$",      HTTP_POST,   handleSpotifyAuthExchange);
-    ui.on("^/api/spotify/last-trigger$",                   HTTP_GET,    handleSpotifyLastTrigger);
-    ui.on("^/api/spotify/debug/probe-api$",                HTTP_GET,    handleSpotifyDebugProbe);
+    routeT(ui, "^/api/spotify/last-trigger$",                   HTTP_GET,    handleSpotifyLastTrigger);
+    routeT(ui, "^/api/spotify/debug/probe-api$",                HTTP_GET,    handleSpotifyDebugProbe);
     // Calls lookupSpotifyDeviceId INLINE from handler thread (no xTaskCreate).
-    ui.on("^/api/spotify/debug/lookup-inline$", HTTP_GET, [](AsyncWebServerRequest* r) {
+    routeT(ui, "^/api/spotify/debug/lookup-inline$", HTTP_GET, [](AsyncWebServerRequest* r) {
         String name = r->hasParam("name") ? r->getParam("name")->value() : "Emma";
         uint32_t t0 = millis();
         String devId = sixback::spotify::lookupSpotifyDeviceId(name);
@@ -3065,23 +3111,23 @@ void registerApiEndpoints(AsyncWebServer& ui) {
     // POST /api/spotify/simulate/{devId}/{slot} — feuert preset-pressed-Event
     // wie ein physischer Tastendruck. Trigger Spotify-/play OHNE Bose-Source-
     // Switch. Nützlich wenn Bose-Slot leer aber Spotify gemappt ist.
-    ui.on("^/api/spotify/simulate/([^/]+)/([1-6])$", HTTP_POST,
+    routeT(ui, "^/api/spotify/simulate/([^/]+)/([1-6])$", HTTP_POST,
           [](AsyncWebServerRequest* r) {
-        String devId = r->pathArg(0);
-        int slot = r->pathArg(1).toInt();
+        String devId = pathParam(0);
+        int slot = pathParam(1).toInt();
         sixback::spotify::onPresetPressed(devId, slot, "ui-simulate");
         r->send(200, "application/json", "{\"ok\":true,\"simulated\":true}");
     });
-    ui.on("^/api/spotify/app-creds$",                      HTTP_GET,    handleSpotifyAppCredsGet);
+    routeT(ui, "^/api/spotify/app-creds$",                      HTTP_GET,    handleSpotifyAppCredsGet);
     routeJsonBody(ui, "^/api/spotify/app-creds$",          HTTP_PUT,    handleSpotifyAppCredsPut);
-    ui.on("^/api/spotify/app-creds$",                      HTTP_DELETE, handleSpotifyAppCredsDelete);
+    routeT(ui, "^/api/spotify/app-creds$",                      HTTP_DELETE, handleSpotifyAppCredsDelete);
     // Library — D&D-Source-Tile-Storage (Sidebar)
-    ui.on("^/api/spotify/library$",                        HTTP_GET,    handleSpotifyLibraryList);
+    routeT(ui, "^/api/spotify/library$",                        HTTP_GET,    handleSpotifyLibraryList);
     routeJsonBody(ui, "^/api/spotify/library$",            HTTP_POST,   handleSpotifyLibraryAdd);
-    ui.on("^/api/spotify/library$",                        HTTP_DELETE, handleSpotifyLibraryDelete);
+    routeT(ui, "^/api/spotify/library$",                        HTTP_DELETE, handleSpotifyLibraryDelete);
     // OAuth-Callback-Page: fängt ?code aus Spotify-Redirect ab + macht
     // Exchange auto im Browser. Self-Redirect → kein localhost-Detour nötig.
-    ui.on("^/spotify-callback$", HTTP_GET, [](AsyncWebServerRequest* r) {
+    routeT(ui, "^/spotify-callback$", HTTP_GET, [](AsyncWebServerRequest* r) {
         static const char kCallbackHtml[] PROGMEM = R"HTML(<!doctype html>
 <html><head><meta charset="utf-8"><title>SixBack – Spotify Callback</title>
 <style>body{font-family:system-ui;background:#1a1a1a;color:#eee;padding:2em;
@@ -3115,13 +3161,13 @@ else {
 </script></body></html>)HTML";
         r->send(200, "text/html", kCallbackHtml);
     });
-    ui.on("^/api/nvs/stats$", HTTP_GET, [](AsyncWebServerRequest* r) {
+    routeT(ui, "^/api/nvs/stats$", HTTP_GET, [](AsyncWebServerRequest* r) {
         JsonDocument doc;
         sixback::nvsGetStatsJson(doc);
         String body; serializeJson(doc, body);
         r->send(200, "application/json", body);
     });
-    ui.on("^/api/nvs/cleanup$", HTTP_POST, [](AsyncWebServerRequest* r) {
+    routeT(ui, "^/api/nvs/cleanup$", HTTP_POST, [](AsyncWebServerRequest* r) {
         bool a = sixback::nvsEraseAllInNamespace("sixback-tune");
         bool b = sixback::nvsEraseAllInNamespace("sixback-sys");
         JsonDocument doc;
@@ -3140,8 +3186,8 @@ else {
     // Path-Strings ohne `^...$` als Prefix — /api/ota wuerde dann auch
     // /api/ota/fs schlucken. Mit explizitem Anchor matched jede Route
     // exakt ihren Pfad.
-    ui.on("^/api/ota$",    HTTP_POST, handleOtaFinalize,   handleOtaUpload);
-    ui.on("^/api/ota/fs$", HTTP_POST, handleOtaFsFinalize, handleOtaFsUpload);
+    routeT(ui, "^/api/ota$",    HTTP_POST, handleOtaFinalize,   handleOtaUpload);
+    routeT(ui, "^/api/ota/fs$", HTTP_POST, handleOtaFsFinalize, handleOtaFsUpload);
 
     // Online-Update — HTTPS-Pull von sixback.io
     sixback::ota::init(String(FW_VERSION_STRING));

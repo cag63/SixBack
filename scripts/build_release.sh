@@ -53,11 +53,12 @@ fi
 #
 # Reihenfolge buildfs vor firmware bleibt aus historischen Gruenden:
 # (frueherer bug 2026-05-19, umgekehrt zeigte manifest.json +1 vs firmware.bin)
-# v0.8.0: esp32-classic skipped — UI growth (DLNA tab + Spotify-Library + Migrate-UX)
-# pushed data/ past the 256 KB spiffs slot in partitions-4mb.csv. Followup:
-# either rebalance the 4-MB symmetric layout or strip data for esp32-classic.
-"$HOME/.platformio/penv/bin/pio" run -e s3 -e c3 -e c6 -t buildfs
-"$HOME/.platformio/penv/bin/pio" run -e s3 -e c3 -e c6
+# v0.8.0: esp32-classic war geskippt — data/ sprengte das 256 KB spiffs der
+# partitions-4mb.csv. Followup umgesetzt: scripts/fs_exclude_esp32.py strippt
+# silence.mp3 (Spotify-only, ~120 KB) NUR fuer env:esp32 aus dem FS-Image
+# (PROJECT_DATA_DIR -> gefilterte Staging-Kopie). Damit passt esp32 wieder rein.
+"$HOME/.platformio/penv/bin/pio" run -e s3 -e c3 -e c6 -e esp32 -t buildfs
+"$HOME/.platformio/penv/bin/pio" run -e s3 -e c3 -e c6 -e esp32
 
 # Resolve final version: tag if set, else read counter from version.h.
 if [ -n "$RELEASE_TAG_STRIPPED" ]; then
@@ -75,13 +76,12 @@ echo ">>> SixBack release build, version=$VERSION"
 # again silently.
 #
 # Limits MUST stay in sync with the partition CSVs:
-#   partitions-4mb.csv       -> APP_4MB_SYM   / FS_4MB_SYM   (esp32-classic, OTA)
-#   partitions-4mb-noota.csv -> APP_4MB_NOOTA / FS_4MB_NOOTA (c3 / c6, v0.7.8+)
-#   partitions.csv           -> APP_16MB      / FS_16MB      (s3, OTA)
+#   partitions-4mb.csv  -> APP_4MB_SYM / FS_4MB_SYM (esp32-classic + c3/c6, A/B-OTA)
+#   partitions.csv      -> APP_16MB    / FS_16MB    (s3, OTA)
+# c3/c6 zurueck auf A/B-OTA (partitions-4mb.csv) seit mini-silence (30KB) das FS
+# unter 256KB drueckt; das alte partitions-4mb-noota.csv wird nicht mehr gebaut.
 APP_4MB_SYM=$((0x1D0000))    # 1.900.544 — app0/app1 in partitions-4mb.csv
 FS_4MB_SYM=$((0x40000))      #   262.144 — spiffs   in partitions-4mb.csv
-APP_4MB_NOOTA=$((0x380000))  # 3.670.016 — app     in partitions-4mb-noota.csv (c3/c6)
-FS_4MB_NOOTA=$((0x60000))    #   393.216 — spiffs  in partitions-4mb-noota.csv
 APP_16MB=$((0x300000))       # 3.145.728 — app0/app1 in partitions.csv (s3)
 FS_16MB=$((0x9E0000))        # 10.354.688 — spiffs in partitions.csv
 
@@ -103,13 +103,12 @@ check_size() {
   fi
 }
 
-## esp32-classic skipped in v0.8.0 (data/ > 256 KB spiffs).
-# check_size "$PIO_BUILD/esp32/firmware.bin" $APP_4MB_SYM   "esp32 app"
-# check_size "$PIO_BUILD/esp32/littlefs.bin" $FS_4MB_SYM    "esp32 fs"
-check_size "$PIO_BUILD/c3/firmware.bin"    $APP_4MB_NOOTA "c3 app"
-check_size "$PIO_BUILD/c3/littlefs.bin"    $FS_4MB_NOOTA  "c3 fs"
-check_size "$PIO_BUILD/c6/firmware.bin"    $APP_4MB_NOOTA "c6 app"
-check_size "$PIO_BUILD/c6/littlefs.bin"    $FS_4MB_NOOTA  "c6 fs"
+check_size "$PIO_BUILD/esp32/firmware.bin" $APP_4MB_SYM   "esp32 app"
+check_size "$PIO_BUILD/esp32/littlefs.bin" $FS_4MB_SYM    "esp32 fs"
+check_size "$PIO_BUILD/c3/firmware.bin"    $APP_4MB_SYM   "c3 app"
+check_size "$PIO_BUILD/c3/littlefs.bin"    $FS_4MB_SYM    "c3 fs"
+check_size "$PIO_BUILD/c6/firmware.bin"    $APP_4MB_SYM   "c6 app"
+check_size "$PIO_BUILD/c6/littlefs.bin"    $FS_4MB_SYM    "c6 fs"
 check_size "$PIO_BUILD/s3/firmware.bin"    $APP_16MB      "s3 app"
 check_size "$PIO_BUILD/s3/littlefs.bin"    $FS_16MB       "s3 fs"
 
@@ -146,17 +145,15 @@ merge_target() {
 #   ESP32 (classic): 0x1000  (Boot-ROM springt dorthin)
 #   S3 / C3 / C6 / S2 / C2 / C5 / C61 / H2 / P4: 0x0
 # spiffs offsets must match the corresponding partition table:
-#   partitions.csv          (16 MB)      -> spiffs @ 0x610000   (s3)
-#   partitions-4mb.csv      ( 4 MB sym)  -> spiffs @ 0x3B0000   (esp32-classic)
-#   partitions-4mb-asym.csv ( 4 MB asym) -> spiffs @ 0x390000   (c3 / c6, v0.7.7+)
-#       app0 auf 0x280000 vergroessert (2.5 MB); spiffs auf 384 KB.
+#   partitions.csv     (16 MB)     -> spiffs @ 0x610000   (s3)
+#   partitions-4mb.csv ( 4 MB A/B) -> spiffs @ 0x3B0000   (esp32-classic + c3/c6)
 #       Wer das mal wieder anpasst: hier mitziehen, sonst landet das
 #       LittleFS-Image im falschen Flash-Bereich und der Web-Flasher
 #       liefert kaputte Factory-Images aus.
-# merge_target esp32 esp32   4MB  0x3B0000  0x1000   # v0.8.0: skipped, see top
+merge_target esp32 esp32   4MB  0x3B0000  0x1000   # classic: bootloader@0x1000
 merge_target s3    esp32s3 16MB 0x610000  0x0
-merge_target c3    esp32c3 4MB  0x390000  0x0
-merge_target c6    esp32c6 4MB  0x390000  0x0
+merge_target c3    esp32c3 4MB  0x3B0000  0x0
+merge_target c6    esp32c6 4MB  0x3B0000  0x0
 
 # --- 3a) Fresh-install manifest (full factory write + erase) -------------
 cat > "$OUT/manifest.json" <<EOF
@@ -166,6 +163,12 @@ cat > "$OUT/manifest.json" <<EOF
   "funding_url": "https://polyformproject.org/licenses/noncommercial/1.0.0/",
   "new_install_prompt_erase": true,
   "builds": [
+    {
+      "chipFamily": "ESP32",
+      "parts": [
+        { "path": "sixback-esp32-factory.bin", "offset": 0 }
+      ]
+    },
     {
       "chipFamily": "ESP32-S3",
       "parts": [
@@ -195,9 +198,8 @@ EOF
 #
 # Offsets MUESSEN zur Partition-Tabelle des jeweiligen Targets passen:
 #   esp32 / s3 / c3 / c6: app/app0 @ 0x10000
-#   esp32:                spiffs   @ 0x3B0000  (partitions-4mb.csv)
+#   esp32 / c3 / c6:      spiffs   @ 0x3B0000  (partitions-4mb.csv)
 #   s3:                   spiffs   @ 0x610000  (partitions.csv)
-#   c3 / c6:              spiffs   @ 0x390000  (partitions-4mb-noota.csv)
 cat > "$OUT/manifest-update.json" <<EOF
 {
   "name": "SixBack (update)",
@@ -205,6 +207,13 @@ cat > "$OUT/manifest-update.json" <<EOF
   "funding_url": "https://polyformproject.org/licenses/noncommercial/1.0.0/",
   "new_install_prompt_erase": false,
   "builds": [
+    {
+      "chipFamily": "ESP32",
+      "parts": [
+        { "path": "sixback-esp32-firmware.bin", "offset": 65536    },
+        { "path": "sixback-esp32-littlefs.bin", "offset": 3866624  }
+      ]
+    },
     {
       "chipFamily": "ESP32-S3",
       "parts": [
@@ -216,14 +225,14 @@ cat > "$OUT/manifest-update.json" <<EOF
       "chipFamily": "ESP32-C3",
       "parts": [
         { "path": "sixback-c3-firmware.bin",    "offset": 65536    },
-        { "path": "sixback-c3-littlefs.bin",    "offset": 3735552  }
+        { "path": "sixback-c3-littlefs.bin",    "offset": 3866624  }
       ]
     },
     {
       "chipFamily": "ESP32-C6",
       "parts": [
         { "path": "sixback-c6-firmware.bin",    "offset": 65536    },
-        { "path": "sixback-c6-littlefs.bin",    "offset": 3735552  }
+        { "path": "sixback-c6-littlefs.bin",    "offset": 3866624  }
       ]
     }
   ]

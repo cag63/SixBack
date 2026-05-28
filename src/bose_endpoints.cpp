@@ -6,6 +6,7 @@
 // Account-Sources und Preset-Sync zwischen Speaker und ESP-Store.
 
 #include "bose_endpoints.h"
+#include "web_router.h"
 #include "tunein_resolver.h"
 #include "preset_store.h"
 #include "speaker_inventory.h"
@@ -66,13 +67,13 @@ void pushUnknown(const UnknownReq& r) {
 // -----------------------------------------------------------------------------
 void handleSCMUDCFinalize(AsyncWebServerRequest* req) {
     Serial.printf("[bmx] SCMUDC POST finalize dev=%s clen=%d\n",
-                  req->pathArg(0).c_str(), (int)req->contentLength());
+                  pathParam(0).c_str(), (int)req->contentLength());
     send200(req);
 }
 
 void handleSCMUDCBody(AsyncWebServerRequest* req,
                       uint8_t* data, size_t len, size_t index, size_t total) {
-    String devId = req->pathArg(0);
+    String devId = pathParam(0);
     sixback::eventStoreIngestChunk(devId, data, len, index, total);
 }
 
@@ -361,7 +362,7 @@ static std::set<String> probeSpeakerStoredMusicReadyUuids_(const String& speaker
 }
 
 void handleAccountFull(AsyncWebServerRequest* req) {
-    String acct = req->pathArg(0);
+    String acct = pathParam(0);
 
     // <devices> — alle bekannten Speaker mit gleichem accountId.
     // Fallback wenn die Liste fuer den angefragten Account leer ist:
@@ -796,8 +797,8 @@ void handleAccountPresets(AsyncWebServerRequest* req) {
 }
 
 void handleDevicePresets(AsyncWebServerRequest* req) {
-    String acct  = req->pathArg(0);
-    String devId = req->pathArg(1);
+    String acct  = pathParam(0);
+    String devId = pathParam(1);
     // Schutz gegen Preset-Verlust nach erase: wenn unser Store fuer das Device
     // noch leer ist (z.B. Mock-Server frisch geflasht, Auto-Mode hat noch
     // nicht via import-from-device gesynct), liefern wir 404 statt
@@ -822,7 +823,7 @@ void handleTuneInToken(AsyncWebServerRequest* req) {
 }
 
 void handleTuneInStation(AsyncWebServerRequest* req) {
-    String id = req->pathArg(0);
+    String id = pathParam(0);
     String json = resolveTuneInStation(id);
     req->send(200, "application/json", json);
 }
@@ -1046,7 +1047,7 @@ String takeGroupBody_(AsyncWebServerRequest* req) {
 
 // GET /streaming/account/{a}/device/{d}/group/
 void handleDeviceGroup(AsyncWebServerRequest* req) {
-    String did = req->pathArg(1);
+    String did = pathParam(1);
     String resp;
     if (g_groups_mtx && xSemaphoreTake(g_groups_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
         for (const auto& g : g_groups) {
@@ -1100,7 +1101,7 @@ void handleGroupCreate(AsyncWebServerRequest* req) {
 
 // PUT /streaming/account/{a}/group/{gid}  -> 200 OK
 void handleGroupUpdate(AsyncWebServerRequest* req) {
-    String gid  = req->pathArg(1);
+    String gid  = pathParam(1);
     String body = takeGroupBody_(req);
     String resp;
     bool   found = false;
@@ -1131,7 +1132,7 @@ void handleGroupUpdate(AsyncWebServerRequest* req) {
 
 // DELETE /streaming/account/{a}/group/{gid}  -> 200 OK empty body
 void handleGroupDelete(AsyncWebServerRequest* req) {
-    String gid = req->pathArg(1);
+    String gid = pathParam(1);
     bool   removed = false;
     if (g_groups_mtx && xSemaphoreTake(g_groups_mtx, pdMS_TO_TICKS(100)) == pdTRUE) {
         for (auto it = g_groups.begin(); it != g_groups.end(); ++it) {
@@ -1224,7 +1225,7 @@ void handleAccountSourceAddBody(AsyncWebServerRequest* req,
     if (xSemaphoreTake(g_addSrcMtx, pdMS_TO_TICKS(50)) != pdTRUE) return;
     auto& ctx = g_addSrcCtx[req];
     if (index == 0) {
-        ctx.accountId = req->pathArg(0);
+        ctx.accountId = pathParam(0);
         ctx.body = "";
     }
     for (size_t i = 0; i < len; ++i) ctx.body += (char)data[i];
@@ -1259,7 +1260,7 @@ void handleAccountSourceAddFinalize(AsyncWebServerRequest* req) {
     for (size_t i = 0; i < userAcc.length(); ++i) srcId = srcId * 31 + (uint8_t)userAcc[i];
     srcId = 25000000 + (srcId % 1000000);
     // soundcork main.py configured_source_xml (Zeile 218-241):
-    //   <sourcename> = display_name aus Request (z.B. "genai: minidlna"),
+    //   <sourcename> = display_name aus Request (z.B. "host: minidlna"),
     //   NICHT hardcoded "Mediaserver". <name> = source_key_account (= username
     //   = UUID/0). sourceproviderid wird aus PROVIDERS-index berechnet — fuer
     //   STORED_MUSIC ist das 7.
@@ -1292,7 +1293,7 @@ void handleAccountSourceAddFinalize(AsyncWebServerRequest* req) {
 }
 
 void handleDeviceAddFinalize(AsyncWebServerRequest* req) {
-    String acct = req->pathArg(0);
+    String acct = pathParam(0);
     String devId;
     if (g_addDevMtx && xSemaphoreTake(g_addDevMtx, pdMS_TO_TICKS(50)) == pdTRUE) {
         auto it = g_addDevCtx.find(req);
@@ -1312,8 +1313,9 @@ void handleDeviceAddFinalize(AsyncWebServerRequest* req) {
     AsyncWebServerResponse* resp = req->beginResponse(
         201, "application/vnd.bose.streaming-v1.2+xml", body);
     resp->addHeader("Credentials", "Bearer bf32-marge-token");
+    String selfBase = "http://" + WiFi.localIP().toString() + ":" + String(BOSE_HTTP_PORT);
     resp->addHeader("Location",
-                    "http://10.10.11.168:8000/streaming/account/" + acct + "/device/" + devId);
+                    selfBase + "/streaming/account/" + acct + "/device/" + devId);
     resp->addHeader("METHOD_NAME", "addDevice");
     req->send(resp);
     Serial.printf("[marge] addDevice acct=%s dev=%s -> 201 Bearer\n",
@@ -1438,51 +1440,51 @@ void registerBoseEndpoints(AsyncWebServer& server) {
     // Push-To-Speaker scheitert. ESP-LittleFS serviert die ~4.5KB MP3 selber.
     server.serveStatic("/silence.mp3", LittleFS, "/silence.mp3")
           .setCacheControl("max-age=3600");
-    server.on("^/v1/scmudc/([^/]+)$",                                 HTTP_POST,
+    routeT(server, "^/v1/scmudc/([^/]+)$",                                 HTTP_POST,
               handleSCMUDCFinalize, nullptr, handleSCMUDCBody);
     server.on("/bmx/registry/v1/services",                            HTTP_GET,  handleBMXRegistry);
     server.on("/bmx/registry/v1/servicesAvailability",                HTTP_GET,  handleBMXServicesAvailability);
     server.on("/streaming/sourceproviders",                           HTTP_GET,  handleSourceProviders);
-    server.on("^/media/bmx-icons/.+$",                                HTTP_GET,  handleBmxIconStub);
+    routeT(server, "^/media/bmx-icons/.+$",                                HTTP_GET,  handleBmxIconStub);
     server.on("/streaming/support/power_on",                          HTTP_POST, handlePowerOn);
-    server.on("^/streaming/account/([^/]+)/full$",                    HTTP_GET,  handleAccountFull);
-    server.on("^/streaming/account/([^/]+)/sources$",                 HTTP_GET,  handleAccountSources);
-    server.on("^/streaming/account/([^/]+)/provider_settings$",       HTTP_GET,  handleProviderSettings);
-    server.on("^/streaming/account/([^/]+)/presets$",                 HTTP_GET,  handleAccountPresets);
-    server.on("^/streaming/account/([^/]+)/presets/all$",             HTTP_GET,  handleAccountPresets);
-    server.on("^/streaming/account/([^/]+)/device/([^/]+)/presets$",  HTTP_GET,  handleDevicePresets);
+    routeT(server, "^/streaming/account/([^/]+)/full$",                    HTTP_GET,  handleAccountFull);
+    routeT(server, "^/streaming/account/([^/]+)/sources$",                 HTTP_GET,  handleAccountSources);
+    routeT(server, "^/streaming/account/([^/]+)/provider_settings$",       HTTP_GET,  handleProviderSettings);
+    routeT(server, "^/streaming/account/([^/]+)/presets$",                 HTTP_GET,  handleAccountPresets);
+    routeT(server, "^/streaming/account/([^/]+)/presets/all$",             HTTP_GET,  handleAccountPresets);
+    routeT(server, "^/streaming/account/([^/]+)/device/([^/]+)/presets$",  HTTP_GET,  handleDevicePresets);
     server.on("/bmx/tunein/v1/token",                                 HTTP_POST, handleTuneInToken);
-    server.on("^/bmx/tunein/v1/playback/station/([^/]+)$",            HTTP_GET,  handleTuneInStation);
+    routeT(server, "^/bmx/tunein/v1/playback/station/([^/]+)$",            HTTP_GET,  handleTuneInStation);
     server.on("/bmx/tunein/v1/report",                                HTTP_POST, handleTuneInReport);
-    server.on("^/streaming/account/([^/]+)/device/([^/]+)/recent$",   HTTP_POST, handleRecent);
+    routeT(server, "^/streaming/account/([^/]+)/device/([^/]+)/recent$",   HTTP_POST, handleRecent);
     // Multi-Room-Group-Status — vom Speaker beim Post-Pair-Boot abgefragt:
-    server.on("^/streaming/account/([^/]+)/device/([^/]+)/group/$",   HTTP_GET,  handleDeviceGroup);
+    routeT(server, "^/streaming/account/([^/]+)/device/([^/]+)/group/$",   HTTP_GET,  handleDeviceGroup);
     // P5 — Stereo-Pairing / Multi-Room-Group-Lifecycle (POST/PUT/DELETE):
-    server.on("^/streaming/account/([^/]+)/group/$",                  HTTP_POST,
+    routeT(server, "^/streaming/account/([^/]+)/group/$",                  HTTP_POST,
               handleGroupCreate, nullptr, handleGroupBody);
-    server.on("^/streaming/account/([^/]+)/group/([^/]+)$",           HTTP_PUT,
+    routeT(server, "^/streaming/account/([^/]+)/group/([^/]+)$",           HTTP_PUT,
               handleGroupUpdate, nullptr, handleGroupBody);
-    server.on("^/streaming/account/([^/]+)/group/([^/]+)$",           HTTP_DELETE,
+    routeT(server, "^/streaming/account/([^/]+)/group/([^/]+)$",           HTTP_DELETE,
               handleGroupDelete);
     // Bose-Device-Blacklist-Check (immer 404 expected):
-    server.on("^/v1/blacklist/([^/]+)$",                              HTTP_GET,  handleBlacklist);
+    routeT(server, "^/v1/blacklist/([^/]+)$",                              HTTP_GET,  handleBlacklist);
     // P7 — defensive Speaker-aktive Gap-Filler-Stubs:
     server.on("/core02/svc-bmx-adapter-orion/prod/orion/station",     HTTP_GET,  handleOrionStation);
-    server.on("^/streaming/software/update/account/([^/]+)$",         HTTP_GET,  handleSwUpdateAccount);
-    server.on("^/streaming/device/([^/]+)/streaming_token$",          HTTP_GET,  handleStreamingToken);
+    routeT(server, "^/streaming/software/update/account/([^/]+)$",         HTTP_GET,  handleSwUpdateAccount);
+    routeT(server, "^/streaming/device/([^/]+)/streaming_token$",          HTTP_GET,  handleStreamingToken);
     server.on("/streaming/support/customersupport",                   HTTP_POST, handleCustomerSupport);
-    server.on("^/streaming/account/([^/]+)/device/([^/]+)/recents$",  HTTP_GET,  handleAccountRecents);
-    server.on("^/streaming/account/([^/]+)/device/([^/]+)/recent/([^/]+)$",
+    routeT(server, "^/streaming/account/([^/]+)/device/([^/]+)/recents$",  HTTP_GET,  handleAccountRecents);
+    routeT(server, "^/streaming/account/([^/]+)/device/([^/]+)/recent/([^/]+)$",
               HTTP_GET, handleAccountRecentSingle);
-    server.on("^/streaming/account/([^/]+)/device/([^/]+)/preset/([1-6])$",
+    routeT(server, "^/streaming/account/([^/]+)/device/([^/]+)/preset/([1-6])$",
               HTTP_GET, handleAccountPresetSingle);
     // Marge-Association-Bootstrap (trailing slash ist Pflicht — Speaker schickt es so):
-    server.on("^/streaming/account/([^/]+)/device/$",                 HTTP_POST,
+    routeT(server, "^/streaming/account/([^/]+)/device/$",                 HTTP_POST,
               handleDeviceAddFinalize, nullptr, handleDeviceAddBody);
     // POST /streaming/account/<aid>/source — MusicService-Account-Registrierung
     // (DLNA, Spotify-User, etc.). Speaker triggert dies aus BMX-POST
     // /setMusicServiceAccount und erwartet 200 OK mit <source id=...>-XML.
-    server.on("^/streaming/account/([^/]+)/source$",                  HTTP_POST,
+    routeT(server, "^/streaming/account/([^/]+)/source$",                  HTTP_POST,
               handleAccountSourceAddFinalize, nullptr, handleAccountSourceAddBody);
     server.on("/updates/soundtouch",                                  HTTP_GET,  handleSWUpdateIndex);
 

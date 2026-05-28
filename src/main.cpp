@@ -87,16 +87,14 @@ static void startMDNS() {
 static void startBoseServer() {
     sixback::eventStoreInit();
     sixback::spotify::init();      // registriert preset-pressed-Callback
-    registerBoseEndpoints(boseServer);
-    boseServer.begin();
+    boseServer.begin();            // routes already registered early in setup()
     Serial.printf("[bose] cloud-replacement listening on :%d\n", BOSE_HTTP_PORT);
     Serial.printf("[bose] tell speakers to use: http://%s:%d\n",
                   WiFi.localIP().toString().c_str(), BOSE_HTTP_PORT);
 }
 
 static void startUiServer() {
-    registerApiEndpoints(uiServer);
-    uiServer.begin();
+    uiServer.begin();              // routes already registered early in setup()
     Serial.printf("[ui]   web/api listening on http://%s:%d/\n",
                   WiFi.localIP().toString().c_str(), UI_HTTP_PORT);
     Serial.printf("[ui]   mDNS: http://%s.local/\n", MDNS_HOSTNAME);
@@ -123,6 +121,16 @@ void setup() {
     // loadFromNVS()/connectWifi(). Idempotent + no-op nach erstem
     // erfolgreichen Boot. Siehe nvs_helper.{h,cpp}.
     sixback::migrateAllBosefixNvs();
+
+    // Compile all HTTP route handlers NOW, while the heap is still fresh.
+    // With ASYNCWEBSERVER_REGEX every "^…$" route builds a std::regex; on
+    // RAM-tight targets (C3, no PSRAM) deferring this until after WiFi+TLS+
+    // Spotify have allocated leaves too little headroom for the regex NFA
+    // compile spike → bad_alloc → std::terminate → bootloop. The servers are
+    // begin()'d later (startBoseServer/startUiServer) once everything is up.
+    registerBoseEndpoints(boseServer);
+    registerApiEndpoints(uiServer);
+
     connectWifi();
     startMDNS();
     initInventory();

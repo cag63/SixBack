@@ -291,7 +291,7 @@ void SpeakerInventory::ssdpMSearch_() {
         String resp(buf);
         // Pruefen ob es ein SoundTouch ist (Server-Header oder Location-Pattern)
         if (resp.indexOf("Location: http://") < 0) continue;
-        // Bose-Speaker liefern z.B. http://10.10.11.196:8091/XD/BO5EBO5E-...
+        // Bose-Speaker liefern z.B. http://192.168.1.50:8091/XD/BO5EBO5E-...
         String srcIp = src.toString();
         Speaker s;
         if (probeIp_(srcIp, s)) {

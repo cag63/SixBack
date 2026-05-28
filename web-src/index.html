@@ -425,7 +425,8 @@
       </div>
     </section>
 
-    <!-- DLNA tab — UPnP browse via Pi5 proxy (sixback-dlna on :8790).
+    <!-- DLNA tab — UPnP browse served same-origin by the firmware itself
+         (/api/dlna/describe + /api/dlna/browse); no external proxy.
          User picks a speaker (= LAN scope), then one of its visible
          media servers, then drills containers and drags an item/folder
          onto a preset slot. Backend records via /select+long-press. -->
@@ -649,7 +650,7 @@
   <div class="box">
     <h3>Add speaker manually</h3>
     <label>IP address</label>
-    <input type="text" id="add-ip" placeholder="10.10.11.196">
+    <input type="text" id="add-ip" placeholder="192.168.1.50">
     <div id="add-error" style="display:none; margin-top:10px; padding:8px 12px; border-radius:4px; background:#5a2222; color:#ffbcbc; font-size:13px; line-height:1.4;"></div>
     <div class="row">
       <button onclick="closeModal('modal-add')">Cancel</button>
@@ -785,7 +786,7 @@
 
 <script>
 let STATE = { speakers: [], editing: null, dragSource: null, _lastDragEndedAt: 0,
-               libResults: [], libSearchTimer: null,
+               libResults: [], libSearchTimer: null, libLastQuery: '',
                // Per-device preset state: store (what user wants) + hw (what
                // speaker actually has). Both are arrays of 6 normalized slots.
                // Populated by loadPresetsFor() — one fetch per source.
@@ -797,28 +798,20 @@ let STATE = { speakers: [], editing: null, dragSource: null, _lastDragEndedAt: 0
                dirtySpeakers: new Set() };
 
 // Station library proxy bases. Tried in order until one returns 200.
-// Override head-of-list via DevTools or localStorage:
-//   localStorage.SIXBACK_STATIONS_BASE = 'http://10.10.11.113:8789/sixback/stations'
-// Default: prefer sixback.io (kanonische Domain seit 2026-05-25, Apache
-// reverse-proxy zu Pi5:8789/sixback/stations/), fall back zur direkten
-// LAN-Adresse (nur fuer Devices im AILab nuetzlich).
+// Default is the canonical public domain (sixback.io -> Apache reverse-proxy).
+// A LAN/dev proxy can be selected head-of-list via DevTools or localStorage:
+//   localStorage.SIXBACK_STATIONS_BASE = 'http://<lan-host>:8789/sixback/stations'
 const STATIONS_API_BASES = [
   window.SIXBACK_STATIONS_BASE,
   localStorage.getItem('SIXBACK_STATIONS_BASE'),
   'https://sixback.io/stations',
-  'http://10.10.11.113:8789/sixback/stations',
 ].filter(Boolean);
 let STATIONS_API_BASE = STATIONS_API_BASES[0];   // updated to whichever base actually works
 
-// DLNA-Browse-Proxy (UPnP-CDS SOAP -> JSON). No public reverse-proxy yet —
-// browser must reach the Pi5 directly. Same override path as STATIONS:
-//   localStorage.SIXBACK_DLNA_BASE = 'http://10.10.11.113:8790'
-const SIXBACK_DLNA_BASES = [
-  window.SIXBACK_DLNA_BASE,
-  localStorage.getItem('SIXBACK_DLNA_BASE'),
-  'http://10.10.11.113:8790',
-].filter(Boolean);
-let SIXBACK_DLNA_BASE = SIXBACK_DLNA_BASES[0];
+// DLNA browse is served same-origin by the firmware itself
+// (/api/dlna/describe, /api/dlna/browse). The ESP speaks UPnP ContentDirectory
+// directly to the media server on the LAN — no external proxy, so it works
+// regardless of where the WebUI is loaded from.
 
 // ---- Toast ----
 // Dedup: identical msg+kind within DEDUP_MS is treated as the same event —
@@ -1155,6 +1148,15 @@ function renderOnline(d) {
       break;
     case 'error':
       msg = '✗ ' + (d.error || 'unknown error');
+      cls = 'color:var(--bad)';
+      break;
+    default:
+      // Backend kann state weglassen oder unbekannten Wert liefern (z.B.
+      // alte Build-Variante, defekter Proxy). Statt stumm zu bleiben den
+      // rohen Response zeigen, damit das Symptom diagnosierbar ist.
+      msg = d.error
+          ? '✗ ' + d.error
+          : '✗ backend returned unknown state' + (d.state ? ' "' + d.state + '"' : ' (no state field)');
       cls = 'color:var(--bad)';
       break;
   }
@@ -2585,7 +2587,7 @@ function streamLoadFromLocalStorage() {
 
 function onLibrarySearchInput() {
   if (STATE.libSearchTimer) clearTimeout(STATE.libSearchTimer);
-  STATE.libSearchTimer = setTimeout(loadLibrary, 350);
+  STATE.libSearchTimer = setTimeout(loadLibrary, 700);
 }
 
 // ---- Preview / Target bar ----
@@ -2787,21 +2789,37 @@ function onLibraryTileClick(ev) {
 }
 
 async function loadLibrary() {
-  const q = document.getElementById('lib-q').value.trim();
+  const raw = document.getElementById('lib-q').value;
+  const q = raw.trim().replace(/\s+/g, ' ');
   const grid = document.getElementById('lib-grid');
-  if (q.length < 2) {
-    grid.innerHTML = '<div class="sb-empty">Type ≥2 characters to search.</div>';
-    STATE.libResults = []; return;
+  if (q.length < 3) {
+    grid.innerHTML = '<div class="sb-empty">Type ≥3 characters to search.</div>';
+    STATE.libResults = []; STATE.libLastQuery = ''; return;
   }
+  // Suppress identical re-issue (e.g. caret moved, focus blur, refresh button).
+  if (q === STATE.libLastQuery && STATE.libResults.length > 0) return;
+  STATE.libLastQuery = q;
   grid.innerHTML = '<div class="sb-empty">Loading…</div>';
-  const pathQ = `/tunein-search?q=${encodeURIComponent(q)}&limit=24`;
+  // TuneIn station IDs (sNNNN…) hit /tunein-resolve for an exact 1-tile
+  // result that's draggable, instead of a fuzzy-search detour.
+  const isStationId = /^s\d+$/i.test(q);
+  const pathQ = isStationId
+      ? `/tunein-resolve/${encodeURIComponent(q.toLowerCase())}`
+      : `/tunein-search?q=${encodeURIComponent(q)}&limit=24`;
   let lastErr = null;
   for (const base of STATIONS_API_BASES) {
     try {
       const r = await fetch(base + pathQ, { mode: 'cors' });
+      if (r.status === 404 && isStationId) {
+        grid.innerHTML = `<div class="sb-empty">TuneIn does not know station
+          <code>${esc(q)}</code>.</div>`;
+        STATE.libResults = []; return;
+      }
       if (!r.ok) { lastErr = new Error('HTTP '+r.status); continue; }
       const body = await r.json();
-      STATE.libResults = body.results || [];
+      STATE.libResults = isStationId
+          ? (body.result ? [body.result] : [])
+          : (body.results || []);
       STATIONS_API_BASE = base;   // remember winner for logo URLs
       renderLibrary();
       return;
@@ -2968,19 +2986,18 @@ async function onDlnaServerChange() {
   document.getElementById('dlna-grid').innerHTML =
     '<div class="sb-empty">Fetching media-server descriptor…</div>';
   try {
-    const url = SIXBACK_DLNA_BASE + '/dlna/describe?location=' +
+    const url = '/api/dlna/describe?location=' +
                 encodeURIComponent(srv.location);
-    const resp = await fetch(url, {mode: 'cors'});
-    if (!resp.ok) throw new Error('HTTP '+resp.status);
-    const dj = await resp.json();
-    if (!dj.ok) throw new Error(dj.detail || 'describe failed');
+    const resp = await fetch(url);
+    const dj = await resp.json().catch(() => ({}));
+    if (!resp.ok || !dj.ok) throw new Error(dj.detail || ('HTTP '+resp.status));
     STATE.dlnaServerControlUrl = dj.control_url;
     STATE.dlnaPath = [];
     await dlnaBrowse('0', dj.name || srv.name || 'Root', /*reset=*/true);
   } catch (e) {
     document.getElementById('dlna-grid').innerHTML =
       `<div class="sb-empty">Describe failed: ${esc(e.message)}<br>
-       <small>${esc(SIXBACK_DLNA_BASE)} must be reachable from this browser.</small></div>`;
+       <small>The speaker and its DLNA server must be reachable on the LAN.</small></div>`;
   }
 }
 
@@ -2989,13 +3006,12 @@ async function dlnaBrowse(objectId, title, reset) {
   document.getElementById('dlna-grid').innerHTML =
     '<div class="sb-empty">Loading…</div>';
   try {
-    const url = SIXBACK_DLNA_BASE + '/dlna/browse?control_url=' +
+    const url = '/api/dlna/browse?control_url=' +
                 encodeURIComponent(STATE.dlnaServerControlUrl) +
                 '&object_id=' + encodeURIComponent(objectId) + '&count=200';
-    const resp = await fetch(url, {mode: 'cors'});
-    if (!resp.ok) throw new Error('HTTP '+resp.status);
-    const j = await resp.json();
-    if (!j.ok) throw new Error(j.detail || 'browse failed');
+    const resp = await fetch(url);
+    const j = await resp.json().catch(() => ({}));
+    if (!resp.ok || !j.ok) throw new Error(j.detail || ('HTTP '+resp.status));
     STATE.dlnaItems = { containers: j.containers || [], items: j.items || [] };
     if (reset) {
       STATE.dlnaPath = [{id: objectId, title}];
