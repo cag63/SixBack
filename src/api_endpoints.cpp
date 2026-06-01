@@ -16,6 +16,7 @@
 #include "speaker_telnet.h"
 #include "wifi_provisioning.h"
 #include "speaker_inventory.h"
+#include "zone_manager.h"
 #include "preset_store.h"
 #include "tunein_resolver.h"
 #include "system_health.h"
@@ -1031,6 +1032,40 @@ static TaskHandle_t  g_pushTask  = nullptr;
 constexpr UBaseType_t PUSH_QUEUE_DEPTH = 16;  // ≥ 3 Speaker × 6 Slots
 
 static void doPush_(const PushPresetJob_& job) {
+    // Defensive /sources-Vorpruefung (Issue #10/#11): der Handler gated bereits
+    // auf MigrationStatus, aber der kann veraltet sein (cron-tick alle 30 min)
+    // oder der account-bound TUNEIN-Source kann trotz "migrated" weggefallen sein
+    // (siehe bose_endpoints.cpp account-bound-source-drop). Ist TUNEIN am Speaker
+    // nicht READY, liefe /select in 500 UNKNOWN_SOURCE_ERROR — hier vorher sauber
+    // abbrechen mit klarem Log statt Fehl-Long-Press. Nur bei eindeutigem
+    // /sources=200-ohne-READY abbrechen; ein /sources-Fehler faellt durch (das
+    // /select unten hat eigenes Error-Handling).
+    if (job.p.source == sixback::PresetSource::TUNEIN) {
+        HTTPClient hs;
+        hs.setReuse(false);
+        if (hs.begin("http://" + job.spIp + ":" + String(BOSE_BMX_PORT) + "/sources")) {
+            if (hs.GET() == 200) {
+                String srcs = hs.getString();
+                bool ready = false;
+                int pos = srcs.indexOf("source=\"TUNEIN\"");
+                while (pos >= 0) {
+                    int tagEnd = srcs.indexOf('>', pos);
+                    if (tagEnd > pos &&
+                        srcs.substring(pos, tagEnd).indexOf("status=\"READY\"") >= 0) {
+                        ready = true; break;
+                    }
+                    pos = srcs.indexOf("source=\"TUNEIN\"", pos + 15);
+                }
+                if (!ready) {
+                    hs.end();
+                    Serial.printf("[bg:push-preset] %s slot %u ABORT — TUNEIN source not READY in /sources (not migrated / source dropped) — no /select\n",
+                                  job.spIp.c_str(), job.p.slot);
+                    return;
+                }
+            }
+            hs.end();
+        }
+    }
     HTTPClient http;
     http.setReuse(false);
     String url = "http://" + job.spIp + ":" + String(BOSE_BMX_PORT) + "/select";
@@ -1073,8 +1108,10 @@ static void doPush_(const PushPresetJob_& job) {
         // /select failed (network glitch, speaker STANDBY/busy, UNKNOWN_SOURCE,
         // etc.). Long-Press would save whatever happens to be playing at that
         // moment to this slot — almost guaranteed to be wrong. Abort.
-        Serial.printf("[bg:push-preset] %s slot %u ABORT — /select=%d (no long-press attempted)\n",
-                      job.spIp.c_str(), job.p.slot, selectCode);
+        const char* hint = (selectCode == 500)
+            ? " [500 = UNKNOWN_SOURCE: speaker source not bound — is it migrated?]" : "";
+        Serial.printf("[bg:push-preset] %s slot %u ABORT — /select=%d (no long-press attempted)%s\n",
+                      job.spIp.c_str(), job.p.slot, selectCode, hint);
         return;
     }
     delay(8000);  // Stream stabilisieren — 4 s war in der Praxis oft zu kurz
@@ -1148,11 +1185,38 @@ void handlePushPresetToDevice(AsyncWebServerRequest* req) {
     uint8_t slot = pathParam(1).toInt();
     auto& inv = sixback::SpeakerInventory::instance();
     String spIp;
+    sixback::MigrationStatus spStatus = sixback::MigrationStatus::UNKNOWN;
     {
         sixback::SpeakerInventory::LockGuard g(inv);
         auto* sp = inv.findById(id);
         if (!sp) { req->send(404, "application/json", "{\"error\":\"unknown deviceId\"}"); return; }
-        spIp = sp->ip;
+        spIp     = sp->ip;
+        spStatus = sp->status;
+    }
+    // Push-Guard (Issue #10/#11, Repro 2026-06-01): ein nicht-migrierter Speaker
+    // hat keinen gebundenen TUNEIN-/Cloud-Source in /sources -> /select liefert
+    // HTTP 500 UNKNOWN_SOURCE_ERROR (1005), doPush_ bricht ab, und die UI meldet
+    // das irrefuehrende "hardware did not save ... (Bose-side / name-normalization)".
+    // Statt einen aussichtslosen Push zu enqueuen: hier mit handlungsweisender
+    // Meldung abweisen. api() reicht body.error als Step-Fehlertext an die UI durch.
+    if (spStatus != sixback::MigrationStatus::MIGRATED) {
+        const char* msg;
+        switch (spStatus) {
+            case sixback::MigrationStatus::NOT_MIGRATED:
+                msg = "speaker not migrated to SixBack yet — migrate it first, then push presets";
+                break;
+            case sixback::MigrationStatus::SETTLING:
+                msg = "speaker is settling after a reboot — retry in ~90 s";
+                break;
+            case sixback::MigrationStatus::OFFLINE:
+                msg = "speaker is offline / unreachable";
+                break;
+            default:
+                msg = "speaker not ready for preset push (migrate it first)";
+                break;
+        }
+        req->send(409, "application/json", String("{\"error\":\"") + msg + "\"}");
+        return;
     }
     auto p = sixback::PresetStore::instance().get(id, slot);
     if (p.source == sixback::PresetSource::EMPTY) {
@@ -1542,6 +1606,99 @@ void handlePlaySource(AsyncWebServerRequest* req, JsonDocument& body) {
     out["source"] = sixback::presetSourceToStr(src);
     String b; serializeJson(out, b);
     req->send(code == 200 ? 200 : 502, "application/json", b);
+}
+
+// -----------------------------------------------------------------------------
+// ZoneManager — device-direct Multiroom (BMX :8090 /setZone etc.)
+//   Stateless: liest die Live-Wahrheit aus /getZone des Masters. Eigene
+//   Schicht, getrennt vom cloud-seitigen Group-Store (handlePutGroup/Sync).
+// -----------------------------------------------------------------------------
+
+// Serialisiert eine ZoneView nach JSON (geteilt von handleGetZone +
+// den POST-Handlern fuer instant feedback). isMaster wird relativ zur
+// abgefragten deviceId abgeleitet.
+void emitZoneView_(JsonDocument& out, const sixback::ZoneView& zv, const String& forId) {
+    out["inZone"]   = zv.inZone;
+    out["masterId"] = zv.masterId;
+    out["isMaster"] = zv.inZone && (zv.masterId == forId);
+    JsonArray arr = out["members"].to<JsonArray>();
+    for (const auto& m : zv.members) {
+        JsonObject o = arr.add<JsonObject>();
+        o["deviceId"] = m.deviceId;
+        o["ip"]       = m.ip;
+        o["name"]     = m.name;
+    }
+}
+
+// GET /api/speaker/{id}/zone — ZoneView des Masters fuer die angefragte id.
+void handleGetZone(AsyncWebServerRequest* req) {
+    String id = pathParam(0);
+    auto& inv = sixback::SpeakerInventory::instance();
+    {
+        sixback::SpeakerInventory::LockGuard g(inv);
+        if (!inv.findById(id)) { req->send(404, "application/json", "{\"error\":\"unknown deviceId\"}"); return; }
+    }
+    sixback::ZoneView zv = sixback::zoneStatus(id);
+    JsonDocument out;
+    emitZoneView_(out, zv, id);
+    String b; serializeJson(out, b);
+    req->send(200, "application/json", b);
+}
+
+// POST /api/zone/create  { master, members:[deviceId,...] }
+void handleZoneCreate(AsyncWebServerRequest* req, JsonDocument& body) {
+    String master = String((const char*)(body["master"] | ""));
+    if (master.length() == 0) { req->send(400, "application/json", "{\"error\":\"master required\"}"); return; }
+    std::vector<String> slaves;
+    if (body["members"].is<JsonArray>()) {
+        for (JsonVariant v : body["members"].as<JsonArray>()) {
+            String sid = String((const char*)(v | ""));
+            if (sid.length() && sid != master) slaves.push_back(sid);
+        }
+    }
+    if (slaves.empty()) { req->send(400, "application/json", "{\"error\":\"members required\"}"); return; }
+    int rc = sixback::zoneCreate(master, slaves);
+    if (rc == -1) { req->send(404, "application/json", "{\"error\":\"unknown deviceId\"}"); return; }
+    JsonDocument out;
+    out["ok"] = (rc == 0);
+    sixback::ZoneView zv = sixback::zoneStatus(master);
+    emitZoneView_(out, zv, master);
+    String b; serializeJson(out, b);
+    req->send(rc == 0 ? 200 : 502, "application/json", b);
+}
+
+// POST /api/zone/dissolve  { master }
+void handleZoneDissolve(AsyncWebServerRequest* req, JsonDocument& body) {
+    String master = String((const char*)(body["master"] | ""));
+    if (master.length() == 0) { req->send(400, "application/json", "{\"error\":\"master required\"}"); return; }
+    int rc = sixback::zoneDissolve(master);
+    if (rc == -1) { req->send(404, "application/json", "{\"error\":\"unknown deviceId\"}"); return; }
+    JsonDocument out;
+    out["ok"] = (rc == 0);
+    String b; serializeJson(out, b);
+    req->send(rc == 0 ? 200 : 502, "application/json", b);
+}
+
+// POST /api/zone/member  { master, slave, op:"add"|"remove" }
+void handleZoneMember(AsyncWebServerRequest* req, JsonDocument& body) {
+    String master = String((const char*)(body["master"] | ""));
+    String slave  = String((const char*)(body["slave"]  | ""));
+    String op     = String((const char*)(body["op"]     | ""));
+    if (master.length() == 0 || slave.length() == 0) {
+        req->send(400, "application/json", "{\"error\":\"master and slave required\"}"); return;
+    }
+    int rc;
+    if (op == "add")         rc = sixback::zoneAdd(master, slave);
+    else if (op == "remove") rc = sixback::zoneRemove(master, slave);
+    else { req->send(400, "application/json", "{\"error\":\"op must be add or remove\"}"); return; }
+    if (rc == -1) { req->send(404, "application/json", "{\"error\":\"unknown deviceId\"}"); return; }
+    JsonDocument out;
+    out["ok"] = (rc == 0);
+    out["op"] = op;
+    sixback::ZoneView zv = sixback::zoneStatus(master);
+    emitZoneView_(out, zv, master);
+    String b; serializeJson(out, b);
+    req->send(rc == 0 ? 200 : 502, "application/json", b);
 }
 
 // -----------------------------------------------------------------------------
@@ -3181,6 +3338,13 @@ void registerApiEndpoints(AsyncWebServer& ui) {
     routeJsonBody(ui, "^/api/speaker/([^/]+)/play-source$", HTTP_POST, handlePlaySource);
     routeT(ui, "^/api/speaker/([^/]+)/hardware-presets$", HTTP_GET, handleGetHardwarePresets);
     routeT(ui, "^/api/speaker/([^/]+)/now-playing-live$", HTTP_GET, handleNowPlayingLive);
+
+    // ZoneManager — device-direct Multiroom (BMX :8090). Eigene Schicht,
+    // getrennt vom cloud-Group-Store (handlePutGroup/handleSyncGroup unten).
+    routeT(ui, "^/api/speaker/([^/]+)/zone$", HTTP_GET,  handleGetZone);
+    routeJsonBody(ui, "^/api/zone/create$",   HTTP_POST, handleZoneCreate);
+    routeJsonBody(ui, "^/api/zone/dissolve$", HTTP_POST, handleZoneDissolve);
+    routeJsonBody(ui, "^/api/zone/member$",   HTTP_POST, handleZoneMember);
 
     routeT(ui, "^/api/speaker/([^/]+)/dlna/servers$", HTTP_GET, handleDlnaServers);
     routeT(ui, "/api/dlna/describe", HTTP_GET, handleDlnaDescribe);

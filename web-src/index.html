@@ -80,9 +80,17 @@
   .sp-dot.settling { background: #f6c945; border-color: #caa023; }
   .speaker.collapsed .speaker-info,
   .speaker.collapsed .speaker-cloud,
+  .speaker.collapsed .speaker-zone,
   .speaker.collapsed .actions,
   .speaker.collapsed .presets,
   .speaker.collapsed .preset-actions { display: none !important; }
+  .speaker-zone { margin-top: .4em; font-size: .85em; display: flex; flex-wrap: wrap;
+                  align-items: center; gap: .4em; }
+  .speaker-zone:empty { display: none; }
+  .zone-badge { background: var(--accent, #4a8); color: #fff; border-radius: 3px;
+                padding: .1em .5em; font-weight: 600; }
+  .zone-badge.slave { background: #555; }
+  .zone-pick { font-size: .85em; }
   .syshead { cursor: pointer; font-weight: 600; font-size: 1.15em; margin: 1.4em 0 .4em;
              display: flex; align-items: center; gap: .5em; user-select: none; }
   #sys-collapsible.collapsed { display: none; }
@@ -1393,6 +1401,8 @@ function toggleSpeaker(ev, devId) {
   const nowCollapsed = card.classList.toggle('collapsed');
   setSpeakerOpen_(devId, !nowCollapsed);
   updateChevron_(card, !nowCollapsed);
+  // Just expanded: fetch zone now so the row populates without waiting for the tick.
+  if (!nowCollapsed) pollZone(devId);
 }
 function setAllSpeakersOpen(open) {
   const m = speakerOpenMap_();
@@ -1587,6 +1597,7 @@ function speakerCard(s, myBase) {
           <div class="speaker-info">${esc(s.model)} · ${esc(s.ip)} · ${esc(s.device_id)} · FW ${esc((s.firmware||'').substring(0,15))}${s.group_id ? ' · group: '+esc(s.group_id) : ''}</div>
           ${cloudLine}
           ${spotifyLine}
+          <div class="speaker-zone" id="zone-${s.device_id}"></div>
         </div>
         <div class="actions">${actionButtonsHtml(s)}</div>
       </div>
@@ -2452,6 +2463,12 @@ async function togglePower(devId) {
 STATE.nowPlaying = {};
 STATE.nowPlayingTimer = null;
 
+// ---- ZoneManager (device-direct multiroom) ----
+// STATE.zone: deviceId -> { inZone, masterId, isMaster, members:[{deviceId,ip,name}] }
+// Live device state, NOT carried in /api/speakers — filled from the poll tick.
+STATE.zone = {};
+STATE.zoneInflight = {};   // devId -> true while a /zone fetch is outstanding (no stacking)
+
 STATE.liveFallbackAt = {};   // devId -> last live-fallback timestamp (ms)
 const LIVE_FALLBACK_MIN_MS = 30000;  // rate-limit: at most once per 30 s per speaker
 
@@ -2545,11 +2562,119 @@ function applyPlayingHighlight(devId) {
   });
 }
 
+// ---- ZoneManager poll + render ----
+// Zone membership is live device state (master's /getZone). Unlike now-playing
+// (served from the SCMUDC cache, instant), this is a REAL synchronous GET to the
+// speaker on the ESP side — so it is polled only for EXPANDED cards (the zone row
+// is hidden when collapsed) and guarded against stacking. Failures stay silent
+// (offline speakers must not toast-spam).
+async function pollZone(devId) {
+  if (STATE.zoneInflight[devId]) return;   // don't stack a second fetch on a slow tick
+  STATE.zoneInflight[devId] = true;
+  try {
+    const z = await api(`/api/speaker/${encodeURIComponent(devId)}/zone`);
+    STATE.zone[devId] = z;
+    renderZoneRow_(devId);
+  } catch(e) { /* speaker offline / endpoint error — silent */ }
+  finally { STATE.zoneInflight[devId] = false; }
+}
+
+// Resolve a member's display name: prefer the live zone-view name, else the
+// speaker list (name or device_id). Never hardcode.
+function zoneMemberName_(m) {
+  if (m.name) return m.name;
+  const s = (STATE.speakers || []).find(sp => sp.device_id === m.deviceId);
+  return (s && (s.name || s.device_id)) || m.deviceId;
+}
+
+function renderZoneRow_(devId) {
+  const row = document.getElementById('zone-' + devId);
+  if (!row) return;
+  const z = STATE.zone[devId];
+  if (!z || !z.inZone) {
+    // Not in a zone — offer a "Group with ▾" picker of other online speakers.
+    // Don't clobber an in-progress selection on the 10s re-poll.
+    const existing = document.getElementById('zonepick-' + devId);
+    if (existing && existing.value) return;
+    const others = (STATE.speakers || []).filter(s =>
+      s.device_id && s.device_id !== devId && (s.status || '') !== 'OFFLINE');
+    if (others.length === 0) { row.innerHTML = ''; return; }
+    const opts = others.map(s =>
+      `<option value="${esc(s.device_id)}">${esc(s.name || s.device_id)}</option>`).join('');
+    row.innerHTML =
+      `<label class="zone-pick">Group with ` +
+      `<select id="zonepick-${devId}"><option value="">— pick a speaker —</option>${opts}</select>` +
+      `</label>` +
+      `<button class="zone-pick" onclick="groupWith('${devId}')">＋ Group</button>`;
+    return;
+  }
+  // In a zone. Master shows full member list + Ungroup; slaves show "part of".
+  const members = z.members || [];
+  if (z.isMaster) {
+    const names = members.map(zoneMemberName_).join(', ');
+    row.innerHTML =
+      `<span class="zone-badge" title="This speaker is the zone master; members follow its now-playing audio.">Zone: master · ${members.length} member${members.length === 1 ? '' : 's'}</span>` +
+      `<span style="color:var(--mute)">${esc(names)}</span>` +
+      `<button class="zone-pick danger" onclick="ungroupZone('${devId}')">Ungroup</button>`;
+  } else {
+    const masterName = (() => {
+      const m = members.find(x => x.deviceId === z.masterId);
+      if (m) return zoneMemberName_(m);
+      const s = (STATE.speakers || []).find(sp => sp.device_id === z.masterId);
+      return (s && (s.name || s.device_id)) || z.masterId;
+    })();
+    row.innerHTML =
+      `<span class="zone-badge slave" title="This speaker follows the master's now-playing audio.">part of ${esc(masterName)}</span>`;
+  }
+}
+
+// Staggered zone re-poll after a group/ungroup action — instant feedback for
+// every speaker affected, mirroring kickPoll's cadence (the zone state of
+// master AND each member changes at once).
+function kickPollZone(devIds) {
+  const ids = Array.isArray(devIds) ? devIds : [devIds];
+  const doIt = () => ids.forEach(id => pollZone(id));
+  doIt();
+  setTimeout(doIt, 800);
+  setTimeout(doIt, 2500);
+}
+
+async function groupWith(devId) {
+  const sel = document.getElementById('zonepick-' + devId);
+  const slave = sel ? sel.value : '';
+  if (!slave) { toast('Pick a speaker to group with'); return; }
+  try {
+    await api('/api/zone/create', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ master: devId, members: [slave] }),
+    });
+  } catch(e) { toast('Group failed: ' + e.message); }
+  kickPollZone([devId, slave]);
+}
+
+async function ungroupZone(devId) {
+  const affected = [devId];
+  const z = STATE.zone[devId];
+  if (z && z.members) z.members.forEach(m => { if (m.deviceId) affected.push(m.deviceId); });
+  try {
+    await api('/api/zone/dissolve', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ master: z && z.masterId ? z.masterId : devId }),
+    });
+  } catch(e) { toast('Ungroup failed: ' + e.message); }
+  kickPollZone(affected);
+}
+
 function startNowPlayingPoll() {
   if (STATE.nowPlayingTimer) clearInterval(STATE.nowPlayingTimer);
   const tick = () => {
     (STATE.speakers || []).forEach(s => {
-      if (s.device_id) pollNowPlaying(s.device_id);
+      if (!s.device_id) return;
+      pollNowPlaying(s.device_id);   // cache-served, cheap — every speaker
+      // Zone is a live GET on the speaker; only fetch it for expanded cards
+      // (the zone row is hidden on collapsed cards anyway). Bounds blocking load.
+      const card = document.getElementById('sp-' + s.device_id);
+      if (card && !card.classList.contains('collapsed')) pollZone(s.device_id);
     });
   };
   // First tick after a short delay so initial page-render isn't slowed by
