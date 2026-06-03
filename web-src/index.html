@@ -336,6 +336,18 @@
              gap: .45em; overflow-y: auto; padding-right: .25em;
              align-content: start; flex: 1; min-height: 0; }
   .sb-empty { text-align: center; color: var(--mute); padding: 1.5em .8em; font-style: italic; font-size: .85em; }
+  /* Collapsed "add by URL / saved streams" block — keeps the search results
+     (rb-grid) as the dominant area of the Stream tab. */
+  details.sb-adv { border-top: 1px solid var(--line); margin-top: .2em; flex: none; }
+  details.sb-adv > summary { cursor: pointer; font-size: .82em; color: var(--mute);
+                             padding: .45em .1em; user-select: none; }
+  details.sb-adv[open] > summary { color: var(--ink); font-weight: 600; }
+  /* Single-line URL-add inputs: natural height (NOT flex:1, which grows them
+     vertically in a column container — that produced the huge boxes). */
+  .sb-urlform { display: flex; flex-direction: column; gap: .35em; margin: .4em 0 .5em; }
+  .sb-urlform input { padding: .35em .55em; font-size: .9em; border: 1px solid var(--line);
+                      border-radius: 6px; background: #fff; width: 100%; box-sizing: border-box; }
+  .sb-grid-saved { flex: none; max-height: 13em; }
 
   .lib-tile { border: 1px solid var(--line); border-radius: 6px; padding: .4em; background: #fff;
               cursor: grab; display: flex; flex-direction: column; gap: .25em;
@@ -444,26 +456,36 @@
       </div>
     </section>
 
-    <!-- Stream tab — paste URL+Name, server-side validate, then drag -->
+    <!-- Stream tab — search internet radio (RadioBrowser) OR paste a URL,
+         both saved natively as Custom Stations (LOCAL_INTERNET_RADIO / ORION) -->
     <section class="sb-panel" id="sb-panel-stream">
-      <div class="sb-controls" style="flex-direction:column; align-items:stretch;">
-        <input type="text" id="stream-name" placeholder="Display name (e.g. Custom Jazz)">
-        <input type="url"  id="stream-url"  placeholder="https://…/stream.mp3">
-        <input type="url"  id="stream-img"  placeholder="Logo URL (optional)">
-        <button class="primary" onclick="streamAddTile()" id="stream-add-btn">+ Add &amp; validate</button>
+      <div class="sb-controls">
+        <input type="text" id="rb-q" placeholder="Search internet radio (SWR3, jazz, BBC…)" oninput="onStreamSearchInput()">
+        <button onclick="loadStreamSearch()" title="Refresh">↻</button>
       </div>
-      <div class="sb-stream-meta" id="stream-meta"></div>
-      <div class="sb-controls" style="gap:.4em">
-        <button onclick="streamExport()" title="Download all saved streams as a JSON file (backup, or move to another browser/device)">⬇ Export</button>
-        <button onclick="streamImport()" title="Import a previously exported stream-set JSON (merges into the device store)">⬆ Import</button>
+      <div class="sb-hint"><span class="dnd-strong">↦ Drag a result onto a preset slot</span> — saved natively as <b>Custom Stations</b> (plays via the device's ORION source). Click to preview.</div>
+      <div class="sb-grid" id="rb-grid">
+        <div class="sb-empty">Type ≥3 characters to search internet radio (RadioBrowser).</div>
       </div>
-      <div class="sb-hint">Streams are stored <b>on the device</b> now — visible in every browser and kept across a USB re-flash.<br>
-        <span class="dnd-strong">↦ Drag a validated tile onto a preset slot</span> to save it there.<br>
-        Validator probes the URL (HEAD/ICY) on the proxy; bad URLs are flagged.<br>
-        <b style="color:#7a5400">HTTP URLs work best</b> — old Bose-FW (2021) can't validate Cloudflare/Let's-Encrypt certs on HTTPS streams, the speaker drops them as <code>INVALID_SOURCE</code>.</div>
-      <div class="sb-grid" id="stream-grid">
-        <div class="sb-empty">No custom streams yet. Add one above.</div>
-      </div>
+      <details class="sb-adv">
+        <summary>➕ Add a stream by URL · saved streams · import/export</summary>
+        <div class="sb-urlform">
+          <input type="text" id="stream-name" placeholder="Display name (e.g. Custom Jazz)">
+          <input type="url"  id="stream-url"  placeholder="https://…/stream.mp3">
+          <input type="url"  id="stream-img"  placeholder="Logo URL (optional)">
+          <button class="primary" onclick="streamAddTile()" id="stream-add-btn">+ Add &amp; validate</button>
+        </div>
+        <div class="sb-stream-meta" id="stream-meta"></div>
+        <div class="sb-controls" style="gap:.4em">
+          <button onclick="streamExport()" title="Download all saved streams as a JSON file (backup, or move to another browser/device)">⬇ Export</button>
+          <button onclick="streamImport()" title="Import a previously exported stream-set JSON (merges into the device store)">⬆ Import</button>
+        </div>
+        <div class="sb-hint">Saved <b>on the device</b> (kept across a USB re-flash); drag a validated tile onto a slot.
+          <b style="color:#7a5400">HTTP URLs are most reliable</b> on old Bose-FW — some HTTPS streams are dropped as <code>INVALID_SOURCE</code>.</div>
+        <div class="sb-grid sb-grid-saved" id="stream-grid">
+          <div class="sb-empty">No custom streams yet.</div>
+        </div>
+      </details>
     </section>
 
     <!-- DLNA tab — UPnP browse served same-origin by the firmware itself
@@ -1770,7 +1792,10 @@ function slotsMatch_(store, hw) {
     return store.stationId === hw.station_id && store.name === hw.name;
   }
   if (store.source === 'LOCAL_INTERNET_RADIO' && hw.source === 'LOCAL_INTERNET_RADIO') {
-    return store.streamUrl === hw.location && store.name === hw.name;
+    // HW meldet die LIR-location nach Long-Press als gebackene rohe streamUrl,
+    // frisch aus account/full (Reboot) als ORION-/station?data=-Pfad — beide synced.
+    if (store.name !== hw.name) return false;
+    return store.streamUrl === hw.location || (hw.location || '').indexOf('/station?data=') === 0;
   }
   if (store.source === 'OPAQUE') {
     // OPAQUE stores raw ContentItem of any type — match by source-name + name.
@@ -2317,13 +2342,14 @@ async function onPresetDrop(ev) {
   }
 
   if (src.kind === 'library') {
-    // Beide Quellen werden als TUNEIN-Source gespeichert — direkt LIR/
-    // LOCAL_INTERNET_RADIO funktioniert auf Bose-Speakern nicht (siehe
-    // memory reference_bose_local_internet_radio_speaker_save_broken).
     //   - Radio-Tab (libSource=TUNEIN): native stationId aus TuneIn (s12345)
-    //   - Stream-Tab (libSource=LOCAL_INTERNET_RADIO): Tunnel via stationId=
-    //     "sstrm{slot}" + streamUrl im preset. Resolver returnt preset.streamUrl
-    //     wenn Speaker /v1/playback/station/sstrm{N} fetched.
+    //   - Stream-Tab (libSource=LOCAL_INTERNET_RADIO): native Custom-Stations
+    //     über den ORION-Adapter (streamUrl im preset; der Speaker spielt es
+    //     via svc-bmx-adapter-orion). Loest den frueheren sstrm-TUNEIN-Tunnel
+    //     ab — on-device verifiziert 2026-06-03 an Emma (PLAY_STATE,
+    //     Hardware-Press, account/full-persistent). Roher Stream-URL als
+    //     location spielt NICHT; der Backend-Push verpackt streamUrl in
+    //     /station?data=… mit type="stationurl".
     let putBody;
     if (src.libSource === 'TUNEIN') {
       putBody = {
@@ -2333,11 +2359,10 @@ async function onPresetDrop(ev) {
         imageUrl: src.imageUrl || '',
       };
     } else {
-      // Stream-Tab tile (LIR) — als TUNEIN-Tunnel anlegen.
+      // Stream-Tab tile (LIR) — native LOCAL_INTERNET_RADIO (kein Tunnel mehr).
       putBody = {
-        source: 'TUNEIN',
+        source: 'LOCAL_INTERNET_RADIO',
         name: src.name,
-        stationId: `sstrm${dst.slot}`,
         streamUrl: src.streamUrl,
         imageUrl: src.imageUrl || '',
       };
@@ -2352,7 +2377,7 @@ async function onPresetDrop(ev) {
         markDirty(dst.dev);
         patchStoreSlot_(dst.dev, dst.slot, putBody);   // optimistic — instant diff
         const note = src.libSource === 'TUNEIN' ? ''
-                   : ' (stream-tunnel — HTTP-only streams work best; HTTPS streams may fail on older Bose-FW)';
+                   : ' (native Custom-Stations — HTTP streams most reliable on older Bose-FW; playlists .m3u/.pls not resolved)';
         toast(`"${src.name}" → slot ${dst.slot}${note}. Click the slot's push button to save to speaker.`);
         loadPresetsFor(dst.dev);
         kickPoll(dst.dev);
@@ -2906,7 +2931,7 @@ function renderStreamTiles() {
       <div class="lib-tile" draggable="true" data-payload="${payload}"
            ondragstart="onLibraryDragStart(event)" ondragend="onLibraryDragEnd(event)"
            onclick="onLibraryTileClick(event)"
-           title="${esc(title)} — click=browser-preview, drag=set as TUNEIN-tunnel preset (works for most HTTP streams)">
+           title="${esc(title)} — click=browser-preview, drag=set as native Custom-Stations preset (works for most HTTP streams)">
         ${s.imageUrl
           ? `<img class="tile-logo" src="${esc(s.imageUrl)}" alt="" loading="lazy"
                    onerror="this.outerHTML='<div class=&quot;tile-logo-ph&quot;>🔗</div>'">`
@@ -3333,6 +3358,75 @@ function onLibraryDragEnd(ev) {
   STATE._lastDragEndedAt = Date.now();
   document.querySelectorAll('.preset.drop-target, .preset.drop-blocked')
     .forEach(e => e.classList.remove('drop-target','drop-blocked'));
+}
+
+// ---- Stream tab: RadioBrowser search → native Custom-Stations (LOCAL_INTERNET_RADIO/ORION) ----
+// Mirrors the TuneIn search (loadLibrary/libTile) but hits the proxy's
+// /search (RadioBrowser) and emits tiles with libSource=LOCAL_INTERNET_RADIO +
+// streamUrl, so a drop becomes a native ORION preset (see onPresetDrop).
+function onStreamSearchInput() {
+  if (STATE.rbSearchTimer) clearTimeout(STATE.rbSearchTimer);
+  STATE.rbSearchTimer = setTimeout(loadStreamSearch, 700);
+}
+
+async function loadStreamSearch() {
+  const raw = (document.getElementById('rb-q') || {}).value || '';
+  const q = raw.trim().replace(/\s+/g, ' ');
+  const grid = document.getElementById('rb-grid');
+  if (!grid) return;
+  if (q.length < 3) {
+    grid.innerHTML = '<div class="sb-empty">Type ≥3 characters to search internet radio (RadioBrowser).</div>';
+    STATE.rbResults = []; STATE.rbLastQuery = ''; return;
+  }
+  if (q === STATE.rbLastQuery && (STATE.rbResults || []).length > 0) return;
+  STATE.rbLastQuery = q;
+  grid.innerHTML = '<div class="sb-empty">Loading…</div>';
+  const pathQ = `/search?q=${encodeURIComponent(q)}&limit=24`;
+  let lastErr = null;
+  for (const base of STATIONS_API_BASES) {
+    try {
+      const r = await fetch(base + pathQ, { mode: 'cors' });
+      if (!r.ok) { lastErr = new Error('HTTP ' + r.status); continue; }
+      const body = await r.json();
+      STATE.rbResults = body.results || [];
+      STATIONS_API_BASE = base;   // remember winner for logo URLs
+      renderStreamSearch();
+      return;
+    } catch (e) { lastErr = e; }
+  }
+  grid.innerHTML = `<div class="sb-empty">Station proxy not reachable.<br>
+    Last error: ${esc(lastErr ? lastErr.message : 'unknown')}</div>`;
+}
+
+function renderStreamSearch() {
+  const grid = document.getElementById('rb-grid');
+  if (!grid) return;
+  if (!(STATE.rbResults || []).length) {
+    grid.innerHTML = '<div class="sb-empty">No stations found.</div>'; return;
+  }
+  grid.innerHTML = STATE.rbResults.map(rbTile).join('');
+}
+
+function rbTile(s) {
+  const logoUrl = s.logo_url ? STATIONS_API_BASE + s.logo_url.replace(/^.*\/sixback\/stations/, '') : '';
+  const meta = [s.codec, s.bitrate ? s.bitrate + 'k' : '', s.country].filter(Boolean).join(' · ');
+  const payload = JSON.stringify({
+    libSource: 'LOCAL_INTERNET_RADIO',
+    name: s.name, streamUrl: s.stream_url,
+    imageUrl: logoUrl, uuid: 'rb-' + (s.uuid || s.stream_url),
+  }).replace(/"/g, '&quot;');
+  return `
+    <div class="lib-tile" draggable="true" data-payload="${payload}"
+         ondragstart="onLibraryDragStart(event)" ondragend="onLibraryDragEnd(event)"
+         onclick="onLibraryTileClick(event)"
+         title="${esc(s.name)} — ${esc(meta)} — click to preview, drag to set as Custom Stations (ORION)">
+      ${logoUrl
+        ? `<img class="tile-logo" src="${esc(logoUrl)}" alt="" loading="lazy"
+                 onerror="this.outerHTML='<div class=&quot;tile-logo-ph&quot;>📡</div>'">`
+        : `<div class="tile-logo-ph">📡</div>`}
+      <div class="tile-name">${esc(s.name)}</div>
+      <div class="tile-meta">${esc(meta)}</div>
+    </div>`;
 }
 
 // ============== DLNA tab — UPnP browse via Pi5 proxy ===========================

@@ -2,6 +2,9 @@
 #include "preset_store.h"
 #include "nvs_helper.h"
 #include "speaker_inventory.h"
+#include <ArduinoJson.h>
+#include "mbedtls/base64.h"
+#include <vector>
 
 namespace sixback {
 
@@ -305,6 +308,47 @@ bool PresetStore::hasAnyFor(const String& deviceId) {
     return false;
 }
 
+String escapeXml(const String& in) { return xmlEscape_(in); }
+
+String unescapeXml(const String& in) {
+    String out = in;
+    out.replace("&lt;", "<");
+    out.replace("&gt;", ">");
+    out.replace("&quot;", "\"");
+    out.replace("&apos;", "'");
+    out.replace("&amp;", "&");   // zuletzt: sonst wird z.B. "&amp;lt;" doppelt dekodiert
+    return out;
+}
+
+String orionStationLocation(const String& streamUrl, const String& name,
+                            const String& imageUrl) {
+    // Envelope-Form wie der echte svc-bmx-adapter-orion / gmuth station.php.
+    JsonDocument d;
+    d["streamUrl"]  = streamUrl;
+    d["name"]       = name;
+    d["imageUrl"]   = imageUrl;
+    d["streamType"] = "liveRadio";
+    d["isRealtime"] = true;
+    String json;
+    serializeJson(d, json);
+
+    size_t need = 0;
+    mbedtls_base64_encode(nullptr, 0, &need,
+        (const unsigned char*)json.c_str(), json.length());
+    std::vector<unsigned char> buf(need + 1, 0);
+    size_t olen = 0;
+    if (mbedtls_base64_encode(buf.data(), buf.size(), &olen,
+            (const unsigned char*)json.c_str(), json.length()) != 0) {
+        return String();   // Puffer zu klein — kann mit need+1 nicht passieren
+    }
+    String b64((const char*)buf.data());   // mbedtls null-terminiert
+    // url-safe: '+' und '/' tauschen; '='-Padding bleibt (im Query gueltig,
+    // handleOrionStation tauscht '-_'->'+/' zurueck, Padding intakt).
+    b64.replace('+', '-');
+    b64.replace('/', '_');
+    return String("/station?data=") + b64;
+}
+
 String PresetStore::toBoseXml(const String& deviceId) {
     LockGuard g(*this);
     // Format aus Pre-Migration-Snapshot der Bose Cloud:
@@ -334,19 +378,22 @@ String PresetStore::toBoseXml(const String& deviceId) {
             out += String(p.slot);
             out += "\"><ContentItem source=\"";
             out += presetSourceToStr(p.source);  // enum-Konst — safe ohne Escape
-            // type-Attribute haengt von der Source ab — siehe
-            // reference_bose_contentitem_type_per_source: TUNEIN braucht
-            // "stationurl", LOCAL_INTERNET_RADIO braucht "url". Falscher type
-            // -> Speaker akzeptiert das Preset zwar, weigert sich aber bei
-            // /select intern (kein Audio) und u.U. bei Hardware-Press.
+            // type="stationurl" fuer BEIDE adapter-aufgeloesten Quellen:
+            // TUNEIN (location /v1/playback/station/<sid>) und
+            // LOCAL_INTERNET_RADIO (location /station?data=… via ORION-Adapter).
+            // LIR mit type="url"+roher Stream-URL spielt der Speaker NICHT;
+            // mit stationurl+ORION-location schon (on-device 2026-06-03, Emma).
             out += "\" type=\"";
-            out += (p.source == PresetSource::TUNEIN) ? "stationurl" : "url";
+            out += "stationurl";
             out += "\" location=\"";
             if (p.source == PresetSource::TUNEIN) {
                 out += "/v1/playback/station/";
                 out += xmlEscape_(p.stationId);
             } else {
-                out += xmlEscape_(p.streamUrl);
+                // LOCAL_INTERNET_RADIO ueber den nativen ORION-Adapter statt
+                // roher Stream-URL (die spielt der Speaker nicht). base64 ist
+                // url-safe -> kein XML-Escape noetig.
+                out += orionStationLocation(p.streamUrl, p.name, p.imageUrl);
             }
             // sourceAccount muss zum /sources-Eintrag am Speaker passen. Bei
             // TUNEIN ist das "TuneIn" (so kommt es auch im Bose-Werks-Cloud-

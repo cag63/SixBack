@@ -773,7 +773,9 @@ String xmlExtractTag(const String& xml, int start, int end, const String& tag) {
     a += open.length();
     int b = xml.indexOf(close, a);
     if (b < 0 || b > end) return "";
-    return xml.substring(a, b);
+    // Tag-Text-Content ist XML-escaped (itemName/containerArt) -> zurueck zur
+    // logischen Form dekodieren, sonst "&amp;" in Store/UI/Diff.
+    return sixback::unescapeXml(xml.substring(a, b));
 }
 
 // -----------------------------------------------------------------------------
@@ -1112,16 +1114,15 @@ static void doPush_(const PushPresetJob_& job) {
         // dieser Speaker (Emma SoundTouch 10 FW 27.0.3). Empty fuer beide
         // Source-Typen scheint zuverlaessig zu funktionieren.
         const char* srcAcct = "";
-        // Per-source `type` attribute. Verified empirically against Emma
-        // (ST10, FW 27.0.3) on 2026-05-23:
-        //   TUNEIN  + type="stationurl" -> plays + slot saves correctly
-        //   LOCAL_INTERNET_RADIO + type="stationurl" -> /select 200 but
-        //       speaker dumps the ContentItem (now_playing returns empty
-        //       with art SHOW_DEFAULT_IMAGE, no audio)
-        //   LOCAL_INTERNET_RADIO + type="url" -> ContentItem echoes back,
-        //       speaker starts streaming the URL.
-        const char* ciType =
-            (job.p.source == sixback::PresetSource::TUNEIN) ? "stationurl" : "url";
+        // type="stationurl" fuer BEIDE adapter-aufgeloesten Quellen:
+        //   TUNEIN               -> location /v1/playback/station/<sid> (tunein-Adapter)
+        //   LOCAL_INTERNET_RADIO -> location /station?data=…            (ORION-Adapter)
+        // Frueher nutzte LIR type="url" mit roher Stream-URL — der Speaker
+        // echo't das nur, spielt aber nicht. Mit der ORION-location MUSS es
+        // "stationurl" sein, sonst interpretiert der Speaker /station?data= als
+        // Direkt-URL und bleibt STANDBY (on-device verifiziert 2026-06-03 an Emma:
+        // type="url" -> STANDBY, type="stationurl" -> PLAY_STATE).
+        const char* ciType = "stationurl";
         String ci = "<ContentItem source=\"";
         ci += sixback::presetSourceToStr(job.p.source);
         ci += "\" type=\""; ci += ciType;
@@ -1129,10 +1130,14 @@ static void doPush_(const PushPresetJob_& job) {
         if (job.p.source == sixback::PresetSource::TUNEIN) {
             ci += "/v1/playback/station/" + job.p.stationId;
         } else {
-            ci += job.p.streamUrl;
+            // LOCAL_INTERNET_RADIO: native ORION-Adapter-location statt roher
+            // Stream-URL. Letztere wird vom Speaker nur ge-echo't, aber nicht
+            // gespielt (kein <playStatus>); der ORION-Pfad spielt nativ
+            // (handleOrionStation, empirisch v0.8.11 auf Emma).
+            ci += sixback::orionStationLocation(job.p.streamUrl, job.p.name, job.p.imageUrl);
         }
         ci += "\" sourceAccount=\""; ci += srcAcct;
-        ci += "\" isPresetable=\"true\"><itemName>" + job.p.name + "</itemName></ContentItem>";
+        ci += "\" isPresetable=\"true\"><itemName>" + sixback::escapeXml(job.p.name) + "</itemName></ContentItem>";
         http.addHeader("Content-Type", "text/xml");
         selectCode = http.POST(ci);
         http.end();
@@ -1610,6 +1615,7 @@ void handlePlaySource(AsyncWebServerRequest* req, JsonDocument& body) {
     String name      = (const char*)(body["name"]      | "");
     String stationId = (const char*)(body["stationId"] | "");
     String streamUrl = (const char*)(body["streamUrl"] | "");
+    String imageUrl  = (const char*)(body["imageUrl"]  | "");
     if (src == sixback::PresetSource::TUNEIN && stationId.length() == 0) {
         req->send(400, "application/json", "{\"error\":\"stationId required for TUNEIN\"}"); return;
     }
@@ -1621,10 +1627,9 @@ void handlePlaySource(AsyncWebServerRequest* req, JsonDocument& body) {
     String url = "http://" + spIp + ":" + String(BOSE_BMX_PORT) + "/select";
     int code = -1;
     if (http.begin(url)) {
-        // Match doPush_ exactly: per-source `type` attribute. See doPush_
-        // comment block — TUNEIN uses "stationurl", LOCAL_INTERNET_RADIO
-        // uses "url" (the latter verified 2026-05-23 against Emma).
-        const char* ciType = (src == sixback::PresetSource::TUNEIN) ? "stationurl" : "url";
+        // Match doPush_ exactly: beide adapter-aufgeloesten Quellen nutzen
+        // "stationurl" (TUNEIN ueber tunein-Adapter, LIR ueber ORION-Adapter).
+        const char* ciType = "stationurl";
         String ci = "<ContentItem source=\"";
         ci += sixback::presetSourceToStr(src);
         ci += "\" type=\""; ci += ciType;
@@ -1632,9 +1637,10 @@ void handlePlaySource(AsyncWebServerRequest* req, JsonDocument& body) {
         if (src == sixback::PresetSource::TUNEIN) {
             ci += "/v1/playback/station/" + stationId;
         } else {
-            ci += streamUrl;
+            // LOCAL_INTERNET_RADIO via native ORION-Adapter (siehe doPush_).
+            ci += sixback::orionStationLocation(streamUrl, name, imageUrl);
         }
-        ci += "\" sourceAccount=\"\" isPresetable=\"true\"><itemName>" + name + "</itemName></ContentItem>";
+        ci += "\" sourceAccount=\"\" isPresetable=\"true\"><itemName>" + sixback::escapeXml(name) + "</itemName></ContentItem>";
         http.addHeader("Content-Type", "text/xml");
         code = http.POST(ci);
         http.end();
@@ -1797,8 +1803,8 @@ void handleNowPlayingLive(AsyncWebServerRequest* req) {
     String src      = extractAttr("ContentItem", "source");
     String srcAcct  = extractAttr("ContentItem", "sourceAccount");
     String location = extractAttr("ContentItem", "location");
-    String itemName = extractTag("itemName");
-    String trackName = extractTag("track");
+    String itemName = sixback::unescapeXml(extractTag("itemName"));
+    String trackName = sixback::unescapeXml(extractTag("track"));
     String playStatus = extractTag("playStatus");
     String art = extractTag("art");
 
@@ -1867,7 +1873,7 @@ static void recordDlnaWorker_(void* arg) {
             ci += "\" isPresetable=\"true\" type=\"";
             ci += job->itemType.length() ? job->itemType : String("dir");
             ci += "\"><itemName>";
-            ci += job->itemName;
+            ci += sixback::escapeXml(job->itemName);
             ci += "</itemName></ContentItem>";
             http.addHeader("Content-Type", "text/xml");
             selectCode = http.POST(ci);
@@ -2137,7 +2143,7 @@ static bool fetchHardwarePresets_(const String& spIp, HwSlotInfo_ out[6]) {
         int nm = block.indexOf("<itemName>");
         if (nm >= 0) {
             int ne = block.indexOf("</itemName>", nm);
-            if (ne > nm) out[slot-1].name = block.substring(nm + 10, ne);
+            if (ne > nm) out[slot-1].name = sixback::unescapeXml(block.substring(nm + 10, ne));
         }
     }
     return true;
@@ -2234,7 +2240,16 @@ void handleBulkPushPresets(AsyncWebServerRequest* req) {
                 if (h.location == wantLoc && h.name == p.name) already = true;
             } else if (p.source == sixback::PresetSource::LOCAL_INTERNET_RADIO
                        && h.source == "LOCAL_INTERNET_RADIO") {
-                if (h.location == p.streamUrl && h.name == p.name) already = true;
+                // Der Speaker meldet die LIR-location in /presets je nach Zustand
+                // verschieden: nach dem Long-Press-Save als ge-"backene" rohe
+                // streamUrl (der Speaker loest den ORION-Adapter auf und merkt
+                // sich die resolved URL), frisch aus account/full (Reboot) als
+                // ORION-Adapter-Pfad /station?data=…. BEIDE gelten als synced,
+                // sonst wuerde push-all den Slot bei jedem Lauf neu pushen.
+                // (on-device 2026-06-03 an Emma: /presets -> rohe streamUrl.)
+                String orionLoc = sixback::orionStationLocation(p.streamUrl, p.name, p.imageUrl);
+                if ((h.location == p.streamUrl || h.location == orionLoc)
+                    && h.name == p.name) already = true;
             }
             if (already) { synced++; continue; }
         }

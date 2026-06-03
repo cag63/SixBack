@@ -83,6 +83,44 @@ def _atomic_write_bytes(path, data):
         pass
 
 
+def _read_text_source_nfs(path, markers=(b"<html", b"</html>"), retries=6):
+    """NFS-safe Read einer Text-Quelldatei (z.B. web-src/index.html).
+    Ein einzelner Read ueber NFS kann einen NUL-praefixierten ersten 4-KB-Block
+    liefern (lazy write-back race): die Laenge stimmt, der Inhalt ist Muell.
+    Validiere den INHALT (keine NUL-Bytes + erwartete Marker, nicht nur Laenge)
+    und lies bei Korruption neu — mit Page-Cache-Invalidierung (posix_fadvise
+    DONTNEED), damit der Retry frisch vom NFS-Server holt statt den kaputten
+    Cache erneut zu sehen. Sonst gzippt der Build stillschweigend eine kaputte
+    UI (Vorfall 2026-06-03: web-src/index.html mit 4096 NUL-Bytes am Anfang ->
+    servierte Seite ohne <head>/<title>). Der gz-Write-Validate weiter unten
+    merkt das NICHT, weil er gegen 'raw' prueft und 'raw' selbst schon korrupt
+    ist — deshalb muss die Quelle hier validiert werden."""
+    last = b""
+    for attempt in range(retries):
+        with open(path, "rb") as fi:
+            raw = fi.read()
+        if raw and b"\x00" not in raw and all(m in raw.lower() for m in markers):
+            return raw
+        last = raw
+        print(f"[nfs-read] {os.path.basename(path)} sieht korrupt aus "
+              f"(Versuch {attempt+1}/{retries}: len={len(raw)}, "
+              f"NUL={raw.count(bytes(1))}) -> Page-Cache verwerfen + re-read")
+        try:
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            finally:
+                os.close(fd)
+        except (AttributeError, OSError):
+            pass
+        time.sleep(0.4)
+    raise RuntimeError(
+        f"[nfs-read] {path} blieb nach {retries} Reads korrupt "
+        f"(NUL={last.count(bytes(1))} Bytes, len={len(last)}) — NFS-write-back-race "
+        f"oder Quelle persistent kaputt. Build abgebrochen, statt eine kaputte UI "
+        f"zu gzippen/flashen. Quelle pruefen / aus git wiederherstellen.")
+
+
 def _write_build(n):
     _atomic_write(BUILD_FILE, f"{n}\n")
 
@@ -242,8 +280,10 @@ def main():
         src_mtime = os.path.getmtime(src_html)
         if (not os.path.isfile(gz_html) or
             os.path.getmtime(gz_html) < src_mtime):
-            with open(src_html, "rb") as fi:
-                raw = fi.read()
+            # NFS-safe Source-Read: validiert Inhalt + re-liest bei NUL-Korruption
+            # (sonst gzippt der Build still eine kaputte web-src/index.html, deren
+            # gz-Validate gegen das schon-korrupte 'raw' faelschlich besteht).
+            raw = _read_text_source_nfs(src_html)
             # NFS-safe: build the gzip fully in memory, write atomically with
             # fsync, then read back + validate. A plain _gzip.open() write to the
             # NFS-backed data/ dir got flushed lazily, so mklittlefs occasionally

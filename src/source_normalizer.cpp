@@ -92,6 +92,20 @@ NormalizeResult normalizePreset(const String& sourceStr,
         return r;
     }
     if (sourceStr == "LOCAL_INTERNET_RADIO" || sourceStr == "INTERNET_RADIO") {
+        // Ist die location bereits eine ORION-Adapter-Form (von SixBack selbst
+        // oder Bose-App/gmuth gepusht)? Dann laesst sich der echte streamUrl
+        // nicht verlustfrei rueckgewinnen -> 1:1 als OPAQUE durchreichen (der
+        // Caller kopiert das rohe <ContentItem>, toBoseXml bettet es wieder
+        // ein). Eine plain Stream-URL bleibt nativer LIR-Eintrag, den der Push
+        // ueber orionStationLocation() neu verpackt.
+        if (location.startsWith("/station?data=") ||
+            location.indexOf("svc-bmx-adapter-orion") >= 0) {
+            out.source           = PresetSource::OPAQUE;
+            out.opaqueSourceName = sourceStr;
+            r.status             = NormalizeStatus::OK_OPAQUE;
+            r.reason             = "ORION location → opaque passthrough";
+            return r;
+        }
         out.source    = PresetSource::LOCAL_INTERNET_RADIO;
         out.streamUrl = location;
         r.status      = NormalizeStatus::OK_PASSTHROUGH;

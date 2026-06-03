@@ -132,6 +132,31 @@ private:
 const char* presetSourceToStr(PresetSource s);
 PresetSource presetSourceFromStr(const String& s);
 
+// Baut die ContentItem-location fuer einen Custom-Stream-Preset
+// (LOCAL_INTERNET_RADIO) ueber den nativen Bose-ORION-Adapter:
+//   "/station?data=<urlsafe-base64-json>"  mit JSON
+//   {streamUrl,name,imageUrl,streamType:"liveRadio",isRealtime:true}.
+// Der Speaker loest das baseUrl-relativ ueber svc-bmx-adapter-orion auf
+// (-> handleOrionStation, bmx_services.json LIR/provider 11). Roh-Stream-URL
+// als location spielt der Speaker NICHT (siehe
+// reference_bose_local_internet_radio_speaker_save_broken); der ORION-Pfad
+// schon (empirisch v0.8.11, Emma). Deterministisch -> push/diff bleiben stabil.
+String orionStationLocation(const String& streamUrl, const String& name,
+                            const String& imageUrl);
+
+// XML-escapt Text fuer ContentItem-Attribute / <itemName> (& < > " '). Public,
+// damit der direkte /select-Push (api_endpoints.cpp) denselben Escaper nutzt
+// wie toBoseXml — sonst verstuemmelt ein '&' im Namen das ContentItem-XML und
+// der Speaker droppt es ("Radio Bella & Monella" -> "Radio Bella  Monella").
+String escapeXml(const String& in);
+
+// Inverse von escapeXml: dekodiert XML-Entities (&amp; &lt; &gt; &quot; &apos;)
+// im aus Speaker-XML extrahierten Text-Content zurueck zur logischen Form.
+// Pflicht beim PARSEN — sonst landet "&amp;" in Store/UI und der Diff vergleicht
+// den logischen Store-Namen ("&") gegen den HW-Namen ("&amp;") -> Mismatch ->
+// Endlos-Re-Push. Symmetrisch zu escapeXml/toBoseXml.
+String unescapeXml(const String& in);
+
 } // namespace sixback
 
 #endif
