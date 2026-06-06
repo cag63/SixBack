@@ -180,33 +180,47 @@ bool waitForSpeakerBack_(const String& ip, uint32_t timeoutMs) {
     return false;
 }
 
-// Peer detection — wenn ein Speaker bereits auf einen anderen SixBack im LAN
-// pollt, sollen wir ihn NICHT zurueckclaimen (verhindert Ping-Pong wenn zwei
-// Sticks beide Auto-Mode aktiv haben). Probe: GET cloudUrl + "/" mit kurzem
-// Timeout — die SixBack-Cloud-Mock liefert auf / ein HTML mit dem Marker
-// "SixBack Cloud-Mock". Falls die URL ein anderer Custom-Cloud-Server ist
-// (Pi5-Mock z.B.), antwortet er nicht mit diesem Marker → nicht-peer →
-// regulaere Eligibility.
+// Peer detection: isPeerSixBackCloud() lebt seit dem (b)-Disown-Umbau
+// (2026-06-06) in speaker_inventory.{h,cpp} — refreshMigrationStatus
+// braucht denselben Probe fuer sein Auto-Release. Semantik unveraendert:
+// wenn ein Speaker bereits auf einen anderen LEBENDEN SixBack im LAN
+// pollt, sollen wir ihn NICHT zurueckclaimen (verhindert Ping-Pong wenn
+// zwei Sticks beide Auto-Mode aktiv haben).
 //
 // User kann ueber den Manual-Migrate-Endpoint (/api/speaker/<id>/migrate)
 // einen Peer-Speaker weiter explizit uebernehmen, das ist ein bewusster
 // User-Klick und respektiert die Auto-Mode-Skip-Logik nicht.
-bool isPeerSixBackCloud_(const String& url) {
-    if (url.length() == 0 || !url.startsWith("http://")) return false;
-    HTTPClient http;
-    http.setConnectTimeout(1500);
-    http.setTimeout(1500);
-    if (!http.begin(url + "/")) return false;
-    int code = http.GET();
-    String body = (code == 200) ? http.getString() : String("");
-    http.end();
-    return (code == 200) && (body.indexOf("SixBack") >= 0);
-}
 
 bool isEligible_(const Speaker& s, const String& myBase) {
-    if (s.ownedByUs) return false;
-    if (s.cloudUrl == myBase) return false;
     if (s.ip.length() == 0) return false;
+    if (s.cloudUrl == myBase) return false;   // zeigt schon auf uns
+    // Defensive: cloudUrl noch leer nach JIT-Resolve im Tick-Pre-Step =
+    // Telnet:17000 unreachable. Migration scheitert spaeter an der
+    // configure-Phase ohnehin — skip statt try-and-fail (vermeidet
+    // "preset import failed"-Spam wenn Speaker am Boot grade settled).
+    // Eliminiert die Race wo isPeerSixBackCloud wegen leerem cloudUrl
+    // gar nicht gefragt wird → false-positive "eligible".
+    if (s.cloudUrl.length() == 0) {
+        if (!s.ownedByUs)   // owned+offline: kein Urteil, kein Log-Spam pro Tick
+            Serial.printf("[auto] skip %s (%s): cloudUrl unknown (telnet probe failed)\n",
+                          s.name.c_str(), s.ip.c_str());
+        return false;
+    }
+    if (s.ownedByUs) {
+        // Re-Claim-Pfad ((b)-Semantik 2026-06-06): owned, aber cloudUrl
+        // zeigt auf eine fremde Base. refreshMigrationStatus disownt nur
+        // bei VERIFIZIERTEM fremden Owner — steht der Speaker hier noch
+        // owned, haengt er mutmasslich auf einer Leiche (unsere alte IP
+        // nach DHCP-Wechsel, oder ein entsorgter Zweit-Stick). Den holen
+        // wir zurueck. KEINE Modell-/FW-Whitelist: der Speaker wurde
+        // nachweislich schon einmal erfolgreich migriert — staerkerer
+        // Beleg als jede Whitelist (deckt manuell migrierte Modelle ab).
+        if (s.cloudUrl.indexOf("bose.com") >= 0) return false;  // Revert = User-Wille
+        if (isPeerSixBackCloud(s.cloudUrl)) return false;       // lebender Peer
+        Serial.printf("[auto] re-claim %s (%s): owned but parked on dead cloud %s\n",
+                      s.name.c_str(), s.ip.c_str(), s.cloudUrl.c_str());
+        return true;
+    }
     // Modell-Whitelist — auto-mode nur fuer Geraete-Familie, an der wir
     // den Telnet-Pfad empirisch verifiziert haben.
     bool modelOk = s.model.indexOf("SoundTouch 10") >= 0
@@ -220,20 +234,9 @@ bool isEligible_(const Speaker& s, const String& myBase) {
     bool fwOk = s.firmware.indexOf("27.0.6.") >= 0
              || s.firmware.indexOf("27.0.3.") >= 0;
     if (!fwOk) return false;
-    // Defensive: cloudUrl noch leer nach JIT-Resolve im Tick-Pre-Step =
-    // Telnet:17000 unreachable. Migration scheitert spaeter an der
-    // configure-Phase ohnehin — skip statt try-and-fail (vermeidet
-    // "preset import failed"-Spam wenn Speaker am Boot grade settled).
-    // Eliminiert die Race wo isPeerSixBackCloud_ wegen leerem cloudUrl
-    // gar nicht gefragt wird → false-positive "eligible".
-    if (s.cloudUrl.length() == 0) {
-        Serial.printf("[auto] skip %s (%s): cloudUrl unknown (telnet probe failed)\n",
-                      s.name.c_str(), s.ip.c_str());
-        return false;
-    }
     // Peer-aware (v0.7.5): wenn cloudUrl auf einen anderen SixBack-Stick
     // im LAN zeigt, nicht zurueckclaimen.
-    if (s.cloudUrl != myBase && isPeerSixBackCloud_(s.cloudUrl)) {
+    if (s.cloudUrl != myBase && isPeerSixBackCloud(s.cloudUrl)) {
         Serial.printf("[auto] skip %s (%s): peer SixBack at %s already owns it\n",
                       s.name.c_str(), s.ip.c_str(), s.cloudUrl.c_str());
         return false;
@@ -446,7 +449,7 @@ bool runMigrationPass_(const AutoModeConfig& cfg, bool deep) {
     String base = myBase_();
     // Fix peer-aware Race (2026-05-26): wenn discoverSync's Telnet-Probe
     // einen Speaker nicht erreicht hat (cloudUrl leer), JIT nachholen.
-    // Sonst greift die isPeerSixBackCloud_-Skip-Logik nicht und ein frisch
+    // Sonst greift die isPeerSixBackCloud-Skip-Logik nicht und ein frisch
     // gebooteter SixBack wuerde einen Speaker migrieren der schon einem
     // anderen SixBack-Stick im LAN gehoert. Symptom: erster Boot-Tick
     // meldet speakers_eligible=N obwohl alle N auf Peer-Cloud zeigen.

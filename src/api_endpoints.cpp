@@ -27,6 +27,7 @@
 #include "source_normalizer.h"
 #include "bose_endpoints.h"
 #include "event_store.h"
+#include "ip_failsafe.h"
 #include "nvs_helper.h"
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -2704,9 +2705,13 @@ void handleRoot(AsyncWebServerRequest* req) {
 //   naechsten Boot `ipFailsafeCheck()` einen IP-Wechsel erkennt und alle
 //   owned-Speaker per Telnet re-migriert. Reine Test-Hilfe, kein Cleanup
 //   noetig — der Failsafe persistiert beim Lauf die aktuelle IP wieder.
+//   Mit `trigger_now: true` wird zusaetzlich der Runtime-Recheck gearmt —
+//   ipFailsafeTick() laeuft dann SOFORT (ohne Reboot), gleicher Pfad wie
+//   ein GOT_IP-Event mit neuer IP.
 // -----------------------------------------------------------------------------
 void handleTestForceIpChange(AsyncWebServerRequest* req, JsonDocument& body) {
-    String fakeIp = (const char*)(body["fake_ip"] | "10.10.99.99");
+    String fakeIp     = (const char*)(body["fake_ip"] | "10.10.99.99");
+    bool   triggerNow = body["trigger_now"] | false;
     Preferences p;
     if (!p.begin("sixback-net", false)) {
         req->send(500, "application/json", "{\"error\":\"nvs open failed\"}"); return;
@@ -2714,12 +2719,15 @@ void handleTestForceIpChange(AsyncWebServerRequest* req, JsonDocument& body) {
     String oldStored = p.getString("last_ip", "");
     p.putString("last_ip", fakeIp);
     p.end();
+    if (triggerNow) sixback::ipFailsafeArmRecheck();
     JsonDocument doc;
     doc["ok"]                = true;
     doc["nvs_last_ip_was"]   = oldStored;
     doc["nvs_last_ip_now"]   = fakeIp;
     doc["esp_actual_ip"]     = WiFi.localIP().toString();
-    doc["next"]              = "POST /api/reboot to trigger ip_failsafe";
+    doc["next"]              = triggerNow
+        ? "armed — ipFailsafeTick() runs within ~1s, watch serial log"
+        : "POST /api/reboot to trigger ip_failsafe";
     String b; serializeJson(doc, b);
     req->send(200, "application/json", b);
 }

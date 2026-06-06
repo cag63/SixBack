@@ -561,6 +561,24 @@ static bool margeSetAccount_(const String& ip, const String& accountId) {
     return code == 200;
 }
 
+// Peer detection — probt ob unter `url` ein LEBENDER SixBack antwortet.
+// GET url + "/" mit kurzem Timeout; die SixBack-Cloud-Mock liefert auf /
+// ein HTML mit dem Marker "SixBack". Ein anderer Custom-Cloud-Server
+// (Pi5-Mock z.B.) oder eine tote URL liefern den Marker nicht.
+// Genutzt von auto_mode (peer-aware-Skip + Re-Claim) und vom (b)-Disown
+// in refreshMigrationStatus (s.u.). Frueher anon in auto_mode.cpp.
+bool isPeerSixBackCloud(const String& url) {
+    if (url.length() == 0 || !url.startsWith("http://")) return false;
+    HTTPClient http;
+    http.setConnectTimeout(1500);
+    http.setTimeout(1500);
+    if (!http.begin(url + "/")) return false;
+    int code = http.GET();
+    String body = (code == 200) ? http.getString() : String("");
+    http.end();
+    return (code == 200) && (body.indexOf("SixBack") >= 0);
+}
+
 void SpeakerInventory::refreshMigrationStatus() {
     // Snapshot unter Lock, dann Telnet-Calls OHNE Lock — sonst blockt jeder
     // Reader (AsyncTCP-Handler, Bose-Cloud-Mock) fuer 3-5 s pro Speaker.
@@ -634,8 +652,29 @@ void SpeakerInventory::refreshMigrationStatus() {
             work[i].status = detectStatus(work[i].ip, myBase, &work[i].cloudUrl);
         }
     }
+    // (b)-Disown-Semantik (2026-06-06, Discussion #19): ein Auto-Release
+    // braucht einen VERIFIZIERTEN fremden Owner — lebender SixBack-Peer
+    // (Marker-Probe) oder bewusster Bose-Revert. Eine TOTE fremde cloudUrl
+    // ist ambig: unsere eigene alte IP nach DHCP-Wechsel ODER ein
+    // entsorgter Zweit-Stick. In beiden Faellen behalten wir owned, damit
+    // ip_failsafe (IP-Wechsel) bzw. auto_mode-Re-Claim den Speaker wieder
+    // auf uns ziehen koennen, statt ihn dauerhaft zu verwaisen.
+    // HTTP-Probe hier VOR dem Lock (1,5 s Timeout pro toter URL — darf
+    // nicht unter dem Inventory-Lock laufen, gleiches Argument wie oben).
+    std::vector<bool> foreignOwnerVerified(work.size(), false);
+    for (size_t i = 0; i < work.size(); ++i) {
+        const auto& s = work[i];
+        if (!s.ownedByUs) continue;
+        if (s.cloudUrl.length() == 0 || s.cloudUrl == myBase) continue;
+        if (s.cloudUrl.indexOf("bose.com") >= 0) {       // Revert = User-Wille
+            foreignOwnerVerified[i] = true;
+            continue;
+        }
+        foreignOwnerVerified[i] = isPeerSixBackCloud(s.cloudUrl);
+    }
     LockGuard g(*this);
-    for (auto& upd : work) {
+    for (size_t i = 0; i < work.size(); ++i) {
+        auto& upd = work[i];
         // Re-find: deviceId kann sich nicht aendern, slot nach reload aber schon.
         Speaker* live = nullptr;
         for (auto& s : speakers_) {
@@ -657,15 +696,21 @@ void SpeakerInventory::refreshMigrationStatus() {
             live->ownedByUs = true;
             continue;
         }
-        // Auto-Release: zeigt auf eine ANDERE Cloud (anderes ESP oder
-        // streaming.bose.com nach Revert) — wir sind nicht mehr zustaendig.
-        // Verhindert dass ip_failsafe ihn beim naechsten IP-Wechsel
-        // zurueck-claimt und dass das UI ihn faelschlich als unsere
-        // Verantwortung zeigt. cloudUrl leer = Speaker offline -> kein Change.
+        // Auto-Release NUR bei verifiziertem fremden Owner (s.o.) — dann
+        // sind wir wirklich nicht mehr zustaendig und ip_failsafe darf ihn
+        // beim naechsten IP-Wechsel nicht zurueck-claimen.
         if (live->ownedByUs && live->cloudUrl.length() > 0 && live->cloudUrl != myBase) {
-            Serial.printf("[inv] auto-release %s (cloudUrl=%s != our base %s)\n",
-                          live->name.c_str(), live->cloudUrl.c_str(), myBase.c_str());
-            live->ownedByUs = false;
+            if (foreignOwnerVerified[i]) {
+                Serial.printf("[inv] auto-release %s (cloudUrl=%s != our base %s; "
+                              "owner verified)\n",
+                              live->name.c_str(), live->cloudUrl.c_str(), myBase.c_str());
+                live->ownedByUs = false;
+            } else {
+                Serial.printf("[inv] keep %s owned: cloudUrl=%s is dead/non-SixBack "
+                              "(stale own base after IP change, or retired peer) — "
+                              "failsafe/auto-mode will re-point it\n",
+                              live->name.c_str(), live->cloudUrl.c_str());
+            }
         }
     }
     saveToNVS();

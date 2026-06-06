@@ -200,6 +200,14 @@ private:
 
 const char* migrationStatusToStr(MigrationStatus s);
 
+// Probt ob unter `url` ein LEBENDER SixBack-Stick antwortet (GET / mit
+// kurzem Timeout; die Cloud-Mock-Startseite traegt den Marker "SixBack").
+// Basis der peer-aware-Skip-Logik in auto_mode UND der Disown-Semantik in
+// refreshMigrationStatus: nur ein VERIFIZIERTER fremder Owner (lebender
+// Peer / Bose-Revert) rechtfertigt ein Auto-Release — eine tote URL ist
+// ambig (eigene alte IP nach DHCP-Wechsel oder entsorgter Zweit-Stick).
+bool isPeerSixBackCloud(const String& url);
+
 } // namespace sixback
 
 #endif

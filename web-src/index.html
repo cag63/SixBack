@@ -320,8 +320,14 @@
   .sb-tab:hover { background: #e6dfca; }
   .sb-tab.active { background: #faf8ef; color: var(--accent); border-bottom: 2px solid var(--accent);
                    margin-bottom: -1px; }
-  .sb-body { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
-  .sb-panel { display: none; flex: 1; overflow: hidden; flex-direction: column; padding: .7em; gap: .55em; }
+  .sb-body { flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
+  /* Panel scrolls vertically when its content outgrows a short viewport — e.g. the
+     Stream tab with the "add a stream by URL" form open, or the long Spotify connect
+     block. Without this the rail was clipped (overflow:hidden) with no scroll, so the
+     footer buttons (+ Add & validate / Export·Import / Spotify connect) were unreachable
+     on laptops. min-height:0 lets the flex panel shrink below its content so overflow-y
+     can engage; overflow-x stays hidden to avoid a stray horizontal bar. (Discussions #15) */
+  .sb-panel { display: none; flex: 1; min-height: 0; overflow: hidden auto; flex-direction: column; padding: .7em; gap: .55em; }
   .sb-panel.active { display: flex; }
   .sb-controls { display: flex; gap: .35em; flex-wrap: wrap; align-items: center; }
   .sb-controls input[type=text], .sb-controls input[type=url] {

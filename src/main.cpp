@@ -140,6 +140,9 @@ void setup() {
     registerBoseEndpoints(boseServer);
     registerApiEndpoints(uiServer);
 
+    sixback::ipFailsafeInit();    // GOT_IP-Listener: Runtime-IP-Wechsel armt
+                                  // den Recheck (VOR connectWifi, damit auch
+                                  // ein spaeter Improv-Connect gefangen wird)
     connectWifi();
     startMDNS();
     initInventory();
@@ -160,6 +163,7 @@ void setup() {
 void loop() {
     sixback::wifiProvisioningTick();
     sixback::healthTick();         // Task-WDT-feed, WiFi/Heap-Watchdog, Self-Ping
+    sixback::ipFailsafeTick();     // gearmter Recheck (GOT_IP / Retry) als One-Shot-Task
     sixback::spotify::refreshTick(); // proaktiver Access-Token-Refresh, 60s-Rate-Limit intern
     static uint32_t lastBeat = 0;
     if (millis() - lastBeat > 30000) {

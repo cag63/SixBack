@@ -17,7 +17,7 @@ No subscription, no account, no Bose servers.  One USB stick on your LAN.
 > functionality is preserved; the rename reflects the project's identity
 > independent of any Bose trademark.
 
-## Status (v0.8.8)
+## Status (v0.8.13)
 
 | Component                                                            | State                                                                                                              |
 | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
@@ -43,10 +43,10 @@ No subscription, no account, no Bose servers.  One USB stick on your LAN.
 | **Stereo-Pair / Multi-Room group API**                               | working — POST/PUT/DELETE on `/streaming/account/{a}/group/`, NVS-persistent                                       |
 | **Device-direct multiroom** (ZoneManager, v0.8.7)                    | working — group speakers straight through the speaker's own `/setZone` / `/getZone` on port 8090 (master + slaves); stateless, live truth read from the master's `/getZone` — a separate layer from the cloud group-store above; WebUI group-picker / badge / ungroup |
 | **Auto-Mode** — discover + migrate + preserve presets on first boot  | working — gated by NVS flag, default on                                                                            |
-| **Auto-Mode cron** — periodic re-check every 30 min when enabled     | working — light discovery + auto-claim/release + migrate newcomers                                                 |
+| **Auto-Mode cron** — periodic re-check every 30 min when enabled     | working — light discovery + auto-claim/release + migrate newcomers; since v0.8.13 a speaker is only *released* to a **verified** foreign owner (a live SixBack peer, or an explicit revert to the Bose cloud) — a speaker pointing at a dead URL stays owned and is **re-claimed** automatically (covers stale bases after an IP change and retired second sticks; the re-claim path skips the model/firmware whitelist because the speaker has already been migrated successfully before) |
 | **Peer-aware Auto-Mode** (v0.7.5)                                    | working — HTTP-probes other SixBack sticks in the LAN; skips speakers already claimed by a peer; UI shows `claimed by peer @ <ip>` |
 | **Source-Normalizer** — TuneIn / Local / RadioBrowser → playable     | working — RadioBrowser UUID resolved via radio-browser.info                                                        |
-| **IP-Failsafe** — auto-remigrate on ESP-IP change, with pre-probe    | working — skips speakers already on the new base                                                                   |
+| **IP-Failsafe** — auto-remigrate on ESP-IP change, with pre-probe    | working — every migrated speaker stores the SixBack base URL as a fixed IP, so a DHCP change would strand them; SixBack detects its own IP change **at boot and at runtime** (WiFi reconnect event, v0.8.13) and re-points every speaker it owns, skipping those already on the new base. If a speaker is offline during the run (router swap — speakers boot slower than the ESP), the run retries every 60 s for up to 20 min instead of giving up (v0.8.13). A DHCP reservation for the SixBack MAC avoids the situation entirely and is still the recommended setup |
 | **SETTLING status** (v0.6.541)                                       | working — backend reports `settling` instead of `offline` when only Telnet:17000 is down but BMX:8090 still answers |
 | Preset UI — drag&drop, dual-row (HW vs Store), per-slot revert       | working — modal progress, per-speaker export/import, refresh discards unsaved (v0.7.3)                             |
 | **Custom stream library — device-side** (v0.8.5)                     | working — Stream-tab tiles persist in device NVS instead of per-browser localStorage; `GET/POST/DELETE /api/streams` + bulk import, one-time localStorage→device migration, Export/Import; survives USB-erase and browser change |
@@ -107,11 +107,14 @@ unrelated on your LAN gets touched.
 After the initial boot pass, SixBack keeps the auto-mode pipeline alive
 as a **periodic cron** (default every 30 minutes, configurable via
 `cron_interval_s`).  Each tick does a light discovery (SSDP + known-IP
-probe, no full `/24` sweep), runs Auto-Claim/Release on the inventory
-(so a speaker that someone else migrated away gets dropped from the
-"owned" list automatically), and migrates any newcomer that matches the
-eligibility whitelist.  The countdown to the next tick is visible at the
-top of the Web UI.
+probe, no full `/24` sweep), runs Auto-Claim/Release on the inventory,
+and migrates any newcomer that matches the eligibility whitelist.  A
+speaker is only *released* when its new owner is verified — a live
+SixBack peer answering on that URL, or an explicit revert to the Bose
+cloud.  A speaker that points at a dead URL (a stale SixBack base after
+an IP change, or a second stick that was retired) stays owned and is
+automatically re-claimed on the next tick.  The countdown to the next
+tick is visible at the top of the Web UI.
 
 If multiple SixBack sticks coexist on the same LAN, the peer-aware
 auto-mode (v0.7.5+) keeps them from fighting over the same speakers:
