@@ -527,11 +527,14 @@ void handlePutPreset(AsyncWebServerRequest* req, JsonDocument& body) {
     p.imageUrl  = (const char*)(body["imageUrl"]  | "");
     bool ok = sixback::PresetStore::instance().set(id, p);
     if (!ok) {
-        // NVS-Save fehlgeschlagen — meist NOT_ENOUGH_SPACE wegen voller Partition.
+        // NVS-Save fehlgeschlagen. Seit dem Blob-Umbau (2026-06-07) heisst
+        // das: Partition WIRKLICH voll (das fruehere 4000-B-String-Limit,
+        // das ab ~5 Speakern jeden Save scheitern liess, ist weg). Der
+        // letzte gute Stand bleibt erhalten (Pass-3-Restore).
         // UI sieht 500 + error-Detail, statt fakem "ok":true.
         req->send(500, "application/json",
-                  "{\"ok\":false,\"error\":\"NVS save failed (partition full/fragmented) — "
-                  "try POST /api/nvs/cleanup\"}");
+                  "{\"ok\":false,\"error\":\"NVS save failed (partition out of space) — "
+                  "remove unused speakers or try POST /api/nvs/cleanup\"}");
         return;
     }
     // Single-Preset-Import via File-Drop: optionales spotify-Feld mitnehmen,

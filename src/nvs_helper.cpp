@@ -3,12 +3,32 @@
 #include <Preferences.h>
 #include <nvs.h>
 #include <nvs_flash.h>
+#include <memory>
+#include <vector>
 
 namespace sixback {
 
 bool nvsLoadJson(const char* ns, const char* key, JsonDocument& doc) {
     Preferences p;
     if (!p.begin(ns, true)) return false;
+    // Seit dem Blob-Umbau (2026-06-07) liegen JSON-Payloads als NVS-BLOB —
+    // nvs_set_blob ist ueber Pages gechunkt, das harte 4000-B-Limit von
+    // nvs_set_str entfaellt. Bestands-Daten (<= v0.8.14) liegen noch als
+    // STRING unter demselben Key -> Fallback; der naechste Save ersetzt den
+    // Eintrag typ-wechselnd durch ein Blob (NVS: neuer Wert ersetzt Typ+Wert).
+    size_t blen = p.getBytesLength(key);
+    if (blen > 0) {
+        std::unique_ptr<char[]> buf(new (std::nothrow) char[blen + 1]);
+        if (!buf) { p.end(); return false; }
+        size_t got = p.getBytes(key, buf.get(), blen);
+        p.end();
+        if (got != blen) return false;
+        buf[blen] = '\0';
+        // const char* erzwingt Copy-Mode in ArduinoJson — mit char* wuerde
+        // zero-copy in den gleich freigegebenen Buffer zeigen.
+        return deserializeJson(doc, (const char*)buf.get())
+               == DeserializationError::Ok;
+    }
     String s = p.getString(key, "");
     p.end();
     if (s.length() == 0) return false;
@@ -18,21 +38,27 @@ bool nvsLoadJson(const char* ns, const char* key, JsonDocument& doc) {
 bool nvsSaveJson(const char* ns, const char* key, JsonDocument& doc) {
     String s;
     serializeJson(doc, s);
+    if (s.length() == 0) return false;
     Preferences p;
     if (!p.begin(ns, false)) {
         Serial.printf("[nvs-save] FAIL begin ns=%s key=%s\n", ns, key);
         return false;
     }
-    size_t n = p.putString(key, s);
+    // BLOB statt String (Lab-Befund 2026-06-07): nvs_set_str kann max
+    // 4000 B inkl. NUL und braucht die Entries zusammenhaengend in EINER
+    // Page — der Preset-Store ueberschritt das ab ~5 Speakern und JEDER
+    // Save schlug fehl, obwohl die Partition zu 2/3 leer war. nvs_set_blob
+    // chunkt ueber Pages; Limit jetzt ~Partitionsgroesse.
+    size_t n = p.putBytes(key, s.c_str(), s.length());
     p.end();
-    if (n == 0) {
-        Serial.printf("[nvs-save] FAIL putString ns=%s key=%s json_len=%u (returned 0)\n",
-                      ns, key, (unsigned)s.length());
-    } else {
-        Serial.printf("[nvs-save] ok ns=%s key=%s json_len=%u wrote=%u\n",
+    if (n != s.length()) {
+        Serial.printf("[nvs-save] FAIL putBytes ns=%s key=%s json_len=%u wrote=%u\n",
                       ns, key, (unsigned)s.length(), (unsigned)n);
+        return false;
     }
-    return n > 0;
+    Serial.printf("[nvs-save] ok ns=%s key=%s json_len=%u (blob)\n",
+                  ns, key, (unsigned)s.length());
+    return true;
 }
 
 bool nvsErase(const char* ns, const char* key) {
@@ -93,15 +119,53 @@ bool nvsSaveJsonWithCleanup(const char* ns, const char* key, JsonDocument& doc) 
     }
     // Pass 3: den ZIEL-Key explizit loeschen + retry. Hilft wenn NVS-internes
     // GC die alte Version noch nicht reclaim't hat.
+    //
+    // ABER (Lab-Befund 2026-06-07): NIEMALS den letzten guten Stand opfern.
+    // Die alte Fassung loeschte den Key bedingungslos — wenn der Neuschreib
+    // dann ebenfalls scheiterte (damals: String > 4000 B = IMMER), war der
+    // letzte persistierte Stand vernichtet -> Total-Preset-Verlust nach dem
+    // naechsten Reboot. Deshalb: alten Wert vorher sichern und bei erneutem
+    // Fehlschlag zurueckschreiben (die soeben freigegebenen Entries reichen
+    // dafuer sicher aus).
     Serial.printf("[nvs-cleanup] %s/%s pass2-fail — pass3 erase target-key + retry\n", ns, key);
+    std::vector<uint8_t> oldBlob;
+    String oldStr;
+    {
+        Preferences p;
+        if (p.begin(ns, true)) {
+            size_t blen = p.getBytesLength(key);
+            if (blen > 0) {
+                oldBlob.resize(blen);
+                if (p.getBytes(key, oldBlob.data(), blen) != blen) oldBlob.clear();
+            } else {
+                oldStr = p.getString(key, "");
+            }
+            p.end();
+        }
+    }
     {
         Preferences p;
         if (p.begin(ns, false)) { p.remove(key); p.end(); }
     }
     bool ok = nvsSaveJson(ns, key, doc);
+    if (!ok && (oldBlob.size() > 0 || oldStr.length() > 0)) {
+        Preferences p;
+        bool restored = false;
+        if (p.begin(ns, false)) {
+            if (oldBlob.size() > 0) {
+                restored = p.putBytes(key, oldBlob.data(), oldBlob.size())
+                           == oldBlob.size();
+            } else {
+                restored = p.putString(key, oldStr) > 0;
+            }
+            p.end();
+        }
+        Serial.printf("[nvs-cleanup] pass3 %s/%s restore alter Stand: %s\n",
+                      ns, key, restored ? "OK" : "FAIL — Daten verloren!");
+    }
     Serial.printf("[nvs-cleanup] pass3 retry %s/%s -> %s%s\n", ns, key,
                   ok ? "OK" : "STILL-FAIL",
-                  ok ? "" : " — NVS partition severely fragmented");
+                  ok ? "" : " — NVS partition genuinely full");
     return ok;
 }
 

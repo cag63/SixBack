@@ -8,12 +8,16 @@
 
 namespace sixback {
 
-// Liest ein NVS-key (string) und parsed JSON in 'doc'. Gibt false zurueck wenn
+// Liest ein NVS-key und parsed JSON in 'doc'. Seit 2026-06-07 ist das
+// Speicherformat BLOB (page-chunked, kein 4000-B-String-Limit); Legacy-
+// STRING-Eintraege (<= v0.8.14) werden transparent gelesen und beim
+// naechsten Save in-place durch ein Blob ersetzt. Gibt false zurueck wenn
 // nicht da oder Parse-Fehler.
 bool nvsLoadJson(const char* ns, const char* key, JsonDocument& doc);
 
-// Serialisiert 'doc' und schreibt unter ns/key. Bei zu grossem Payload
-// erweitert Preferences automatisch (Limit ~ 4KB pro String).
+// Serialisiert 'doc' und schreibt als BLOB unter ns/key. Blob-Limit =
+// min(508 KB, ~97 % Partition) statt der harten 4000 B von nvs_set_str —
+// Letzteres vernichtete ab ~5 Speakern jeden Save (Lab-Befund 2026-06-07).
 bool nvsSaveJson(const char* ns, const char* key, JsonDocument& doc);
 
 // Loescht einen Key.
@@ -25,8 +29,10 @@ bool nvsEraseAllInNamespace(const char* ns);
 // Liefert NVS-Stats fuer die Default-Partition als JSON.
 void nvsGetStatsJson(JsonDocument& out);
 
-// Try-Save mit Auto-Cleanup-Fallback. Wenn putString fail (NVS voll),
-// werden Cache-Namespaces erased + retried. Returns true bei Erfolg.
+// Try-Save mit Auto-Cleanup-Fallback. Wenn der Blob-Write fehlschlaegt
+// (NVS wirklich voll), werden Cache-Namespaces erased + retried. Pass 3
+// sichert den alten Wert und stellt ihn bei erneutem Fehlschlag wieder
+// her — vernichtet NIE den letzten guten Stand. Returns true bei Erfolg.
 bool nvsSaveJsonWithCleanup(const char* ns, const char* key, JsonDocument& doc);
 
 // Einmalige Daten-Migration BoseFix32 -> SixBack.
