@@ -322,9 +322,15 @@ void wifiOptimizeForReliability() {
     //    konkurrierende Quellen.
     WiFi.persistent(false);
 
-    // 5) CPU auf maximale Frequenz pinnen. arduino-esp32 cappt das
-    //    automatisch auf den Chip-Max: S3/Classic 240 MHz, C3/C6 160 MHz.
+    // 5) CPU auf das Chip-Maximum pinnen. arduino-esp32 cappt NICHT still —
+    //    setCpuFrequencyMhz(240) loggt auf C3/C6 einen Fehler ("could not be
+    //    set to 240 MHz", Discussion #28). Daher explizit den Chip-Max waehlen:
+    //    S3/Classic 240 MHz, C3/C6 160 MHz.
+#if defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32)
     setCpuFrequencyMhz(240);
+#else
+    setCpuFrequencyMhz(160);  // C3/C6 Maximum
+#endif
 
     Serial.printf("[wifi] PS=NONE TX=max CPU=%lu MHz — optimized for reliability\n",
                   (unsigned long)getCpuFrequencyMhz());

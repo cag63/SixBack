@@ -61,19 +61,17 @@ static String extractPdoField_(const String& reply, const String& field) {
     return reply.substring(q1 + 1, q2);
 }
 
+// Bei marginalem WLAN (Paketverlust) kann ein einzelnes Telnet-Kommando ohne
+// Antwort bleiben und die ganze Migration abbrechen (Discussion #28: ESP RSSI
+// −86, leere Antwort). Daher die gesamte — idempotente — Kommando-Sequenz
+// mehrfach versuchen; erst bei Erfolg getpdo-Verify + reboot. Eine LEERE
+// Antwort (0 Bytes) wird als Link-/Paketverlust gemeldet (mit RSSI), nicht als
+// vom Speaker abgelehntes Kommando.
+static const int TELNET_MIGRATE_ATTEMPTS = 3;
+
 MigrationResult migrateSpeaker(const String& speakerIP,
                                 const String& serverBaseUrl) {
     MigrationResult r{false, "", ""};
-
-    WiFiClient client;
-    if (!client.connect(speakerIP.c_str(), BOSE_TELNET_PORT, 5000)) {
-        r.message = "Telnet-Connect zu " + speakerIP + ":17000 fehlgeschlagen";
-        return r;
-    }
-
-    // Banner-Prompt abwarten
-    delay(300);
-    while (client.available()) client.read();
 
     struct { const char* cmd_prefix; String value; } commands[5] = {
         { "sys configuration bmxRegistryUrl ", serverBaseUrl + "/bmx/registry/v1/services" },
@@ -83,42 +81,80 @@ MigrationResult migrateSpeaker(const String& speakerIP,
         { "envswitch boseurls set ",           serverBaseUrl + " " + serverBaseUrl + "/updates/soundtouch" },
     };
 
-    String reply;
-    for (auto& c : commands) {
-        String cmd = String(c.cmd_prefix) + c.value;
-        if (!sendAndExpectOK(client, cmd, reply)) {
-            r.message = "Kommando fehlgeschlagen: " + cmd + "\nAntwort: " + reply;
+    String lastErr;
+    for (int attempt = 1; attempt <= TELNET_MIGRATE_ATTEMPTS; ++attempt) {
+        WiFiClient client;
+        if (!client.connect(speakerIP.c_str(), BOSE_TELNET_PORT, 5000)) {
+            lastErr = "Telnet-Connect zu " + speakerIP + ":17000 fehlgeschlagen "
+                      "(ESP-WLAN RSSI=" + String(WiFi.RSSI()) + " dBm)";
+            delay(attempt * 500);
+            continue;
+        }
+
+        // Banner-Prompt abwarten + leeren
+        delay(300);
+        while (client.available()) client.read();
+
+        String reply;
+        bool seqOk = true;
+        for (auto& c : commands) {
+            String cmd = String(c.cmd_prefix) + c.value;
+            if (!sendAndExpectOK(client, cmd, reply)) {
+                if (reply.length() == 0) {
+                    // 0 Bytes zurueck = Paketverlust/toter Link, KEIN abgelehntes
+                    // Kommando. Den wahrscheinlichsten Hebel (WLAN) direkt nennen.
+                    lastErr = "keine Antwort vom Speaker-Telnet auf '" + cmd +
+                              "' — Paketverlust? ESP-WLAN RSSI=" +
+                              String(WiFi.RSSI()) + " dBm (Stick naeher an Router/AP platzieren)";
+                } else {
+                    lastErr = "Kommando abgelehnt: " + cmd + "\nAntwort: " + reply;
+                }
+                seqOk = false;
+                break;
+            }
+        }
+        if (!seqOk) {
             client.stop();
-            return r;
+            Serial.printf("[telnet] migrate attempt %d/%d failed: %s\n",
+                          attempt, TELNET_MIGRATE_ATTEMPTS, lastErr.c_str());
+            delay(attempt * 500);  // Backoff; delay() speist auch den Task-WDT
+            continue;
         }
+
+        // --- Sequenz erfolgreich: Verifikation + reboot ---
+        // getpdo soll zeigen dass margeServerUrl jetzt auf unsere base zeigt.
+        // Falls Mismatch: NICHT fail-hard, weil getpdo zeitweise inkonsistent ist
+        // (Diag-Shell-Quirk, NVS-Cache-Latenz) — Auto-Claim/Release in
+        // refreshMigrationStatus reconcile't das beim naechsten Refresh. Das
+        // Mismatch bleibt in r.message (wird unten NICHT mehr ueberschrieben),
+        // damit der User im Reply-Toast sieht dass die Verifikation nicht clean war.
+        delay(200);  // NVS-write am Speaker abklingen lassen
+        if (sendAndExpectOK(client, "getpdo CurrentSystemConfiguration", reply)) {
+            r.verifiedConfig = reply;
+            String actualMarge = extractPdoField_(reply, "margeServerUrl");
+            if (actualMarge.length() > 0 && actualMarge != serverBaseUrl) {
+                Serial.printf("[telnet] WARN getpdo margeServerUrl=%s expected=%s "
+                              "— auto-claim will reconcile next refresh\n",
+                              actualMarge.c_str(), serverBaseUrl.c_str());
+                r.message = String("WARN: getpdo margeServerUrl=") + actualMarge +
+                            " expected=" + serverBaseUrl + " (auto-claim will fix)";
+            }
+        }
+
+        client.print("sys reboot\n");
+        delay(500);
+        client.stop();
+
+        r.ok = true;
+        if (r.message.length() == 0)
+            r.message = "Migration erfolgreich, Speaker rebooted";
+        if (attempt > 1)
+            r.message += " (nach " + String(attempt) + " Versuchen)";
+        return r;
     }
 
-    // Verifikation: getpdo soll zeigen dass margeServerUrl jetzt auf unsere
-    // base zeigt. Falls Mismatch: NICHT fail-hard, weil getpdo zeitweise
-    // inkonsistent ist (Diag-Shell-Quirk, NVS-Cache-Latenz) — Auto-Claim/
-    // Release in refreshMigrationStatus reconcile't das beim naechsten Refresh.
-    // Aber: das Mismatch wird ins r.message geschrieben, damit der User im
-    // Reply-Toast sieht, dass die Verifikation nicht clean durchging.
-    delay(200);  // NVS-write am Speaker abklingen lassen
-    if (sendAndExpectOK(client, "getpdo CurrentSystemConfiguration", reply)) {
-        r.verifiedConfig = reply;
-        String actualMarge = extractPdoField_(reply, "margeServerUrl");
-        if (actualMarge.length() > 0 && actualMarge != serverBaseUrl) {
-            Serial.printf("[telnet] WARN getpdo margeServerUrl=%s expected=%s "
-                          "— auto-claim will reconcile next refresh\n",
-                          actualMarge.c_str(), serverBaseUrl.c_str());
-            r.message = String("WARN: getpdo margeServerUrl=") + actualMarge +
-                        " expected=" + serverBaseUrl + " (auto-claim will fix)";
-        }
-    }
-
-    // Reboot
-    client.print("sys reboot\n");
-    delay(500);
-    client.stop();
-
-    r.ok = true;
-    r.message = "Migration erfolgreich, Speaker rebooted";
+    r.message = lastErr + " — nach " + String(TELNET_MIGRATE_ATTEMPTS) +
+                " Versuchen aufgegeben";
     return r;
 }
 
