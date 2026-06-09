@@ -1993,6 +1993,38 @@ async function onPresetClick(ev, devId, slot) {
     toast(`Speaker slot ${slot} is empty — push a station to it first`);
     return;
   }
+  // Custom internet-radio (LOCAL_INTERNET_RADIO) slots go "cold" after a source
+  // switch: a plain preset-key press — which is what play-preset does, and what
+  // the physical button does — connects to the stream but never engages the
+  // playback engine (flashing white LED, no audio; Discussion #15). Re-resolving
+  // the stream through the ORION /select path (the same path a push/preview uses)
+  // re-arms it reliably. So for LIR slots we re-resolve via play-source instead
+  // of emulating the button. The physical button itself can't be helped (the
+  // speaker emits no event when it's pressed), but the UI click can.
+  if (hw.source === 'LOCAL_INTERNET_RADIO') {
+    const store = d.store && d.store[slot-1];
+    // Clean stream URL: prefer the store (always the raw URL we authored). Fall
+    // back to the HW-baked location, but only if it's a real http(s) URL — never
+    // the ORION "/station?data=" form, which play-source would double-wrap.
+    let streamUrl = (store && store.source === 'LOCAL_INTERNET_RADIO' && store.streamUrl) ? store.streamUrl : '';
+    if (!streamUrl && /^https?:\/\//.test(hw.location || '')) streamUrl = hw.location;
+    if (streamUrl) {
+      try {
+        const r = await api(`/api/speaker/${encodeURIComponent(devId)}/play-source`, {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({
+            source: 'LOCAL_INTERNET_RADIO',
+            name: (store && store.name) || hw.name || 'Custom Station',
+            streamUrl,
+            imageUrl: (store && store.imageUrl) || '',
+          }),
+        });
+        if (r && r.ok) { toast(`▶ ${slotName_(hw)} on slot ${slot}`); kickPoll(devId); return; }
+        // play-source reached the speaker but it refused → fall through to the
+        // button-press path rather than failing silently.
+      } catch(e) { /* network error → fall through to play-preset */ }
+    }
+  }
   try {
     await api(`/api/speaker/${encodeURIComponent(devId)}/play-preset/${slot}`, {method:'POST'});
     toast(`▶ ${slotName_(hw)} on slot ${slot}`);
