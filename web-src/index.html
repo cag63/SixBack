@@ -1201,6 +1201,7 @@ function uploadOta(kind) {
 // Pattern stammt aus tul-knx-gateway / ip4knx — der ESP zieht selbst per
 // HTTPS aus dem Distributions-Host. UI ruft check/install und pollt status.
 let OTA_POLL = null;
+let OTA_POLL_FAILS = 0;   // aufeinanderfolgende fehlgeschlagene Status-Polls waehrend installing
 
 function renderOnline(d) {
   const latestEl = document.getElementById('fw-latest');
@@ -1304,9 +1305,34 @@ function renderOnline(d) {
 async function pollOnline() {
   try {
     const r = await fetch('/api/update/status', { cache: 'no-store' });
-    if (!r.ok) return;
+    if (!r.ok) { otaPollFailed(); return; }
+    OTA_POLL_FAILS = 0;
     renderOnline(await r.json());
-  } catch (_) { /* tolerate transient errors during reboot window */ }
+  } catch (_) { otaPollFailed(); }
+}
+
+// Waehrend INSTALLING heisst ein wegfallender Status-Endpoint mit hoher
+// Wahrscheinlichkeit: der ESP rebootet gerade nach dem Flash (oder der Link ist
+// kurz weg). Frueher wurde der Fehler still geschluckt -> der Progress-Balken
+// blieb eingefroren stehen (betateilchen, FHEM #52: "seit 10 Minuten so", obwohl
+// der Flash laengst durch war). Stattdessen nach ein paar Fehlschlaegen klar
+// kommunizieren und automatisch neu laden, sobald das Geraet zurueck sein sollte.
+function otaPollFailed() {
+  if (!OTA_POLL) return;               // poll nur aktiv waehrend installing
+  OTA_POLL_FAILS++;
+  if (OTA_POLL_FAILS === 4) {          // ~4s nicht erreichbar
+    const statEl = document.getElementById('fw-online-status');
+    const lab    = document.getElementById('fw-online-prog-label');
+    if (statEl) {
+      statEl.textContent = 'status: ESP nicht erreichbar — Flash fertig & Reboot? Seite lädt gleich neu…';
+      statEl.style.cssText = 'color:var(--warn)';
+    }
+    if (lab) lab.textContent = 'ESP rebooting / connection lost — reloading…';
+  }
+  if (OTA_POLL_FAILS >= 12) {          // ~12s weg -> Geraet sollte zurueck sein
+    if (OTA_POLL) { clearInterval(OTA_POLL); OTA_POLL = null; }
+    setTimeout(() => location.reload(), 3000);
+  }
 }
 
 async function onlineCheck() {
@@ -2828,18 +2854,21 @@ async function renameSpeaker(devId) {
       body: JSON.stringify({ name }),
     });
     toast(`Renaming to "${name}"…`);
-    // Speaker braucht einen Moment; danach Inventory neu laden und das
-    // Ergebnis VERIFIZIEREN: der SoundTouch akzeptiert nur EINEN Rename
-    // pro Boot-Session (on-device ST10 FW 27.0.3, 2026-06-07) — weitere
-    // Versuche noop'en still mit HTTP 200. Stiller Fail wäre die
-    // #10-Häkchen-Falle; daher expliziter Hinweis mit Reboot-Tipp.
+    // Der Rename wird ASYNCHRON angewendet: ein migrierter Speaker delegiert ihn
+    // an seine Cloud — er feuert selbst PUT /streaming/account/{a}/device/{d} an
+    // SixBack (vom Marge-Handler bedient) und committet ihn dann lokal. Der
+    // Round-Trip dauert ein paar Sekunden (on-device ~3-8s, ST10 FW 27.0.3,
+    // 2026-06-10). Danach Inventory neu laden + verifizieren; bleibt der Name
+    // aus, ist der Speaker vermutlich offline/langsam — stillen Fail sichtbar
+    // machen (#10-Häkchen-Falle vermeiden), aber OHNE die alte (falsche)
+    // "ein Rename pro Boot"-Behauptung.
     setTimeout(async () => {
       await loadSpeakers();
       const after = STATE.speakers.find(x => x.device_id === devId);
       if (after && after.name !== name) {
-        toast('Speaker ignored the rename — SoundTouch applies only one rename per power-on. Reboot the speaker (action button), then try again.', 'error');
+        toast('Rename not confirmed yet — the speaker takes a few seconds to apply it. Hit Refresh; if the name does not change, check the speaker is online.', 'error');
       }
-    }, 5000);
+    }, 8000);
   } catch (e) { toast('Rename failed: ' + e.message); }
 }
 

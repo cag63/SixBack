@@ -50,6 +50,11 @@ struct Speaker {
                             // (Issue #10: push -> /select=500). Wird bei jedem
                             // refreshMigrationStatus neu ermittelt; UI warnt +
                             // bietet Re-Sync. Runtime-derived, nicht in NVS.
+    uint8_t offlineStreak = 0; // Runtime-only (NICHT NVS): Anzahl aufeinanderfolgender
+                            // Refresh-Zyklen mit nicht-gesunder Probe (OFFLINE/SETTLING/
+                            // UNKNOWN). Entprellt den UI-Status-Flip — die Kachel kippt
+                            // erst nach STATUS_OFFLINE_DEBOUNCE Schlecht-Zyklen, nicht
+                            // nach einem einzelnen verfehlten Durchlauf (FHEM #49 fred).
     uint32_t lastSeenMs;
     String groupId;         // freitext, default ""
 

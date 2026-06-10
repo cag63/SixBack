@@ -281,6 +281,7 @@ bool pullAndFlashOne_(const char* path, int updateType,
     uint32_t written = 0;
     uint32_t lastReport = millis();
     uint32_t lastDataMs = millis();
+    const uint32_t phaseStartMs = millis();
     // Read until connection closes OR no new bytes for kIdleTimeoutMs (idle-EOF).
     // Pre-Release-fix: NICHT auf written>=total brechen — total ist
     // (auf ESP HTTPS) unzuverlaessig.
@@ -291,7 +292,36 @@ bool pullAndFlashOne_(const char* path, int updateType,
     // 30s gibt langsamen Geraeten Luft, ohne bei echtem Abriss ewig zu haengen
     // (http.connected() faengt den sauberen Close ohnehin sofort).
     const uint32_t kIdleTimeoutMs = 30000;
+    // 2026-06-10 (FHEM #52 betateilchen, "seit 10 Minuten so"): der Idle-Timeout
+    // oben faengt nur ein TOTAL stehengebliebenes Read ab. Ein pathologisch
+    // langsamer-aber-lebendiger Link (oder ein half-open TCP, das connected()==true
+    // haelt und gerade genug troepfelt um lastDataMs immer wieder zu resetten) kann
+    // sonst BELIEBIG lange laufen, ohne dass je ein Fehler gesetzt wird. Wall-Clock-
+    // Backstop: bei Ueberschreitung sauber abbrechen — Update.abort erhaelt die
+    // Anti-Brick-Garantie (laufender Slot bleibt aktiv).
+    // Budget SKALIERT mit der Image-Groesse (Mindest-Durchsatz ~3 KB/s als Untergrenze
+    // dessen, was in vertretbarer Zeit fertig wird) statt flacher Decke — sonst koennte
+    // das ~10-MB-s3-littlefs auf einem schwachen Link (RSSI-86-Population, #28) legitim
+    // mitten im Fortschritt abgewuergt werden, waehrend ein 256-KB-Image eine enge Decke
+    // verdient. Floor 5 min fuer kleine Images. Der 30-s-Idle-Timeout oben faengt echte
+    // Total-Stalls weiterhin schnell; dieser Backstop nur den langsam-troepfelnden
+    // half-open-Fall (contentLen ist hier garantiert > 0, oben per :206 erzwungen).
+    constexpr uint32_t kMinBytesPerSec = 3000;
+    uint32_t kPhaseMaxMs = (contentLen > 0)
+        ? (uint32_t)((uint64_t)contentLen * 1000ULL / kMinBytesPerSec)
+        : (20UL * 60UL * 1000UL);
+    if (kPhaseMaxMs < 5UL * 60UL * 1000UL) kPhaseMaxMs = 5UL * 60UL * 1000UL;
     while (http.connected()) {
+        if (millis() - phaseStartMs > kPhaseMaxMs) {
+            free(buf);
+            setError_(String(phaseName) + ": phase exceeded " +
+                      String(kPhaseMaxMs / 60000UL) +
+                      " min wall-clock at " + String(written) + "/" +
+                      String(contentLen) + " B — aborting (link too slow / stalled)");
+            Update.abort();
+            http.end();
+            return false;
+        }
         size_t avail = stream->available();
         if (avail == 0) {
             if (millis() - lastDataMs > kIdleTimeoutMs) {

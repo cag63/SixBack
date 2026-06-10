@@ -462,9 +462,18 @@ MigrationStatus SpeakerInventory::detectStatus(const String& ip, const String& m
         // aus"-Alarm wirft. Slot/Cloud-URL bleibt unbekannt bis Telnet wieder
         // antwortet.
         HTTPClient http;
-        String bmxUrl = "http://" + ip + ":" + String(BOSE_HTTP_PORT) + "/info";
+        // 2026-06-10 (FHEM #49 fred): Port war faelschlich BOSE_HTTP_PORT (8000 =
+        // unser EIGENER ESP-Port), nicht BOSE_BMX_PORT (8090 = Speaker-API). Der
+        // Speaker bedient 8000 nicht -> dieser Fallback lieferte NIE 200 -> das
+        // SETTLING-Verdikt (Speaker lebt, nur Telnet-Diag-Shell transient weg) war
+        // faktisch tot, jeder Telnet-Blip kippte direkt auf OFFLINE. Alle anderen
+        // /info-Proben nutzen korrekt 8090 (probeIp_, ip_failsafe, system_health,
+        // auto_mode).
+        String bmxUrl = "http://" + ip + ":" + String(BOSE_BMX_PORT) + "/info";
         if (http.begin(bmxUrl)) {
-            http.setTimeout(2000);
+            http.setConnectTimeout(2000);  // war ungesetzt -> arduino-Default ~5s
+            http.setTimeout(4000);         // war 2000 — spielende Box unter Last
+                                           // braucht mehr Luft fuer die Antwort
             int code = http.GET();
             http.end();
             if (code == 200) return MigrationStatus::SETTLING;
@@ -579,6 +588,13 @@ bool isPeerSixBackCloud(const String& url) {
     return (code == 200) && (body.indexOf("SixBack") >= 0);
 }
 
+// Anzeige-Entprellung des Status-Tiles (FHEM 144729 #49, fred): wie viele
+// aufeinanderfolgende Schlecht-Probe-Zyklen noetig sind, bevor die Kachel von
+// einem gesunden Status auf OFFLINE/SETTLING kippt. 2 = ein einzelner verfehlter
+// Durchlauf (Telnet-Blip / transienter /info-Timeout) bleibt unsichtbar, ein
+// echter Ausfall zeigt sich nach <=2 Zyklen.
+static constexpr uint8_t STATUS_OFFLINE_DEBOUNCE = 2;
+
 void SpeakerInventory::refreshMigrationStatus() {
     // Snapshot unter Lock, dann Telnet-Calls OHNE Lock — sonst blockt jeder
     // Reader (AsyncTCP-Handler, Bose-Cloud-Mock) fuer 3-5 s pro Speaker.
@@ -681,8 +697,31 @@ void SpeakerInventory::refreshMigrationStatus() {
             if (s.deviceId == upd.deviceId) { live = &s; break; }
         }
         if (!live) continue;
-        live->status       = upd.status;
-        live->cloudUrl     = upd.cloudUrl;
+        // Anzeige-Entprellung (FHEM #49 fred): ein einzelner verfehlter Probe-
+        // Durchlauf darf das Tile NICHT sofort auf OFFLINE/SETTLING kippen, solange
+        // der Speaker in Wahrheit weiterspielt. Erst nach STATUS_OFFLINE_DEBOUNCE
+        // aufeinanderfolgenden Schlecht-Zyklen den Status-Downgrade ZEIGEN; ein
+        // gesundes Verdikt (MIGRATED/NOT_MIGRATED) wird sofort uebernommen + resettet.
+        // WICHTIG: nur das STATUS-Enum (= die Kachel) wird gehalten, NICHT cloudUrl.
+        // cloudUrl folgt IMMER dem frischen Probe-Wert (bei einem Blip "") — sonst
+        // saehe auto_mode/resolveEmptyCloudUrls_ einen gehaltenen Stale-Wert und der
+        // Re-Claim-Skip-Guard (isEligible_ cloudUrl=="") griffe nicht -> ein zum
+        // Scheitern verurteilter Re-Claim ueber das gerade blippende Telnet. Die
+        // Auto-Release-Pruefung unten ueberspringt bei cloudUrl=="" ohnehin
+        // (length()>0-Gate), bleibt also korrekt — exakt das Vor-Aenderungs-Verhalten.
+        const bool badProbe = (upd.status == MigrationStatus::OFFLINE ||
+                               upd.status == MigrationStatus::SETTLING ||
+                               upd.status == MigrationStatus::UNKNOWN);
+        if (badProbe) {
+            if (live->offlineStreak < 255) live->offlineStreak++;
+            if (live->offlineStreak >= STATUS_OFFLINE_DEBOUNCE)
+                live->status = upd.status;       // bestaetigter Downgrade -> jetzt zeigen
+            // sonst: vorherige (gesunde) Kachel HALTEN, Status nicht kippen.
+        } else {
+            live->offlineStreak = 0;
+            live->status = upd.status;
+        }
+        live->cloudUrl     = upd.cloudUrl;       // cloudUrl folgt IMMER dem frischen Probe
         live->sourcesReady = upd.sourcesReady;
         // Auto-heal (Issue #10): einen frisch zugewiesenen synthetischen
         // accountId uebernehmen (macht den Speaker marge-eligible).

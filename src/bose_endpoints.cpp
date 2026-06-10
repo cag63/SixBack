@@ -1380,6 +1380,91 @@ void handleDeviceAddFinalize(AsyncWebServerRequest* req) {
 }
 
 // -----------------------------------------------------------------------------
+// PUT /streaming/account/{accountId}/device/{deviceId}  -- Rename (account-seitig)
+//
+// Ein marge-/account-gebundener (migrierter) Speaker wendet einen Rename NICHT
+// lokal an: er feuert diesen PUT SELBST an seine margeURL (= uns), egal ob der
+// User in der Bose-App oder via lokalem POST :8090/name umbenennt. Ohne Handler
+// -> onNotFound/404 -> Speaker retry-loopt, Rename committed nie, /info bleibt
+// auf dem alten Namen (HW-bewiesen 2026-06-10 an Emma: POST :8090/name -> Emma
+// feuert PUT .../device/EC24B89C26AD, mehrfach = Retry; vgl. gesellix/AfterTouch
+// issue285 — nur-POST-registriert ergab dort 502 + endlosen Bose-App-Spinner).
+//   Content-Type: application/vnd.bose.streaming-v1.2+xml
+//   Body: <device deviceid="DEVID"><name>NEU</name><macaddress>MAC</macaddress></device>
+//   200:  <device deviceid><createdOn><ipaddress><name>NEU</name><updatedOn></device>
+//   deviceid URL != Body -> 400 (mirror AfterTouch/ueberboese updateDevice).
+// account/full serviert <name> bereits (s.o.), daher genuegt der Inventory-Update.
+struct PutDeviceCtx { String body; };
+std::map<void*, PutDeviceCtx> g_putDevCtx;
+SemaphoreHandle_t g_putDevMtx = nullptr;
+
+void handlePutDeviceBody(AsyncWebServerRequest* req,
+                         uint8_t* data, size_t len, size_t index, size_t total) {
+    if (!g_putDevMtx) g_putDevMtx = xSemaphoreCreateMutex();
+    if (xSemaphoreTake(g_putDevMtx, pdMS_TO_TICKS(50)) != pdTRUE) return;
+    auto& ctx = g_putDevCtx[req];
+    if (index == 0) ctx.body = "";
+    for (size_t i = 0; i < len; ++i) ctx.body += (char)data[i];
+    xSemaphoreGive(g_putDevMtx);
+}
+
+void handlePutDeviceFinalize(AsyncWebServerRequest* req) {
+    String acct     = pathParam(0);
+    String urlDevId = pathParam(1);
+    String body;
+    if (g_putDevMtx && xSemaphoreTake(g_putDevMtx, pdMS_TO_TICKS(50)) == pdTRUE) {
+        auto it = g_putDevCtx.find(req);
+        if (it != g_putDevCtx.end()) { body = it->second.body; g_putDevCtx.erase(it); }
+        xSemaphoreGive(g_putDevMtx);
+    }
+    // Body parsen: deviceid="..."-Attr + <name>...</name>
+    String bodyDevId, newName;
+    int dp = body.indexOf("deviceid=\"");
+    if (dp >= 0) { int e = body.indexOf("\"", dp + 10); if (e > dp) bodyDevId = body.substring(dp + 10, e); }
+    int np = body.indexOf("<name>");
+    if (np >= 0) { int e = body.indexOf("</name>", np); if (e > np) newName = body.substring(np + 6, e); }
+    newName.trim();
+    // deviceid-Mismatch URL vs Body -> 400 (wie AfterTouch HandleMargeUpdateDevice)
+    if (bodyDevId.length() && urlDevId.length() && bodyDevId != urlDevId) {
+        req->send(400, "application/vnd.bose.streaming-v1.2+xml", "");
+        Serial.printf("[marge] putDevice deviceid mismatch url=%s body=%s -> 400\n",
+                      urlDevId.c_str(), bodyDevId.c_str());
+        return;
+    }
+    String devId = urlDevId.length() ? urlDevId : bodyDevId;
+    // Inventory-Name aktualisieren. Speaker unbekannt -> trotzdem 200 echoen
+    // (Speaker erwartet 200, sonst Retry-Loop); Name synct dann via account/full.
+    String ip, appliedName = newName;
+    bool found = false, changed = false;
+    {
+        auto& inv = sixback::SpeakerInventory::instance();
+        sixback::SpeakerInventory::LockGuard g(inv);
+        auto* sp = inv.findById(devId);
+        if (sp) {
+            found = true;
+            ip = sp->ip;
+            if (newName.length() && sp->name != newName) { sp->name = newName; changed = true; }
+            if (newName.length() == 0) appliedName = sp->name;
+        }
+    }
+    // saveToNVS() lockt selbst -> AUSSERHALB des LockGuard-Scopes rufen.
+    if (changed) sixback::SpeakerInventory::instance().saveToNVS();
+    String resp = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
+                  "<device deviceid=\""; resp += xmlEsc_(devId); resp += "\">"
+                    "<createdOn>"; resp += kBosmanInitTs; resp += "</createdOn>"
+                    "<ipaddress>"; resp += xmlEsc_(ip); resp += "</ipaddress>"
+                    "<name>"; resp += xmlEsc_(appliedName); resp += "</name>"
+                    "<updatedOn>"; resp += kBosmanInitTs; resp += "</updatedOn>"
+                  "</device>";
+    AsyncWebServerResponse* r = req->beginResponse(
+        200, "application/vnd.bose.streaming-v1.2+xml", resp);
+    r->addHeader("METHOD_NAME", "updateDevice");
+    req->send(r);
+    Serial.printf("[marge] putDevice acct=%s dev=%s name=\"%s\" found=%d changed=%d -> 200\n",
+                  acct.c_str(), devId.c_str(), appliedName.c_str(), (int)found, (int)changed);
+}
+
+// -----------------------------------------------------------------------------
 // GET /updates/soundtouch  -- Replica der Bose-Firmware-Index-Liste
 // -----------------------------------------------------------------------------
 void handleSWUpdateIndex(AsyncWebServerRequest* req) {
@@ -1538,6 +1623,11 @@ void registerBoseEndpoints(AsyncWebServer& server) {
     // Marge-Association-Bootstrap (trailing slash ist Pflicht — Speaker schickt es so):
     routeT(server, "^/streaming/account/([^/]+)/device/$",                 HTTP_POST,
               handleDeviceAddFinalize, nullptr, handleDeviceAddBody);
+    // Rename (account-seitig): Speaker feuert diesen PUT beim Umbenennen selbst
+    // (Bose-App ODER lokales :8090/name). Ohne ihn -> 404 + Retry-Loop, Rename
+    // committed nie. Anchored + PUT-only -> kollidiert nicht mit .../device/{d}/*.
+    routeT(server, "^/streaming/account/([^/]+)/device/([^/]+)$",          HTTP_PUT,
+              handlePutDeviceFinalize, nullptr, handlePutDeviceBody);
     // POST /streaming/account/<aid>/source — MusicService-Account-Registrierung
     // (DLNA, Spotify-User, etc.). Speaker triggert dies aus BMX-POST
     // /setMusicServiceAccount und erwartet 200 OK mit <source id=...>-XML.
