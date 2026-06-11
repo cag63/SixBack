@@ -35,6 +35,8 @@ struct Speaker {
     String name;            // "Bose SoundTouch Kueche"
     String model;           // "SoundTouch 30"
     String firmware;        // "27.0.6.46330.5043500..."
+    String moduleType;      // /info <moduleType> (sm2/scm = Wireless-Modul-Generation)
+    String variant;         // /info <variant> (rhino/mojo/spotty) — HW-Revision fuer Issue-Triage
     String ip;              // "192.168.1.50"
     String accountId;       // margeAccountUUID
     MigrationStatus status; // siehe oben

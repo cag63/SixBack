@@ -34,6 +34,8 @@
 #include "tunein_resolver.h"
 #include "marge_keepalive.h"
 #include "mbedtls_psram_alloc.h"
+#include "gabbo_ws.h"
+#include "gabbo_watcher.h"
 
 static AsyncWebServer boseServer(BOSE_HTTP_PORT);
 static AsyncWebServer uiServer(UI_HTTP_PORT);
@@ -153,6 +155,7 @@ void setup() {
     sixback::startAutoModeTask(); // No-op wenn NVS-Flag auto-mode disabled
     sixback::startMargeKeepAlive(); // 5min-Ping an /setMargeAccount damit
                                     // scmudc-Event-Stream nicht stehen bleibt
+    sixback::startGabboWatcher();    // #15 HW-Tasten-Re-Arm (no-op wenn Flag off)
 
     Serial.println();
     Serial.printf("[setup] SixBack ready - UI: http://%s.local/\n", MDNS_HOSTNAME);

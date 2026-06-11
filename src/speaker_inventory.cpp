@@ -226,6 +226,8 @@ void SpeakerInventory::mergeSpeaker_(const Speaker& s) {
             existing.name       = s.name;
             existing.model      = s.model;
             existing.firmware   = s.firmware;
+            existing.moduleType = s.moduleType;
+            existing.variant    = s.variant;
             existing.ip         = s.ip;
             existing.accountId  = s.accountId;
             existing.lastSeenMs = millis();
@@ -296,6 +298,8 @@ bool SpeakerInventory::probeIp_(const String& ip, Speaker& out,
     out.name      = xmlValue(xml, "name");
     out.model     = xmlValue(xml, "type");
     out.firmware  = xmlValue(xml, "softwareVersion");
+    out.moduleType = xmlValue(xml, "moduleType");   // sm2/scm — HW-Revision (Issue-Triage)
+    out.variant    = xmlValue(xml, "variant");      // rhino/mojo/spotty
     out.accountId = xmlValue(xml, "margeAccountUUID");
     out.ip        = ip;
     out.status    = MigrationStatus::UNKNOWN;

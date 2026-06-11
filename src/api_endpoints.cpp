@@ -29,6 +29,7 @@
 #include "event_store.h"
 #include "ip_failsafe.h"
 #include "nvs_helper.h"
+#include "gabbo_watcher.h"
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include "speaker_diagnostic.h"
@@ -44,6 +45,44 @@
 #include <LittleFS.h>
 #include <Update.h>
 #include <Preferences.h>
+
+// Setzt einen TUNEIN/LIR-Sender per /select an einen Speaker (plain HTTP :8090).
+// ACHTUNG: doPush_ haelt eine bewusst getrennte, BYTE-IDENTISCHE Kopie dieses
+// /select-ContentItem-Schemas (braucht den HTTP-Code fuer seine Abort-Logik +
+// macht danach waitForPlayState_ + Long-Press). Bei Schema-Aenderung (type/
+// sourceAccount/location/Attribute) BEIDE Stellen anpassen: hier UND doPush_.
+// Markiert gabboMarkSelfSelect
+// VOR dem Push, damit das resultierende nowSelectionUpdated nicht als HW-Press
+// re-armed wird (gabbo-Loop-Guard). type="stationurl" Pflicht (type="url" ->
+// Speaker STANDBY); sourceAccount="" (empirisch Emma: "TuneIn" -> 500 1005).
+// MUSS am globalen Scope stehen (NICHT im anon-namespace unten), sonst laesst
+// sich der sixback::-qualifizierte Name nicht definieren.
+int sixback::selectStationOnSpeaker(const String& spIp, const sixback::Preset& p) {
+    sixback::gabboMarkSelfSelect(spIp);
+    HTTPClient http;
+    http.setReuse(false);
+    http.setConnectTimeout(2000);   // Watcher-Task nicht lange blockieren (Re-Arm-Kontext)
+    http.setTimeout(3000);
+    String url = "http://" + spIp + ":" + String(BOSE_BMX_PORT) + "/select";
+    int code = -1;
+    if (http.begin(url)) {
+        const char* ciType = "stationurl";
+        String ci = "<ContentItem source=\"";
+        ci += sixback::presetSourceToStr(p.source);
+        ci += "\" type=\""; ci += ciType;
+        ci += "\" location=\"";
+        if (p.source == sixback::PresetSource::TUNEIN) {
+            ci += "/v1/playback/station/" + p.stationId;
+        } else {
+            ci += sixback::orionStationLocation(p.streamUrl, p.name, p.imageUrl);
+        }
+        ci += "\" sourceAccount=\"\" isPresetable=\"true\"><itemName>" + sixback::escapeXml(p.name) + "</itemName></ContentItem>";
+        http.addHeader("Content-Type", "text/xml");
+        code = http.POST(ci);
+        http.end();
+    }
+    return code;
+}
 
 namespace {
 
@@ -184,6 +223,8 @@ void emitSpeakers(AsyncWebServerRequest* req, JsonDocument& doc) {
         o["name"]      = s.name;
         o["model"]     = s.model;
         o["firmware"]  = s.firmware;
+        o["module_type"] = s.moduleType;   // sm2/scm — HW-Revision (Issue-Triage, STR-Adopt)
+        o["variant"]     = s.variant;      // rhino/mojo/spotty
         o["ip"]        = s.ip;
         o["account_id"]= s.accountId;
         o["status"]      = sixback::migrationStatusToStr(s.status);
@@ -1109,6 +1150,7 @@ static void doPush_(const PushPresetJob_& job) {
             hs.end();
         }
     }
+    sixback::gabboMarkSelfSelect(job.spIp);   // gabbo-Loop-Guard: Eigen-/select markieren
     HTTPClient http;
     http.setReuse(false);
     String url = "http://" + job.spIp + ":" + String(BOSE_BMX_PORT) + "/select";
@@ -1630,29 +1672,14 @@ void handlePlaySource(AsyncWebServerRequest* req, JsonDocument& body) {
     if (src == sixback::PresetSource::LOCAL_INTERNET_RADIO && streamUrl.length() == 0) {
         req->send(400, "application/json", "{\"error\":\"streamUrl required for LOCAL_INTERNET_RADIO\"}"); return;
     }
-    HTTPClient http;
-    http.setReuse(false);
-    String url = "http://" + spIp + ":" + String(BOSE_BMX_PORT) + "/select";
-    int code = -1;
-    if (http.begin(url)) {
-        // Match doPush_ exactly: beide adapter-aufgeloesten Quellen nutzen
-        // "stationurl" (TUNEIN ueber tunein-Adapter, LIR ueber ORION-Adapter).
-        const char* ciType = "stationurl";
-        String ci = "<ContentItem source=\"";
-        ci += sixback::presetSourceToStr(src);
-        ci += "\" type=\""; ci += ciType;
-        ci += "\" location=\"";
-        if (src == sixback::PresetSource::TUNEIN) {
-            ci += "/v1/playback/station/" + stationId;
-        } else {
-            // LOCAL_INTERNET_RADIO via native ORION-Adapter (siehe doPush_).
-            ci += sixback::orionStationLocation(streamUrl, name, imageUrl);
-        }
-        ci += "\" sourceAccount=\"\" isPresetable=\"true\"><itemName>" + sixback::escapeXml(name) + "</itemName></ContentItem>";
-        http.addHeader("Content-Type", "text/xml");
-        code = http.POST(ci);
-        http.end();
-    }
+    sixback::Preset tmp;
+    tmp.slot      = 0;
+    tmp.source    = src;
+    tmp.name      = name;
+    tmp.stationId = stationId;
+    tmp.streamUrl = streamUrl;
+    tmp.imageUrl  = imageUrl;
+    int code = sixback::selectStationOnSpeaker(spIp, tmp);
     JsonDocument out;
     out["ok"]     = (code == 200);
     out["select"] = code;
@@ -3029,6 +3056,8 @@ void handleRoot(AsyncWebServerRequest* req) {
     if (LittleFS.exists("/index.html.gz")) {
         auto* resp = req->beginResponse(LittleFS, "/index.html.gz", "text/html");
         resp->addHeader("Content-Encoding", "gzip");
+        resp->addHeader("Content-Security-Policy", SIXBACK_CSP_HEADER);
+        resp->addHeader("X-Content-Type-Options", "nosniff");
         req->send(resp);
         return;
     }
