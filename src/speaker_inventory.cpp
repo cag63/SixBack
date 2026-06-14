@@ -544,6 +544,33 @@ static bool probeTuneinReady_(const String& ip) {
     return false;  // kein READY-TUNEIN -> Re-Sync noetig
 }
 
+// Analog probeTuneinReady_, aber fuer STORED_MUSIC (DLNA-Presets, Issue #30).
+// true = mindestens ein <sourceItem source="STORED_MUSIC" ... status="READY">.
+// Anders als TUNEIN ist diese Source am Speaker NICHT reboot-persistent — sie
+// haengt an unserem account/full-STORED_MUSIC-Block (gebaut aus
+// mediaServerUuids) und geht nach einem Cold-Boot verloren, waehrend der
+// Speaker die DLNA-Server weiter SIEHT (Browse ok) und TUNEIN READY bleibt.
+// Der abschliessende Quote in "STORED_MUSIC\"" grenzt sauber gegen
+// STORED_MUSIC_MEDIA_RENDERER ab. Konservativ: unerreichbar/non-200 -> true
+// (nicht faelschlich heilen wollen).
+static bool probeStoredMusicReady_(const String& ip) {
+    HTTPClient http;
+    http.setReuse(false);
+    if (!http.begin("http://" + ip + ":" + String(BOSE_BMX_PORT) + "/sources")) return true;
+    int code = http.GET();
+    if (code != 200) { http.end(); return true; }
+    String body = http.getString();
+    http.end();
+    int pos = body.indexOf("source=\"STORED_MUSIC\"");
+    while (pos >= 0) {
+        int tagEnd = body.indexOf('>', pos);
+        if (tagEnd > pos &&
+            body.substring(pos, tagEnd).indexOf("status=\"READY\"") >= 0) return true;
+        pos = body.indexOf("source=\"STORED_MUSIC\"", pos + 21);
+    }
+    return false;  // kein READY-STORED_MUSIC -> DLNA-Source-Re-Sync noetig
+}
+
 // Synthetischer, deterministischer accountId aus der SCM-MAC (deviceId), fuer
 // Speaker die (mehr) keinen margeAccountUUID haben. Numerisch (account-aehnlich),
 // pro-Speaker eindeutig, kollisionsfrei. Ohne accountId ist ein Speaker nicht
@@ -637,6 +664,37 @@ void SpeakerInventory::refreshMigrationStatus() {
             Serial.printf("[inv] auto-heal: /setMargeAccount %s acct=%s -> %d "
                           "(sources re-register on next account/full pull)\n",
                           s.ip.c_str(), s.accountId.c_str(), (int)ok);
+        }
+        // AUTO-HEAL STORED_MUSIC (Issue #30): die DLNA-Source ist — anders als
+        // TUNEIN (oben) — am Speaker NICHT reboot-persistent. Nach einem
+        // Cold-Boot (Stromausfall) kann sie fehlen, obwohl der Speaker die
+        // DLNA-Server weiter sieht (Browse + /listMediaServers ok) und TUNEIN
+        // READY bleibt -> der DLNA-Preset-Push (recordDlnaWorker_) bricht mit
+        // /select=500 1005 UNKNOWN_SOURCE ab ("speaker hardware out of sync").
+        // Der TUNEIN-Heal oben deckt das nicht ab (prueft nur TUNEIN). Hier:
+        // ist STORED_MUSIC nicht READY, refreshMediaServers (haelt unsere UUIDs
+        // frisch) + /setMargeAccount (zwingt einen account/full-Re-Pull, bei dem
+        // der Speaker STORED_MUSIC re-registriert). Nur wenn der Speaker
+        // ueberhaupt DLNA-Server hat (sonst kein DLNA-User -> kein Heal). Lab-
+        // verifiziert 2026-06-13: /select STORED_MUSIC 500 -> 200 nach diesem
+        // Pfad. Idempotent + selbstheilend ueber Cron-Ticks; sobald READY,
+        // greift es nicht mehr.
+        if (oursMigrated && !probeStoredMusicReady_(s.ip)) {
+            refreshMediaServers(s.deviceId);
+            bool haveUuids = false;
+            {
+                LockGuard g(*this);
+                if (Speaker* p = findById(s.deviceId))
+                    haveUuids = !p->mediaServerUuids.empty();
+            }
+            if (haveUuids) {
+                if (s.accountId.length() == 0)
+                    s.accountId = syntheticAccountId_(s.deviceId);
+                bool ok = margeSetAccount_(s.ip, s.accountId);
+                Serial.printf("[inv] auto-heal STORED_MUSIC: %s /setMargeAccount=%d "
+                              "(DLNA source re-registers on next account/full pull)\n",
+                              s.ip.c_str(), (int)ok);
+            }
         }
     }
     // Stale-view-fix (2026-05-26): die auto-release-Pruefung (s.u.) skipt

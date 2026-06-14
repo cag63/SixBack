@@ -1471,7 +1471,7 @@ function toggleSpeaker(ev, devId) {
   updateChevron_(card, !nowCollapsed);
   // Just expanded: fetch zone + stereo now so the rows populate without
   // waiting for the tick.
-  if (!nowCollapsed) { pollZone(devId); pollStereo(devId); }
+  if (!nowCollapsed) { pollZone(devId); pollStereo(devId); pollClock(devId); }
 }
 function setAllSpeakersOpen(open) {
   const m = speakerOpenMap_();
@@ -1668,6 +1668,7 @@ function speakerCard(s, myBase) {
           ${spotifyLine}
           <div class="speaker-zone" id="zone-${s.device_id}"></div>
           <div class="speaker-zone" id="stereo-${s.device_id}"></div>
+          <div class="speaker-zone" id="clock-${s.device_id}"></div>
         </div>
         <div class="actions">${actionButtonsHtml(s)}</div>
       </div>
@@ -2837,6 +2838,72 @@ function kickPollStereo(devIds) {
   setTimeout(doIt, 2500);
 }
 
+// ---- Clock-Display (ST20/ST30) poll + render ----
+// Toggle + Helligkeit der Geraete-Uhr-Anzeige. Polled nur fuer EXPANDIERTE
+// Karten (wie Zone/Stereo), still bei Fehler, kein Stacking. Sichtbar nur
+// wenn das Geraet ein Display hat — das Backend liefert has_clock_display
+// aus der echten capabilities.xml (ST20/ST30 true, ST10 false). Am echten
+// ST30 verifiziert 2026-06-14: userEnable=false ODER brightness=0 = aus.
+STATE.clock = {};
+STATE.clockInflight = {};
+
+async function pollClock(devId) {
+  if (STATE.clockInflight[devId]) return;
+  STATE.clockInflight[devId] = true;
+  try {
+    const v = await api(`/api/speaker/${encodeURIComponent(devId)}/clock-display`);
+    STATE.clock[devId] = v;
+    renderClockRow_(devId);
+  } catch(e) { /* speaker offline / endpoint error — silent */ }
+  finally { STATE.clockInflight[devId] = false; }
+}
+
+function renderClockRow_(devId) {
+  const row = document.getElementById('clock-' + devId);
+  if (!row) return;
+  const v = STATE.clock[devId];
+  if (!v || !v.has_clock_display) { row.innerHTML = ''; return; }
+  // Das ST20/ST30-Display kann nicht dimmen — brightnessLevel ist physisch
+  // binaer (0 = aus, jeder Wert > 0 gleich hell, am ST30 verifiziert
+  // 2026-06-14). Daher nur ein An/Aus-Schalter, kein Helligkeits-Slider.
+  const on = !!v.enabled && (v.brightness | 0) > 0;
+  row.innerHTML =
+    `<span class="zone-badge" title="Show the clock on this speaker's display (ST20/ST30)">🕒 Clock display</span>` +
+    `<label class="switch" title="Turn the clock display on/off">` +
+      `<input type="checkbox" id="clk-${esc(devId)}" ${on ? 'checked' : ''} ` +
+        `onchange="toggleClock('${esc(devId)}',this.checked)"><span class="slider"></span>` +
+    `</label>`;
+}
+
+async function toggleClock(devId, en) {
+  const cb = document.getElementById('clk-' + devId);
+  if (cb) cb.disabled = true;
+  const payload = { enabled: !!en };
+  // Beim Einschalten sicherstellen, dass die Helligkeit nicht auf 0 steht —
+  // sonst bliebe das Display trotz userEnable=true dunkel (am ST30 beide
+  // schalten ab). Dann eine sichtbare Default-Helligkeit mitsenden.
+  if (en) {
+    const cur = STATE.clock[devId];
+    if (cur && (cur.brightness | 0) === 0) payload.brightness = 70;
+  }
+  try {
+    await api(`/api/speaker/${encodeURIComponent(devId)}/clock-display`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    toast(`Clock display ${en ? 'on' : 'off'}`, 'success');
+  } catch(e) { toast('Clock toggle failed: ' + e.message, 'error'); }
+  kickPollClock(devId);
+}
+
+function kickPollClock(devIds) {
+  const ids = Array.isArray(devIds) ? devIds : [devIds];
+  const doIt = () => ids.forEach(id => pollClock(id));
+  doIt();
+  setTimeout(doIt, 800);
+  setTimeout(doIt, 2500);
+}
+
 // Speaker umbenennen (#25) — device-direct POST /name via Backend; 202 +
 // fire-and-forget auf dem ESP, danach re-poll (Name kommt aus dem Inventory).
 async function renameSpeaker(devId) {
@@ -2907,6 +2974,7 @@ function startNowPlayingPoll() {
       if (card && !card.classList.contains('collapsed')) {
         pollZone(s.device_id);
         pollStereo(s.device_id);   // ST10-gated in pollStereo selbst
+        pollClock(s.device_id);    // nur sichtbar bei ST20/ST30 (Backend-gated)
       }
     });
   };

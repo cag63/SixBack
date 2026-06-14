@@ -2220,6 +2220,160 @@ void handleNowPlayingLive(AsyncWebServerRequest* req) {
 }
 
 // -----------------------------------------------------------------------------
+// Clock-Display (Uhr-/Standby-Anzeige auf ST20/ST30) — device-direct :8090
+//   Am echten ST30 verifiziert 2026-06-14: GET/POST /clockDisplay, Body
+//   verschachtelt <clockDisplay><clockConfig timezoneInfo userEnable
+//   timeFormat userOffsetMinute brightnessLevel userUtcTime /></clockDisplay>,
+//   Content-Type text/xml. Die Uhr-Anzeige ist AUS bei userEnable="false"
+//   ODER brightnessLevel="0" (beide schalten ab, userEnable uebersteuert
+//   die Helligkeit). Gate: nur Geraete mit Display (capabilities.xml
+//   <clockDisplay>true</clockDisplay>; ST20/ST30 true, ST10 false).
+// -----------------------------------------------------------------------------
+// Extrahiert ein Attribut aus dem self-closing <clockConfig .../>-Tag
+// (eindeutig im Dokument -> simples indexOf genuegt). "" wenn nicht da.
+static String clockConfigAttr_(const String& xml, const char* attr) {
+    String needle = String(attr) + "=\"";
+    int s = xml.indexOf(needle);
+    if (s < 0) return String();
+    s += needle.length();
+    int e = xml.indexOf('"', s);
+    return e > s ? xml.substring(s, e) : String();
+}
+
+// GET /api/speaker/{id}/clock-display -> {has_clock_display, enabled, brightness}
+void handleClockDisplayGet(AsyncWebServerRequest* req) {
+    String id = pathParam(0);
+    auto& inv = sixback::SpeakerInventory::instance();
+    String spIp;
+    {
+        sixback::SpeakerInventory::LockGuard g(inv);
+        auto* sp = inv.findById(id);
+        if (!sp) { req->send(404, "application/json", "{\"error\":\"unknown deviceId\"}"); return; }
+        spIp = sp->ip;
+    }
+    String prefix = "http://" + spIp + ":" + String(BOSE_BMX_PORT);
+
+    // (1) Capability-Gate: hat das Geraet ueberhaupt eine Uhr-Anzeige?
+    bool hasDisplay = false;
+    {
+        HTTPClient h; h.setReuse(false); h.setConnectTimeout(2000); h.setTimeout(4000);
+        if (h.begin(prefix + "/capabilities")) {
+            if (h.GET() == 200) {
+                String caps = h.getString();
+                hasDisplay = (caps.indexOf("<clockDisplay>true</clockDisplay>") >= 0);
+            }
+            h.end();
+        }
+    }
+
+    JsonDocument out;
+    out["has_clock_display"] = hasDisplay;
+    // (2) aktuellen clockConfig nur lesen, wenn das Geraet ein Display hat
+    if (hasDisplay) {
+        HTTPClient h; h.setReuse(false); h.setConnectTimeout(2000); h.setTimeout(4000);
+        if (h.begin(prefix + "/clockDisplay")) {
+            if (h.GET() == 200) {
+                String xml = h.getString();
+                String ue = clockConfigAttr_(xml, "userEnable");
+                String bl = clockConfigAttr_(xml, "brightnessLevel");
+                out["enabled"]    = (ue == "true");
+                out["brightness"] = bl.length() ? bl.toInt() : 0;
+            }
+            h.end();
+        }
+    }
+    String body; serializeJson(out, body);
+    req->send(200, "application/json", body);
+}
+
+// POST /api/speaker/{id}/clock-display  body {enabled?:bool, brightness?:int}
+//   Read-modify-write: liest erst den vollen clockConfig vom Speaker,
+//   ueberschreibt NUR die gesetzten Felder und sendet den KOMPLETTEN
+//   Envelope zurueck (text/xml) — sonst fallen timezoneInfo/timeFormat/
+//   userOffsetMinute auf Defaults. Fire-and-forget-Worker (async_tcp-safe,
+//   Lesson #22), 202 sofort.
+void handleClockDisplaySet(AsyncWebServerRequest* req, JsonDocument& body) {
+    String id = pathParam(0);
+    bool hasEnabled    = !body["enabled"].isNull();
+    bool hasBrightness = !body["brightness"].isNull();
+    if (!hasEnabled && !hasBrightness) {
+        req->send(400, "application/json", "{\"error\":\"need enabled and/or brightness\"}");
+        return;
+    }
+    bool enabled    = body["enabled"] | true;
+    int  brightness = body["brightness"] | 0;
+    if (brightness < 0)   brightness = 0;
+    if (brightness > 100) brightness = 100;
+
+    String spIp;
+    {
+        auto& inv = sixback::SpeakerInventory::instance();
+        sixback::SpeakerInventory::LockGuard g(inv);
+        auto* sp = inv.findById(id);
+        if (!sp) { req->send(404, "application/json", "{\"error\":\"unknown deviceId\"}"); return; }
+        spIp = sp->ip;
+    }
+
+    struct Ctx { String ip, id; bool setEn, setBr, en; int br; };
+    Ctx* ctx = new Ctx();
+    ctx->ip = spIp; ctx->id = id;
+    ctx->setEn = hasEnabled; ctx->setBr = hasBrightness;
+    ctx->en = enabled; ctx->br = brightness;
+
+    BaseType_t rc = xTaskCreate([](void* arg) {
+        Ctx* c = (Ctx*)arg;
+        HTTPClient h;
+        h.setReuse(false); h.setConnectTimeout(2000); h.setTimeout(10000);
+        String base = "http://" + c->ip + ":" + String(BOSE_BMX_PORT) + "/clockDisplay";
+
+        // read: aktuellen clockConfig holen (read-modify-write)
+        String cur;
+        if (h.begin(base)) { if (h.GET() == 200) cur = h.getString(); h.end(); }
+        String tz  = clockConfigAttr_(cur, "timezoneInfo");
+        String ue  = clockConfigAttr_(cur, "userEnable");
+        String tf  = clockConfigAttr_(cur, "timeFormat");
+        String uom = clockConfigAttr_(cur, "userOffsetMinute");
+        String bl  = clockConfigAttr_(cur, "brightnessLevel");
+        String uut = clockConfigAttr_(cur, "userUtcTime");
+        // Defaults falls der GET fehlschlug (Felder vom echten ST30)
+        if (ue.length()  == 0) ue  = "true";
+        if (tf.length()  == 0) tf  = "TIME_FORMAT_24HOUR_ID";
+        if (uom.length() == 0) uom = "0";
+        if (bl.length()  == 0) bl  = "70";
+        if (uut.length() == 0) uut = "0";
+        // modify: nur die angeforderten Felder
+        if (c->setEn) ue = c->en ? "true" : "false";
+        if (c->setBr) bl = String(c->br);
+
+        String xml = "<clockDisplay><clockConfig";
+        if (tz.length()) { xml += " timezoneInfo=\""; xml += tz; xml += "\""; }
+        xml += " userEnable=\"";       xml += ue;  xml += "\"";
+        xml += " timeFormat=\"";       xml += tf;  xml += "\"";
+        xml += " userOffsetMinute=\""; xml += uom; xml += "\"";
+        xml += " brightnessLevel=\"";  xml += bl;  xml += "\"";
+        xml += " userUtcTime=\"";      xml += uut; xml += "\"";
+        xml += " /></clockDisplay>";
+
+        int code = -1;
+        if (h.begin(base)) {
+            h.addHeader("Content-Type", "text/xml");  // ST-Endpoints picky (vgl. /name)
+            code = h.POST(xml);
+            h.end();
+        }
+        Serial.printf("[clock] %s userEnable=%s brightness=%s HTTP %d\n",
+                      c->id.c_str(), ue.c_str(), bl.c_str(), code);
+        delete c;
+        vTaskDelete(nullptr);
+    }, "sp-clock", 8192, ctx, 1, nullptr);
+    if (rc != pdPASS) {
+        delete ctx;
+        req->send(500, "application/json", "{\"error\":\"task create failed\"}");
+        return;
+    }
+    req->send(202, "application/json", "{\"ok\":true,\"state\":\"clock-set\"}");
+}
+
+// -----------------------------------------------------------------------------
 // POST /api/speaker/{id}/dlna/preset/{slot}
 //   Records an OPAQUE STORED_MUSIC preset by emulating what a user would do
 //   at the speaker (long-press): /select the DLNA ContentItem -> wait for
@@ -3806,6 +3960,10 @@ void registerApiEndpoints(AsyncWebServer& ui) {
     routeJsonBody(ui, "^/api/speaker/([^/]+)/play-source$", HTTP_POST, handlePlaySource);
     routeT(ui, "^/api/speaker/([^/]+)/hardware-presets$", HTTP_GET, handleGetHardwarePresets);
     routeT(ui, "^/api/speaker/([^/]+)/now-playing-live$", HTTP_GET, handleNowPlayingLive);
+
+    // Clock-Display-Toggle (ST20/ST30) — device-direct GET/POST /clockDisplay
+    routeT(ui, "^/api/speaker/([^/]+)/clock-display$", HTTP_GET, handleClockDisplayGet);
+    routeJsonBody(ui, "^/api/speaker/([^/]+)/clock-display$", HTTP_POST, handleClockDisplaySet);
 
     // ZoneManager — device-direct Multiroom (BMX :8090). Eigene Schicht,
     // getrennt vom cloud-Group-Store (handlePutGroup/handleSyncGroup unten).
