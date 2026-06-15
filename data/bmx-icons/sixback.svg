@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 46 32" width="46" height="32">
+  <rect width="46" height="32" fill="#ffffff"/>
+  <text x="23" y="13" font-family="Arial,Helvetica,sans-serif" font-weight="bold" font-size="14" text-anchor="middle" fill="#000000">SIX</text>
+  <rect x="0" y="16" width="46" height="16" fill="#000000"/>
+  <text x="23" y="28" font-family="Arial,Helvetica,sans-serif" font-weight="bold" font-size="14" text-anchor="middle" fill="#ffffff">BACK</text>
+</svg>

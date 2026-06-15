@@ -740,6 +740,18 @@ static const uint8_t kPng1x1Transparent[] = {
 };
 
 void handleBmxIconStub(AsyncWebServerRequest* req) {
+    // 2026-06-15: Uniform SixBack-Branding — JEDES BMX-Service-Icon (alle Quellen:
+    // TuneIn, Custom Stations, ...) zeigt die SixBack-Wortmarke statt eines
+    // fremden Marken-Logos (TM-sauber + brandet den lokalen Cloud-Ersatz am
+    // Geraete-Display). PNG fuers ST20/30-Panel, SVG fuer die App; beides im
+    // LittleFS unter /bmx-icons/sixback.{png,svg}. Fallback: 1x1-transparent
+    // (kein 404-Spam), falls das Asset fehlt.
+    bool svg = req->url().endsWith(".svg");
+    const char* fsPath = svg ? "/bmx-icons/sixback.svg" : "/bmx-icons/sixback.png";
+    if (LittleFS.exists(fsPath)) {
+        req->send(LittleFS, fsPath, svg ? "image/svg+xml" : "image/png");
+        return;
+    }
     AsyncWebServerResponse* resp = req->beginResponse_P(
         200, "image/png", kPng1x1Transparent, sizeof(kPng1x1Transparent));
     resp->addHeader("Cache-Control", "public, max-age=86400");
