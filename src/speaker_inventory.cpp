@@ -452,6 +452,26 @@ void SpeakerInventory::activeScanTask_(void* arg) {
     vTaskDelete(nullptr);
 }
 
+void SpeakerInventory::refreshStatusTask_(void* arg) {
+    // Hintergrund-Variante des manuellen "Refresh status" (FHEM 144729 #86).
+    // refreshMigrationStatus() persistiert selbst (saveToNVS am Ende), ebenso
+    // refreshSpotifyAccounts() — daher hier kein zusaetzliches saveToNVS noetig.
+    auto* inv = static_cast<SpeakerInventory*>(arg);
+    inv->refreshMigrationStatus();
+    // Stufe-0 Diagnose: pro Speaker die Spotify-Account-Verknuepfung neu pullen
+    // (leichter BMX /sources-GET, ~3 s pro Speaker max). list() liefert eine
+    // Kopie -> sicher iterierbar waehrend refreshSpotifyAccounts die Live-Liste
+    // anfasst.
+    for (const auto& s : inv->list()) {
+        inv->refreshSpotifyAccounts(s.deviceId);
+    }
+    UBaseType_t freeBytes = uxTaskGetStackHighWaterMark(nullptr);
+    Serial.printf("[inv] background refresh-status done — stack high-water-mark=%u bytes free (of 8192)\n",
+                  (unsigned)freeBytes);
+    inv->scanRunning_.store(false);
+    vTaskDelete(nullptr);
+}
+
 MigrationStatus SpeakerInventory::detectStatus(const String& ip, const String& myBaseUrl,
                                                 String* outCloudUrl) {
     if (outCloudUrl) *outCloudUrl = "";
@@ -856,6 +876,35 @@ void SpeakerInventory::discover() {
         activeScan_();
         refreshMigrationStatus();
         saveToNVS();
+        scanRunning_.store(false);
+    }
+}
+
+void SpeakerInventory::refreshStatusesAsync() {
+    // Manueller "Refresh status": dieselbe Probe-Arbeit wie der fruehere
+    // synchrone Handler (refreshMigrationStatus + Spotify-/sources je Speaker),
+    // aber ausgelagert in eine Hintergrund-Task — sonst friert die ganze WebUI
+    // ein, weil refreshMigrationStatus je Speaker Telnet/BMX/Peer-Probe macht
+    // UND einen stale-view-Retry mit delay() bis 30 s enthaelt (FHEM 144729 #86).
+    // scanRunning_ ist *uebergreifend* fuer discover() UND diesen Refresh: der
+    // compare_exchange verhindert zwei gleichzeitige Inventory-Worker; laeuft
+    // schon einer, pollt das UI ohnehin /api/speakers bis isScanRunning()==false.
+    bool expected = false;
+    if (!scanRunning_.compare_exchange_strong(expected, true)) {
+        Serial.println("[inv] refresh-status: scan/refresh already in flight, skipping spawn");
+        return;
+    }
+    // 8192 Stack wie bg-discover: refreshMigrationStatus + Spotify-Pull fahren
+    // HTTPClient/Telnet ueber alle Speaker (lwIP-Tiefe ~1.5-2 KB).
+    BaseType_t r = xTaskCreate(refreshStatusTask_, "boseRefresh", 8192,
+                                this, 1, nullptr);
+    if (r != pdPASS) {
+        // Fallback: lieber synchron als gar nicht (praktisch nie — nur bei
+        // Heap-Erschoepfung). Blockiert dann zwar den Handler, aber besser als
+        // ein dauerhaft gesetztes scanRunning_ ohne Worker, der es je raeumt.
+        Serial.println("[inv] refresh-status: xTaskCreate failed — running synchronously");
+        refreshMigrationStatus();
+        for (const auto& s : list()) refreshSpotifyAccounts(s.deviceId);
         scanRunning_.store(false);
     }
 }

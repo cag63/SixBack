@@ -24,6 +24,7 @@
 #include "ota_pull.h"
 #include "dlna_browse.h"
 #include "auto_mode.h"
+#include "ui_auth.h"
 #include "source_normalizer.h"
 #include "bose_endpoints.h"
 #include "event_store.h"
@@ -499,17 +500,18 @@ void handleReboot(AsyncWebServerRequest* req) {
 }
 
 void handleRefreshStatus(AsyncWebServerRequest* req) {
+    // Die Probe-Arbeit (refreshMigrationStatus: Telnet/BMX/Peer-Probe je Speaker
+    // + stale-view-Retry mit delay() bis 30 s, dann Spotify-/sources je Speaker)
+    // NICHT synchron im AsyncTCP-Request-Handler ausfuehren — das blockiert den
+    // einzigen Async-TCP-Task und fror bei grossen Zonen die ganze WebUI ein
+    // (FHEM 144729 #86). Wie handleDiscover: als Background-Task starten und
+    // sofort den aktuellen Snapshot mit scan_in_progress=true zurueckgeben; das
+    // UI pollt dann /api/speakers bis scan_in_progress==false und faehrt erst
+    // danach die Per-Speaker-Phasen (hardware-presets / discard).
     auto& inv = sixback::SpeakerInventory::instance();
-    inv.refreshMigrationStatus();
-    // Stufe-0 Diagnose: bei jedem manuellen Status-Refresh auch die
-    // Spotify-Account-Verknuepfung pro Speaker neu pullen (leichter
-    // BMX /sources-GET, ~3s pro Speaker max). So bekommt der User
-    // im UI per "🔄 Status"-Click eine aktuelle Spotify-Anzeige.
-    for (const auto& s : inv.list()) {
-        inv.refreshSpotifyAccounts(s.deviceId);
-    }
+    inv.refreshStatusesAsync();
     JsonDocument doc;
-    emitSpeakers(req, doc);
+    emitSpeakers(req, doc);   // setzt scan_in_progress = isScanRunning()
 }
 
 // -----------------------------------------------------------------------------
@@ -3368,6 +3370,72 @@ void handlePutDiagShare(AsyncWebServerRequest* req, JsonDocument& body) {
 }
 
 // -----------------------------------------------------------------------------
+// Issue #31 — optionaler Web-UI-Zugriffsschutz (Digest, default AUS).
+// Gated wird ueber die Middleware am uiServer; diese Endpoints verwalten nur
+// die Konfiguration. GET gibt NIE den Passwort-Hash heraus.
+// -----------------------------------------------------------------------------
+void handleGetUiAuth(AsyncWebServerRequest* req) {
+    auto c = sixback::uiAuthLoad();
+    JsonDocument doc;
+    doc["enabled"]    = c.enabled;
+    doc["username"]   = c.username;
+    doc["configured"] = (c.username.length() > 0 && c.ha1.length() > 0);
+    doc["notice"]     = "Digest auth for the web UI only (:80). On plain-HTTP LAN the "
+                        "password is never sent in cleartext, but page content and the "
+                        "speaker's own :8090 API stay open. Deterrence, not isolation.";
+    String b; serializeJson(doc, b);
+    req->send(200, "application/json", b);
+}
+
+void handlePutUiAuth(AsyncWebServerRequest* req, JsonDocument& body) {
+    JsonDocument resp;
+    // Variante A: {username,password} → Credentials setzen (impliziert enable).
+    if (body["password"].is<const char*>()) {
+        String user = body["username"] | "";
+        String pass = body["password"] | "";
+        user.trim();
+        if (!sixback::uiAuthSetCredentials(user, pass)) {
+            resp["ok"]    = false;
+            resp["error"] = "username required and password must be at least 4 characters";
+            String b; serializeJson(resp, b);
+            req->send(400, "application/json", b);
+            return;
+        }
+    // Variante B: {enabled:bool} → nur an/aus ohne Credential-Aenderung.
+    } else if (body["enabled"].is<bool>()) {
+        if (!sixback::uiAuthSetEnabled(body["enabled"].as<bool>())) {
+            resp["ok"]    = false;
+            resp["error"] = "set a username and password before enabling protection";
+            String b; serializeJson(resp, b);
+            req->send(400, "application/json", b);
+            return;
+        }
+    } else {
+        resp["ok"]    = false;
+        resp["error"] = "provide {username,password} to set credentials, or {enabled:bool} to toggle";
+        String b; serializeJson(resp, b);
+        req->send(400, "application/json", b);
+        return;
+    }
+    auto c = sixback::uiAuthLoad();
+    resp["ok"]         = true;
+    resp["enabled"]    = c.enabled;
+    resp["username"]   = c.username;
+    resp["configured"] = (c.username.length() > 0 && c.ha1.length() > 0);
+    String b; serializeJson(resp, b);
+    req->send(200, "application/json", b);
+}
+
+void handlePostUiAuthReset(AsyncWebServerRequest* req) {
+    sixback::uiAuthReset();
+    JsonDocument resp;
+    resp["ok"]      = true;
+    resp["enabled"] = false;
+    String b; serializeJson(resp, b);
+    req->send(200, "application/json", b);
+}
+
+// -----------------------------------------------------------------------------
 // P2 — Event-Capture / Now-Playing-UI.
 //   GET  /api/events                       — all devices, latest now-playing per
 //   GET  /api/speaker/{deviceId}/now-playing  — single device
@@ -4009,6 +4077,10 @@ void registerApiEndpoints(AsyncWebServer& ui) {
 
     ui.on("/api/diag-share",         HTTP_GET,  handleGetDiagShare);
     routeJsonBody(ui, "/api/diag-share", HTTP_PUT, handlePutDiagShare);
+
+    ui.on("/api/ui-auth",            HTTP_GET,  handleGetUiAuth);
+    routeJsonBody(ui, "/api/ui-auth", HTTP_PUT, handlePutUiAuth);
+    ui.on("/api/ui-auth/reset",      HTTP_POST, handlePostUiAuthReset);
     routeJsonBody(ui, "/api/test/force-ip-change", HTTP_POST, handleTestForceIpChange);
 
     ui.on("/api/factory_reset_wifi", HTTP_POST, handleFactoryResetWifi);

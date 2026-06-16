@@ -36,6 +36,7 @@
 #include "mbedtls_psram_alloc.h"
 #include "gabbo_ws.h"
 #include "gabbo_watcher.h"
+#include "ui_auth.h"
 
 static AsyncWebServer boseServer(BOSE_HTTP_PORT);
 static AsyncWebServer uiServer(UI_HTTP_PORT);
@@ -142,6 +143,11 @@ void setup() {
     registerBoseEndpoints(boseServer);
     registerApiEndpoints(uiServer);
 
+    // Optionalen Web-UI-Zugriffsschutz (Issue #31) an den uiServer haengen —
+    // NUR :80, nie den speaker-seitigen boseServer. Default AUS; Middleware
+    // muss vor uiServer.begin() registriert sein.
+    sixback::uiAuthInit(uiServer);
+
     sixback::ipFailsafeInit();    // GOT_IP-Listener: Runtime-IP-Wechsel armt
                                   // den Recheck (VOR connectWifi, damit auch
                                   // ein spaeter Improv-Connect gefangen wird)
@@ -168,6 +174,7 @@ void loop() {
     sixback::healthTick();         // Task-WDT-feed, WiFi/Heap-Watchdog, Self-Ping
     sixback::ipFailsafeTick();     // gearmter Recheck (GOT_IP / Retry) als One-Shot-Task
     sixback::spotify::refreshTick(); // proaktiver Access-Token-Refresh, 60s-Rate-Limit intern
+    sixback::uiAuthSerialTick();   // Lockout-Recovery: "auth-reset" am USB-Serial (no-op solange Improv aktiv)
     static uint32_t lastBeat = 0;
     if (millis() - lastBeat > 30000) {
         lastBeat = millis();

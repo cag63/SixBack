@@ -142,6 +142,16 @@ public:
     // discover() weil keine IP-Scan-Phase.
     void refreshMigrationStatus();
 
+    // Wie discover(): startet refreshMigrationStatus() + Spotify-/sources-Pull
+    // je Speaker in einer FreeRTOS-Hintergrund-Task statt synchron im AsyncTCP-
+    // Handler. Grund (FHEM 144729 #86): refreshMigrationStatus blockiert je
+    // Speaker per Telnet/BMX/Peer-Probe und enthaelt einen stale-view-Retry mit
+    // delay() bis 30 s — synchron im Request-Handler fror das die ganze WebUI
+    // bei grossen Zonen ein. scanRunning_ wird gesetzt; das UI pollt
+    // /api/speakers bis isScanRunning()==false. Spawnt nicht, wenn bereits ein
+    // Scan/Refresh laeuft (compare_exchange auf scanRunning_).
+    void refreshStatusesAsync();
+
     // Liefert read-only-Kopie der Liste fuer UI/API. Lock intern.
     std::vector<Speaker> list();
 
@@ -195,6 +205,7 @@ private:
     void ssdpMSearch_();
     void activeScan_();
     static void activeScanTask_(void* arg);  // FreeRTOS entry
+    static void refreshStatusTask_(void* arg);  // FreeRTOS entry (manueller Refresh)
 
     void initMutex_();
 

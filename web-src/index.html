@@ -727,6 +727,24 @@
   </span>
 </div>
 
+<div class="automode-bar" id="uiauth-bar" style="margin-top:1em">
+  <span class="label">Web UI password:</span>
+  <label class="switch" title="Off by default — optional login for this web interface (digest auth, LAN only)">
+    <input type="checkbox" id="ua-toggle" onchange="toggleUiAuth(this.checked)">
+    <span class="slider"></span>
+  </label>
+  <span class="pill" id="ua-pill">…</span>
+  <button onclick="openUiAuthModal()" style="margin-left:.5em">Set / change password</button>
+  <span class="detail" id="ua-detail">
+    Off by default — anyone on your LAN can open this UI. When on, your browser
+    asks for a username + password (digest auth: the password is never sent in
+    cleartext, and only a hash is stored on the device). Note: page content and
+    the speaker's own controls stay reachable on the LAN — this is deterrence,
+    not network isolation. Forgot the password? Send <code>auth-reset</code>
+    over the USB serial console.
+  </span>
+</div>
+
 <!-- Modals -->
 <div class="modal" id="modal-add">
   <div class="box">
@@ -807,6 +825,26 @@
     <div class="row">
       <button onclick="closeModal('modal-group')">Cancel</button>
       <button class="primary" onclick="submitGroupSync()">Transfer</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="modal-uiauth">
+  <div class="box">
+    <h3>Web UI password</h3>
+    <p style="margin:.3em 0 .6em;font-size:.85em;color:var(--mute)">
+      Sets a username + password for this web interface. Digest auth — the
+      password is never sent in cleartext, and only a hash is stored on the
+      device. After saving, the page reloads and your browser asks you to log in.
+    </p>
+    <label>Username</label>
+    <input type="text" id="ua-user" placeholder="e.g. admin" autocomplete="username">
+    <label>Password (min 4 characters)</label>
+    <input type="password" id="ua-pass" placeholder="••••••" autocomplete="new-password">
+    <div id="ua-error" style="display:none; margin-top:10px; padding:8px 12px; border-radius:4px; background:#5a2222; color:#ffbcbc; font-size:13px; line-height:1.4;"></div>
+    <div class="row">
+      <button onclick="closeModal('modal-uiauth')">Cancel</button>
+      <button class="primary" onclick="saveUiAuthModal()">Save &amp; enable</button>
     </div>
   </div>
 </div>
@@ -924,7 +962,22 @@ function toast(msg, kind='success') {
 
 // ---- HTTP helpers ----
 async function api(path, opts={}) {
-  const r = await fetch(path, opts);
+  // Defensiv: jeder Call bekommt einen Abort-Timeout (Default 30 s), damit ein
+  // haengender Endpoint die UI nicht unbegrenzt blockiert (FHEM 144729 #86).
+  // Pro-Call ueberschreibbar via opts.timeoutMs.
+  const { timeoutMs = 30000, ...fetchOpts } = opts;
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), timeoutMs);
+  let r;
+  try {
+    r = await fetch(path, { ...fetchOpts, signal: ac.signal });
+  } catch (e) {
+    if (e && e.name === 'AbortError')
+      throw new Error('timeout after ' + Math.round(timeoutMs / 1000) + 's');
+    throw e;
+  } finally {
+    clearTimeout(t);
+  }
   let body = null;
   try { body = await r.json(); } catch(_) { body = null; }
   if (!r.ok) {
@@ -1007,6 +1060,7 @@ async function loadStatus() {
   // Auto-Mode-Bar parallel refreshen
   loadAutoMode();
   loadDiagShare();
+  loadUiAuth();
 }
 
 // ---- Auto-Mode toggle ----
@@ -1096,6 +1150,94 @@ async function toggleDiagShare(en) {
              : 'Diagnostic sharing disabled', 'success');
   } catch (e) { toast('Diag-Share toggle failed: '+e.message, 'error'); }
   loadDiagShare();
+}
+
+// ---- Web-UI password protection (Issue #31: default OFF, opt-in) ----
+// Gating itself is handled by the browser's native digest-auth dialog (the
+// server challenges any navigation to :80). These calls only manage config.
+async function loadUiAuth() {
+  try {
+    const d = await api('/api/ui-auth');
+    const bar    = document.getElementById('uiauth-bar');
+    const toggle = document.getElementById('ua-toggle');
+    const pill   = document.getElementById('ua-pill');
+    const detail = document.getElementById('ua-detail');
+    toggle.checked  = !!d.enabled;
+    toggle.disabled = false;
+    bar.classList.toggle('on',  d.enabled);
+    bar.classList.toggle('off', !d.enabled);
+    pill.className   = 'pill ' + (d.enabled ? 'migrated_us' : 'unknown');
+    pill.textContent = d.enabled ? 'ON' : 'OFF';
+    if (d.username) detail.dataset.user = d.username;   // prefill the modal next time
+  } catch (e) { /* silent — page-load tick, no toast */ }
+}
+
+async function toggleUiAuth(en) {
+  const toggle = document.getElementById('ua-toggle');
+  toggle.disabled = true;
+  if (en) {
+    // Enabling needs credentials. If none are set yet, open the modal instead
+    // of trying to enable an empty gate (the server would reject that anyway).
+    let cfg = null;
+    try { cfg = await api('/api/ui-auth'); } catch (_) {}
+    if (!cfg || !cfg.configured) {
+      toggle.checked = false;
+      toggle.disabled = false;
+      openUiAuthModal();
+      return;
+    }
+  }
+  try {
+    await api('/api/ui-auth', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({enabled: !!en})
+    });
+    if (en) {
+      // The browser hasn't been challenged yet (this page loaded without auth);
+      // a navigation reload triggers the 401 → native login dialog.
+      toast('Password protection enabled — reloading to log in…', 'success');
+      setTimeout(() => location.reload(), 1200);
+    } else {
+      toast('Password protection disabled', 'success');
+      loadUiAuth();
+    }
+  } catch (e) {
+    toast('Toggle failed: ' + e.message, 'error');
+    loadUiAuth();
+  }
+}
+
+function openUiAuthModal() {
+  document.getElementById('ua-error').style.display = 'none';
+  document.getElementById('ua-pass').value = '';
+  const u = document.getElementById('ua-user');
+  if (!u.value) u.value = document.getElementById('ua-detail').dataset.user || '';
+  openModal('modal-uiauth');
+}
+
+async function saveUiAuthModal() {
+  const user = document.getElementById('ua-user').value.trim();
+  const pass = document.getElementById('ua-pass').value;
+  const err  = document.getElementById('ua-error');
+  if (!user || pass.length < 4) {
+    err.textContent = 'Username required and password must be at least 4 characters.';
+    err.style.display = 'block';
+    return;
+  }
+  try {
+    await api('/api/ui-auth', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username: user, password: pass})
+    });
+    closeModal('modal-uiauth');
+    toast('Password set — reloading to log in…', 'success');
+    setTimeout(() => location.reload(), 1200);
+  } catch (e) {
+    err.textContent = e.message;
+    err.style.display = 'block';
+  }
 }
 
 // ---- OTA (Firmware-Tile) ----
@@ -4079,6 +4221,9 @@ async function actSpeaker(devId, action) {
         const sr = await api('/api/speakers/refresh-status', {method:'POST'});
         STATE.speakers = sr.speakers || STATE.speakers;
         renderSpeakers();
+        // Probe laeuft als Hintergrund-Task (FHEM 144729 #86) — abwarten, damit
+        // der angezeigte Status frisch ist statt der Vor-Probe-Snapshot.
+        if (sr.scan_in_progress) await waitForScanDone();
         const me = STATE.speakers.find(s => s.device_id === devId);
         progressStep('status', 'done', me ? me.status : '');
       } catch (e) { progressStep('status', 'error', e.message); progressDone(); return; }
@@ -4651,6 +4796,23 @@ async function pollUntilScanDone() {
   toast('Scan still running — UI will refresh on next /api/status tick', 'error');
 }
 
+// Wartet bis ein Hintergrund-Probe/Scan (scan_in_progress) fertig ist und haelt
+// STATE.speakers dabei aktuell. Liefert true bei Abschluss, false bei Timeout.
+// Verwendet von den Progress-Modal-Flows (Refresh status), die einen bool statt
+// Toasts brauchen. Ceiling Default 40 x 3 s = 120 s — deckt eine grosse Zone
+// inkl. des 30-s-stale-view-Retry in refreshMigrationStatus ab.
+async function waitForScanDone(maxIters = 40, intervalMs = 3000) {
+  for (let i = 0; i < maxIters; ++i) {
+    await new Promise(res => setTimeout(res, intervalMs));
+    let r;
+    try { r = await api('/api/speakers'); } catch (_) { continue; }
+    STATE.speakers = r.speakers || STATE.speakers;
+    renderSpeakers();
+    if (!r.scan_in_progress) return true;
+  }
+  return false;
+}
+
 // Global "🔄 Refresh status" toolbar button. Three phases per modal:
 //   1. Inventory probe (Telnet/IP/cloud) — once for all speakers
 //   2. Per-speaker /hardware-presets pull — refreshes "on speaker" row
@@ -4673,13 +4835,21 @@ async function refreshStatuses() {
   }
   progressBar(1);
 
-  // Phase 1: bulk inventory refresh.
+  // Phase 1: bulk inventory refresh. Der POST startet die Probe jetzt als
+  // Hintergrund-Task und kehrt sofort mit scan_in_progress=true zurueck (FHEM
+  // 144729 #86) — wir pollen /api/speakers bis sie fertig ist, sonst liefen die
+  // Per-Speaker-Phasen gegen veraltete Status.
   progressStep('inv', 'running');
   try {
     const sr = await api('/api/speakers/refresh-status', {method: 'POST'});
     STATE.speakers = sr.speakers || STATE.speakers;
     renderSpeakers();
-    progressStep('inv', 'done', `${(sr.speakers || []).length} probed`);
+    if (sr.scan_in_progress && !(await waitForScanDone())) {
+      progressStep('inv', 'error', 'probe still running — try again in a moment');
+      progressDone(0);
+      return;
+    }
+    progressStep('inv', 'done', `${(STATE.speakers || []).length} probed`);
   } catch (e) {
     progressStep('inv', 'error', e.message);
     progressDone(0);
