@@ -126,6 +126,13 @@ void startImprovMode() {
     // toleranter, C6 strikter — daher symptomatisch nur C6-Boards.
     // POLICY_MANUAL stellt sicher dass der Connect-Pfad NICHT per
     // Beacon-Override auf einen restriktiveren Channel-Set zurueckfaellt.
+    // 2026-06-17: KEIN C5-Sonderfall hier. Vermutet wurde, die 2.4-GHz-MANUAL-
+    // Config (schan=1/nchan=13) breche auf dem C5 den 5-GHz-Reconnect — das war
+    // falsch: der C5 verbindet sich damit problemlos initial auf 5 GHz (ch40),
+    // und der beobachtete Reconnect-Fehler ist `Reason 210 =
+    // NO_AP_FOUND_W_COMPATIBLE_SECURITY` (esp-idf station-scenarios), d.h. der
+    // AP WIRD gefunden, aber wegen Security/PMF-Mismatch abgelehnt — KEIN
+    // Band-/Scan-Problem. POLICY_AUTO half daher nicht und wurde zurueckgenommen.
     {
         wifi_country_t c = {
             .cc      = "DE",
@@ -185,6 +192,19 @@ void startImprovMode() {
 // das Window, damit niemand mitten im Provisioning rausgekickt wird.
 void improvTickInternal() {
     if (!improvActive) return;
+    // Wedge-Guard (Fix 2026-07-02): der Improv-Core hat ein HARTES 120-s-
+    // Wall-Clock-Fenster (IMPROV_RUN_FOR; "once false, stays false until
+    // reboot") und drained nach dem Disarm den RX nicht mehr. Jedes weitere
+    // Host-Byte hielte dann via Serial.available() unser Idle-Fenster ewig
+    // offen -> die provisionWifi()-Warteschleife erreichte den Restart-
+    // Fallback nie und das unprovisionierte Geraet hinge dunkel (kein SoftAP,
+    // kein Reboot). Also: Core-Fenster zu -> RX verwerfen, Fenster schliessen.
+    if (millis() - improvStartMs > IMPROV_RUN_FOR) {
+        while (Serial.available()) Serial.read();
+        Serial.println("[improv] core wall-clock window closed — closing improv window");
+        improvActive = false;
+        return;
+    }
     if (Serial.available()) improvLastActivityMs = millis();
     improvSerial.handleSerial();
     const uint32_t idle = millis() - improvLastActivityMs;
@@ -265,6 +285,23 @@ void provisionWifi() {
         delay(10);
     }
     captiveStop();
+
+    if (WiFi.status() == WL_CONNECTED) {
+        // Fix Port-80-Bind-Race (2026-07-02, HW-verifiziert am C5): der
+        // Captive-AsyncWebServer haelt das Port-80-Binding nach end() noch
+        // Sekunden im lwIP-Close-Lag — uiServer.begin() im weiteren setup()
+        // bindet dann ins Leere (AsyncWebServer meldet Bind-Fail nicht) und
+        // die Web-UI bleibt bis zum naechsten Reboot tot, waehrend :8000 und
+        // ICMP normal laufen. Der User haelt das Provisioning fuer
+        // gescheitert, obwohl es geklappt hat. Creds sind hier bereits
+        // persistiert (captiveTick-Success-Zweig bzw. onImprovConnected) →
+        // kontrollierter Neustart in den sauberen, getesteten NVS-Boot-Pfad
+        // statt Port-80-Roulette. successHtml kuendigt den Restart an
+        // (Redirect nach ~35 s).
+        Serial.println("[provision] captive-phase connect OK — restart into clean NVS boot");
+        delay(500);   // Serial-Flush
+        ESP.restart();
+    }
 
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("[provision] all windows expired, no provisioning — restart in 10s");

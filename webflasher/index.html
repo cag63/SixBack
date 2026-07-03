@@ -128,10 +128,15 @@
 <div class="ok">
   <strong>Recommended hardware: ESP32-S3-DevKitC-1-N16R8</strong> —
   16 MB flash, 8 MB PSRAM, mature WiFi 5 stack.  In extended end-to-end
-  testing this was the most robust target.  ESP32 / C3 / C6 work too
+  testing this was the most robust target.  ESP32 / C3 / C6 / C5 work too
   (factory image auto-selected), but the C6's WiFi 6 stack occasionally
   needed a second boot to discover all speakers, and the 4-MB targets
-  are tight on flash for future features.
+  are tight on flash for future features.<br>
+  <br>
+  <strong>Only the ESP32-C5 speaks dual-band 2.4 / 5&nbsp;GHz WiFi&nbsp;6</strong> —
+  pick it if your network runs on 5&nbsp;GHz. Every other target is 2.4&nbsp;GHz
+  only (the C6 is WiFi&nbsp;6 but 2.4&nbsp;GHz only). The C5 image is auto-selected
+  by chip family just like the rest.
 </div>
 
 <div class="warn">
@@ -216,7 +221,7 @@ slots, push to the speaker.</p>
     document.getElementById('ver').textContent = m.version || '?';
     // S3 first + visually marked as recommended. esp-web-tools picks the right
     // image by chip-family automatically; the order here is purely cosmetic.
-    const order = ['ESP32-S3', 'ESP32', 'ESP32-C3', 'ESP32-C6'];
+    const order = ['ESP32-S3', 'ESP32', 'ESP32-C3', 'ESP32-C6', 'ESP32-C5'];
     const sorted = (m.builds || []).slice().sort(
       (a, b) => order.indexOf(a.chipFamily) - order.indexOf(b.chipFamily));
     document.getElementById('targets').innerHTML = sorted.map(b => {

@@ -171,6 +171,12 @@ void handleStatus(AsyncWebServerRequest* req) {
     wifi["ssid"]      = WiFi.SSID();
     wifi["ip"]        = WiFi.localIP().toString();
     wifi["rssi"]      = WiFi.RSSI();
+    // Kanal + Band-Sichtbarkeit (v0.8.28, ESP32-C5-Dualband): Kanal 1-14 = 2.4 GHz,
+    // >=36 = 5 GHz. WiFi.getBand() ist im Framework per #if SOC_WIFI_SUPPORT_5G
+    // gekapselt -> liefert auf 2.4-only-Chips (esp32/s3/c3/c6) immer WIFI_BAND_2G,
+    // also cross-target sicher. Beantwortet "auf welchem Band haengt das Geraet?".
+    wifi["channel"]   = WiFi.channel();
+    wifi["band"]      = (WiFi.getBand() == WIFI_BAND_5G) ? "5GHz" : "2.4GHz";
     wifi["mac"]       = WiFi.macAddress();
     wifi["hostname"]  = String(MDNS_HOSTNAME) + ".local";
     wifi["improv_active"]   = sixback::improvIsActive();
@@ -190,7 +196,8 @@ void handleStatus(AsyncWebServerRequest* req) {
     chip["model"]     = info.model == CHIP_ESP32S3 ? "ESP32-S3" :
                         info.model == CHIP_ESP32   ? "ESP32"    :
                         info.model == CHIP_ESP32C3 ? "ESP32-C3" :
-                        info.model == CHIP_ESP32C6 ? "ESP32-C6" : "?";
+                        info.model == CHIP_ESP32C6 ? "ESP32-C6" :
+                        info.model == CHIP_ESP32C5 ? "ESP32-C5" : "?";
     chip["cores"]     = info.cores;
     chip["revision"]  = info.revision;
     // Layout-Identitaet (Issue #23): unterscheidet die 16-MB- von der
@@ -261,7 +268,11 @@ void handleSpeakersList(AsyncWebServerRequest* req) {
 }
 
 void discoverWorker_(void* /*arg*/) {
-    sixback::SpeakerInventory::instance().discover();
+    // Expliziter User-Discover: IMMER den vollen /24-Active-Scan fahren — der
+    // User will neue/umgezogene Speaker finden. (Der Boot-Auto-Mode-Pass ruft
+    // discover() ohne force und ueberspringt den Scan, wenn alles erreichbar
+    // + klassifiziert ist; siehe speaker_inventory.h discover().)
+    sixback::SpeakerInventory::instance().discover(/*forceActiveScan=*/true);
     // Stack-Headroom messen, bevor sich der Task selbst loescht. ESP-IDF gibt
     // den High-Water-Mark in Bytes zurueck (= kleinster je freier Stack-Rest).
     // Diente zur Verifikation des bg-discover-Stack-Overflow-Fixes (v0.8.4);

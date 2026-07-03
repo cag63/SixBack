@@ -126,7 +126,14 @@ public:
     // Sinn: HTTP-Handler kann sofort eine response mit "was wir bisher
     // wissen" liefern; das UI pollt anschliessend /api/speakers bis
     // isScanRunning() wieder false ist.
-    void discover();
+    //
+    // Der /24-Active-Scan laeuft NUR, wenn er etwas finden kann
+    // (activeScanWorthwhile_: leeres Inventory oder ein OFFLINE/UNKNOWN-
+    // Speaker) ODER forceActiveScan=true (expliziter User-Discover via
+    // POST /api/speakers/discover). Sind alle bekannten Speaker erreichbar +
+    // klassifiziert, wird der Scan uebersprungen — spart ~66 s + Heap-Druck
+    // (auf no-PSRAM-C5 sonst heap_reboot beim Boot-Auto-Mode-Pass).
+    void discover(bool forceActiveScan = false);
 
     // Lightweight-Discovery fuer periodische Cron-Checks: NUR knownIpProbe
     // + SSDP-Burst + refreshMigrationStatus (~6 s total). KEIN /24-Active-
@@ -203,6 +210,10 @@ private:
                   ProbeFailure* failOut = nullptr);
     void knownIpProbe_();
     void ssdpMSearch_();
+    // True, wenn der /24-Active-Scan etwas finden kann (siehe discover()):
+    // leeres Inventory oder mind. ein OFFLINE/UNKNOWN-Speaker. Nach der
+    // Sync-Phase auszuwerten.
+    bool activeScanWorthwhile_();
     void activeScan_();
     static void activeScanTask_(void* arg);  // FreeRTOS entry
     static void refreshStatusTask_(void* arg);  // FreeRTOS entry (manueller Refresh)

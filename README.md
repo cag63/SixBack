@@ -17,7 +17,7 @@ No subscription, no account, no Bose servers.  One USB stick on your LAN.
 > functionality is preserved; the rename reflects the project's identity
 > independent of any Bose trademark.
 
-## Status (v0.8.27)
+## Status (v0.8.28)
 
 | Component                                                            | State                                                                                                              |
 | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
@@ -78,7 +78,8 @@ No subscription, no account, no Bose servers.  One USB stick on your LAN.
 | **ESP32-C6 WPA2 reliability**                                        | working — `WiFi.setSleep(WIFI_PS_NONE)` + `setAutoReconnect(true)` applied **before** `WiFi.begin()`; closes 4-Way-Handshake-Timeout on WPA2-Mixed APs |
 | System health — Task-WDT, WiFi / heap watchdog, crash counter, self-ping | working                                                                                                        |
 | **Discovery stack-safety** (v0.8.5)                                  | working — the background discovery worker no longer overruns its task stack on setups with many speakers: SSDP responder collection and per-speaker probing now run in separate stack frames and the worker stack was enlarged. Fixes a stack-canary crash that rebooted the device mid-scan and left discovery finding 0 speakers (manual add still worked). Verified across S3 / C6 / C3 |
-| Builds for **ESP32-S3 ★ / ESP32-C3 / ESP32-C6 / ESP32-classic**      | working — S3 is the recommended target; ESP32-classic re-enabled (`scripts/fs_exclude_esp32.py` trims the Spotify-only `silence.mp3` from its LittleFS image so the Web UI fits the 256 KB spiffs slot of `partitions-4mb.csv`) |
+| **ESP32-C5 dual-band target** (v0.8.28)                              | working — `c5` build for the ESP32-C5 (RISC-V, dual-band Wi-Fi 6). Verified end-to-end on real C5 silicon (rev v1.0): boots from the C5's `0x2000` bootloader offset, connects on **5 GHz** (channel 40), Web UI + provisioning + OTA-check all work. 4 MB / no-PSRAM devkit → C6-equivalent config; `/api/status` now reports `band` + `channel`. Factory-image merge uses esptool ≥ 5 (4.x has no esp32c5 target) |
+| Builds for **ESP32-S3 ★ / ESP32-C5 / ESP32-C3 / ESP32-C6 / ESP32-classic** | working — S3 is the recommended target; ESP32-classic re-enabled (`scripts/fs_exclude_esp32.py` trims the Spotify-only `silence.mp3` from its LittleFS image so the Web UI fits the 256 KB spiffs slot of `partitions-4mb.csv`) |
 | ESP-Web-Tools landing page (auto-detects chip)                       | working — <https://sixback.io/>                                                                                    |
 
 ## Install (recommended)
@@ -174,6 +175,7 @@ page auto-redirects to the device's freshly assigned LAN IP via
 | ESP32         | `esp32dev` (DevKitC-1)           | 4 MB  | classic — **shipped again** (v0.8.x); `scripts/fs_exclude_esp32.py` trims the Spotify-only `silence.mp3` from its LittleFS image so the gzipped Web UI fits the 256 KB spiffs slot |
 | ESP32-C3      | `esp32-c3-devkitm-1`             | 4 MB  | flashes over the chip's built-in USB-Serial-JTAG                 |
 | ESP32-C6      | `esp32-c6-devkitc-1`             | 4 MB  | WiFi 6 — works, but cold-start discovery occasionally drops SSDP-multicast packets and rare HTTP-server hangs need a reset |
+| ESP32-C5      | `esp32-c5-devkitc1-n4`          | 4 MB  | **dual-band Wi-Fi 6 (2.4 + 5 GHz)** — native USB-Serial-JTAG; verified connecting on 5 GHz (channel 40; `band`/`channel` shown in `/api/status`). 4 MB / no-PSRAM devkit, A/B-OTA like C3/C6. **Note:** the C5 second-stage bootloader lives at flash `0x2000` (not `0x0`), and merging its factory image needs esptool ≥ 5. 8 MB+PSRAM C5 boards (e.g. Seeed XIAO ESP32-C5) would warrant a separate build target |
 
 **S3 is the recommended target for distribution.** During the 4-phase
 end-to-end test (S3 ↔ C6 ping-pong with full erase/flash/provision each
@@ -191,7 +193,7 @@ every release.  ESP32-classic is published again: `scripts/fs_exclude_esp32.py`
 strips the Spotify-only `silence.mp3` stub from its LittleFS image so the
 gzipped Web UI fits the 256 KB spiffs slot of `partitions-4mb.csv`.
 
-All four targets share the same source tree and the same Web UI; the
+All targets share the same source tree and the same Web UI; the
 PlatformIO `extends = common` mechanism keeps the per-target diff small
 ([`platformio.ini`](platformio.ini)).
 

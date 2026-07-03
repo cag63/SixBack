@@ -12,7 +12,14 @@ namespace sixback {
 
 namespace {
 
-constexpr uint32_t  CAPTIVE_WINDOW_MS = 5 * 60 * 1000;   // 5 min idle
+// Idle-Fenster: jeder HTTP-Request des Portals touched startMs (siehe
+// captiveTouch_). Bis 2026-07-02 war das Fenster ABSOLUT ab captiveStart —
+// das Portal starb nach 5 min auch mitten in der User-Eingabe (danach
+// ESP.restart via provisionWifi = "Reboot-Schleife waehrend der Eingabe").
+// Das Hard-Cap verhindert, dass periodische OS-Captive-Detection-Pings
+// eines haengengebliebenen Clients das Fenster ewig offen halten.
+constexpr uint32_t  CAPTIVE_WINDOW_MS  =  5 * 60 * 1000;   // 5 min idle
+constexpr uint32_t  CAPTIVE_HARDCAP_MS = 30 * 60 * 1000;   // absolutes Cap
 constexpr uint16_t  CAPTIVE_PORT      = 80;
 constexpr uint16_t  DNS_PORT          = 53;
 const     IPAddress AP_IP(192, 168, 4, 1);
@@ -26,7 +33,8 @@ const     IPAddress AP_NETMASK(255, 255, 255, 0);
 DNSServer       dnsServer;
 AsyncWebServer* captiveServer = nullptr;
 bool            active        = false;
-uint32_t        startMs       = 0;
+uint32_t        startMs       = 0;   // idle-Fenster-Anker, per captiveTouch_ verlaengert
+uint32_t        hardStartMs   = 0;   // absoluter Fenster-Anker (Hard-Cap)
 String          apSsid;
 String          provisionedSta;   // empty = pending, "x.x.x.x" once STA up
 
@@ -40,6 +48,48 @@ String      saveSsid;
 String      savePsk;
 uint32_t    saveStartMs    = 0;
 constexpr uint32_t SAVE_TIMEOUT_MS = 20 * 1000;
+
+// Jeder Portal-HTTP-Request verlaengert das Idle-Fenster.
+void captiveTouch_() { startMs = millis(); }
+
+// Async-Scan-State-Machine (Fix 2026-07-02). Der fruehere handleScan pollte
+// scanComplete() bis 15 s IM async_tcp-Task. Der ist per Default am Task-WDT
+// subscribed (CONFIG_ASYNC_TCP_USE_WDT, 5 s, trigger_panic) und feedet nur
+// ZWISCHEN Events — delay() im Handler yieldet, fuettert aber nicht. Auf dem
+// C5 dauert der Dual-Band-Scan ~9 s -> jeder Portal-Seitenaufruf (formHtml
+// feuert fetch('/scan') automatisch) panic-rebootete das Geraet nach exakt
+// 5 s (HW-verifiziert am C5, UART0: "task_wdt: - async_tcp" -> rst:0xc).
+// 2,4-GHz-Chips blieben mit ~4 s Scan knapp unter der Grenze. Daher jetzt:
+// Handler kickt nur an und antwortet sofort (rc:-1), captiveTick() pollt im
+// loop-Task, das Formular-JS pollt /scan bis rc >= 0.
+//
+// Ergebnis-Puffer bewusst festes char[] statt Arduino-String: geschrieben im
+// loop-Task (captiveTick), gelesen im async_tcp-Handler (Cross-Task-Regel).
+// State-Uebergaenge: Idle->Running nur im Handler, Running->Ready nur im
+// Tick, Ready->Idle nur im Handler — der Puffer wird nie beschrieben,
+// waehrend ein Handler ihn lesen kann.
+enum class ScanState : uint8_t { Idle, Running, Ready };
+volatile ScanState scanState = ScanState::Idle;
+char scanJsonBuf[3072] = "{\"networks\":[],\"rc\":0}";
+
+void buildScanJson_(int n) {
+    size_t off = (size_t)snprintf(scanJsonBuf, sizeof(scanJsonBuf), "{\"networks\":[");
+    for (int i = 0; i < n && off + 100 < sizeof(scanJsonBuf); ++i) {
+        char ssid[68]; size_t k = 0;
+        String s = WiFi.SSID(i);
+        for (size_t j = 0; j < s.length() && k < sizeof(ssid) - 2; ++j) {
+            char ch = s[j];
+            if (ch == '"' || ch == '\\') ssid[k++] = '\\';
+            ssid[k++] = ch;
+        }
+        ssid[k] = 0;
+        off += (size_t)snprintf(scanJsonBuf + off, sizeof(scanJsonBuf) - off,
+                                "%s{\"ssid\":\"%s\",\"rssi\":%d,\"open\":%s}",
+                                i ? "," : "", ssid, (int)WiFi.RSSI(i),
+                                WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "true" : "false");
+    }
+    snprintf(scanJsonBuf + off, sizeof(scanJsonBuf) - off, "],\"rc\":%d}", n);
+}
 
 // Minimal-HTML Form (~1.2 KB), keine externen Assets — funktioniert ohne
 // Internet, was im Captive-Portal Pflicht ist.
@@ -62,18 +112,22 @@ String formHtml() {
 "<label>SSID</label><input type=\"text\" id=\"ssid\" name=\"ssid\" required>"
 "<label>Password</label><input type=\"password\" name=\"psk\" placeholder=\"(empty for open networks)\">"
 "<button type=\"submit\">Save &amp; connect</button></form>"
-"<script>fetch('/scan').then(r=>r.json()).then(d=>{"
+"<script>function ld(t){fetch('/scan').then(r=>r.json()).then(d=>{"
+"if(d.rc===-1){if(t<30)setTimeout(()=>ld(t+1),1000);return;}"
 "const s=document.getElementById('pick');"
 "s.innerHTML='<option value=\"\">\xe2\x80\x94 pick one \xe2\x80\x94</option>'+"
 "(d.networks||[]).map(n=>`<option value=\"${n.ssid}\">${n.ssid} (${n.rssi} dBm${n.open?', open':''})</option>`).join('');"
-"});</script></body></html>");
+"}).catch(()=>{if(t<30)setTimeout(()=>ld(t+1),1500);});}ld(0);</script></body></html>");
 }
 
 String successHtml(const String& staIp) {
     String h = F(
 "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
 "<title>SixBack \xe2\x80\x94 Connected</title>"
-"<meta http-equiv=\"refresh\" content=\"20;url=http://");
+// 35 s statt 20 s: nach dem Captive-Success rebootet das Geraet kontrolliert
+// in den NVS-Boot-Pfad (Port-80-Bind-Fix, siehe provisionWifi) — Reconnect +
+// uiServer brauchen zusammen ~10-15 s, erst dann ist das Redirect-Ziel da.
+"<meta http-equiv=\"refresh\" content=\"35;url=http://");
     h += staIp;
     h += F("/\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
 "<style>body{font:-apple-system,Segoe UI,sans-serif;max-width:28em;margin:1.5em auto;padding:0 1em;color:#222;background:#f7f6f3}"
@@ -84,15 +138,17 @@ String successHtml(const String& staIp) {
     h += F("/\">http://");
     h += staIp;
     h += F("/</a> (or <code>http://sixback.local/</code>).</p>"
-"<p><b>Switch your phone back to your normal Wi-Fi.</b> This page will "
-"redirect there automatically in 20 seconds \xe2\x80\x94 which of course "
-"only works once you are on the right network.</p>"
+"<p><b>Switch your phone back to your normal Wi-Fi.</b> SixBack restarts "
+"once to finish setup; this page will redirect automatically in about half "
+"a minute \xe2\x80\x94 which of course only works once you are on the right "
+"network.</p>"
 "<p style=\"color:#777;font-size:.85em\">SixBack " FW_VERSION_STRING "</p>"
 "</body></html>");
     return h;
 }
 
 void handleRoot(AsyncWebServerRequest* req) {
+    captiveTouch_();
     if (provisionedSta.length() > 0) {
         req->send(200, "text/html; charset=utf-8", successHtml(provisionedSta));
         return;
@@ -101,35 +157,21 @@ void handleRoot(AsyncWebServerRequest* req) {
 }
 
 void handleScan(AsyncWebServerRequest* req) {
-    // ASYNC scan + Polling im Handler.  Sync-scanNetworks() blockiert auf
-    // arduino-esp32 im AP_STA- (Captive aktiv) oder STA-connected-Mode
-    // unbestimmt lange — wir haben live verifiziert dass er > 60 s nicht
-    // zurueckkehrt.  Async + scanComplete()-Polling liefert die Liste in
-    // ~4 s zuverlaessig.
-    WiFi.scanDelete();
-    delay(50);
-    WiFi.scanNetworks(/*async=*/true, /*show_hidden=*/false);
-    uint32_t t0 = millis();
-    int n = WIFI_SCAN_RUNNING;
-    while (millis() - t0 < 15000) {
-        n = WiFi.scanComplete();
-        if (n >= 0 || n == WIFI_SCAN_FAILED) break;
-        delay(200);
+    // NIE im Handler auf den Scan warten (Task-WDT-Panic, siehe Kommentar an
+    // der ScanState-Machine oben). Sync-scanNetworks() waere noch schlimmer:
+    // blockiert im AP_STA-Mode > 60 s (live verifiziert).
+    captiveTouch_();
+    if (scanState == ScanState::Ready) {
+        req->send(200, "application/json", scanJsonBuf);
+        scanState = ScanState::Idle;   // one-shot: naechster Aufruf scannt frisch
+        return;
     }
-    String body = "{\"networks\":[";
-    if (n > 0) {
-        for (int i = 0; i < n; ++i) {
-            if (i) body += ",";
-            String ssid = WiFi.SSID(i);
-            ssid.replace("\"", "\\\"");
-            body += "{\"ssid\":\"" + ssid + "\",\"rssi\":" + String(WiFi.RSSI(i))
-                  + ",\"open\":" + (WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "true" : "false")
-                  + "}";
-        }
+    if (scanState == ScanState::Idle) {
+        WiFi.scanDelete();
+        WiFi.scanNetworks(/*async=*/true, /*show_hidden=*/false);
+        scanState = ScanState::Running;
     }
-    body += "],\"rc\":" + String(n) + "}";
-    WiFi.scanDelete();
-    req->send(200, "application/json", body);
+    req->send(200, "application/json", "{\"networks\":[],\"rc\":-1}");
 }
 
 String progressHtml(const String& ssid) {
@@ -164,6 +206,7 @@ String progressHtml(const String& ssid) {
 }
 
 void handleSave(AsyncWebServerRequest* req) {
+    captiveTouch_();
     if (!req->hasParam("ssid", true)) {
         req->send(400, "text/plain", "Missing ssid");
         return;
@@ -189,6 +232,7 @@ void handleSave(AsyncWebServerRequest* req) {
 }
 
 void handleSaveStatus(AsyncWebServerRequest* req) {
+    captiveTouch_();
     const char* st = "idle";
     switch (saveState) {
         case SaveState::Idle:       st = "idle";       break;
@@ -211,6 +255,7 @@ void handleSaveStatus(AsyncWebServerRequest* req) {
 }
 
 void handleCaptiveRedirect(AsyncWebServerRequest* req) {
+    captiveTouch_();
     req->redirect("http://" + AP_IP.toString() + "/");
 }
 
@@ -257,12 +302,14 @@ void captiveStart() {
     captiveServer->begin();
 
     active  = true;
-    startMs = millis();
+    startMs     = millis();
+    hardStartMs = startMs;
     provisionedSta = "";
     saveState = SaveState::Idle;
     saveSsid  = "";
     savePsk   = "";
     saveStartMs = 0;
+    scanState = ScanState::Idle;
 }
 
 void captiveStop() {
@@ -283,6 +330,18 @@ void captiveTick() {
     if (!active) return;
     dnsServer.processNextRequest();
 
+    // Async-Scan antreiben (laeuft im loop-Task, NIE im async_tcp-Handler —
+    // Task-WDT, siehe ScanState-Kommentar).
+    if (scanState == ScanState::Running) {
+        const int n = WiFi.scanComplete();
+        if (n >= 0 || n == WIFI_SCAN_FAILED) {
+            buildScanJson_(n);
+            WiFi.scanDelete();
+            scanState = ScanState::Ready;
+            Serial.printf("[captive] scan done, rc=%d\n", n);
+        }
+    }
+
     // Async-Save-State-Machine antreiben.
     if (saveState == SaveState::Connecting) {
         if (WiFi.status() == WL_CONNECTED) {
@@ -298,9 +357,16 @@ void captiveTick() {
         }
     }
 
-    if (millis() - startMs > CAPTIVE_WINDOW_MS) {
-        Serial.println("[captive] window expired");
-        captiveStop();
+    // Fenster-Expiry: idle-basiert + Hard-Cap. Ein laufender Connect-Versuch
+    // blockiert das Expiry — sonst risse der Fenster-Ablauf einen /save kurz
+    // vor Schluss ab, BEVOR persistCreds je gelaufen ist (Creds-Loss-Race:
+    // korrektes Passwort, aber nie gespeichert -> Endlosschleife).
+    if (saveState != SaveState::Connecting) {
+        const bool hardExpired = millis() - hardStartMs > CAPTIVE_HARDCAP_MS;
+        if (hardExpired || millis() - startMs > CAPTIVE_WINDOW_MS) {
+            Serial.printf("[captive] window expired (%s)\n", hardExpired ? "hard-cap" : "idle");
+            captiveStop();
+        }
     }
 }
 

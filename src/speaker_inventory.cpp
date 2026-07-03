@@ -847,7 +847,24 @@ void SpeakerInventory::discoverSync() {
                   (unsigned)speakers_.size());
 }
 
-void SpeakerInventory::discover() {
+// Entscheidet, ob der teure /24-Active-Scan ueberhaupt etwas finden kann.
+// Er lohnt nur, wenn (a) noch gar keine Speaker bekannt sind, oder (b) ein
+// bekannter Speaker nach der Sync-Phase OFFLINE/UNKNOWN ist — der koennte per
+// DHCP auf eine neue IP gewandert sein, die der Scan per deviceID wiederfindet.
+// Sind alle bekannten Speaker erreichbar + klassifiziert (MIGRATED/
+// NOT_MIGRATED/SETTLING), findet der Scan nichts Neues. Wird NACH der
+// Sync-Phase ausgewertet, damit die Status frisch sind.
+bool SpeakerInventory::activeScanWorthwhile_() {
+    LockGuard g(*this);
+    if (speakers_.empty()) return true;
+    for (const auto& s : speakers_) {
+        if (s.status == MigrationStatus::OFFLINE ||
+            s.status == MigrationStatus::UNKNOWN) return true;
+    }
+    return false;
+}
+
+void SpeakerInventory::discover(bool forceActiveScan) {
     // scanRunning_ ist *uebergreifend* fuer Sync-Phase + Active-Scan-Phase:
     // damit handleDiscover() im HTTP-Handler sofort returnen kann, das UI
     // scan_in_progress sieht und solange pollt bis beide Phasen durch sind.
@@ -865,6 +882,22 @@ void SpeakerInventory::discover() {
     refreshMigrationStatus();
     Serial.printf("[inv] sync phase done, %u speakers known\n",
                   (unsigned)speakers_.size());
+
+    // Der /24-Active-Scan ist teuer: 254 HTTP-Probes (~66 s) und auf RAM-
+    // knappen no-PSRAM-Targets (C5, 261 KB Heap) drueckt er free-heap an die
+    // Health-Watchdog-Schwelle (-> heap_reboot). Nur laufen lassen, wenn er
+    // etwas finden kann: expliziter User-Discover (forceActiveScan) ODER
+    // activeScanWorthwhile_(). Sind nach der Sync-Phase alle bekannten Speaker
+    // erreichbar + klassifiziert (typischer Boot-Pass: alle laengst migriert),
+    // ist der Scan reine Heap-/Zeit-/Log-Spam-Verschwendung -> ueberspringen.
+    if (!forceActiveScan && !activeScanWorthwhile_()) {
+        Serial.printf("[inv] %u known speakers all reachable+classified — "
+                      "skipping /24 active scan\n",
+                      (unsigned)speakers_.size());
+        saveToNVS();
+        scanRunning_.store(false);
+        return;
+    }
 
     // Active-Scan in Hintergrund-Task — kann je nach LAN-Groesse 30 s+
     // dauern. UI pollt /api/speakers solange isScanRunning() == true.

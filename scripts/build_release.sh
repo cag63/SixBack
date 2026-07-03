@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SixBack — build release artefacts for ESP-Web-Tools distribution.
 #
-# For each target (esp32, s3, s3-8mb, c3, c6) it produces:
+# For each target (esp32, s3, s3-8mb, c3, c6, c5) it produces:
 #   webflasher/sixback-<tgt>-factory.bin   — merged bootloader+parts+app+fs
 #   webflasher/sixback-<tgt>-firmware.bin  — app-only (for OTA over WiFi)
 #   webflasher/sixback-<tgt>-littlefs.bin  — Web-UI image (for FS-OTA)
@@ -57,8 +57,8 @@ fi
 # partitions-4mb.csv. Followup umgesetzt: scripts/fs_exclude_esp32.py strippt
 # silence.mp3 (Spotify-only, ~120 KB) NUR fuer env:esp32 aus dem FS-Image
 # (PROJECT_DATA_DIR -> gefilterte Staging-Kopie). Damit passt esp32 wieder rein.
-"$HOME/.platformio/penv/bin/pio" run -e s3 -e s3-8mb -e c3 -e c6 -e esp32 -t buildfs
-"$HOME/.platformio/penv/bin/pio" run -e s3 -e s3-8mb -e c3 -e c6 -e esp32
+"$HOME/.platformio/penv/bin/pio" run -e s3 -e s3-8mb -e c3 -e c6 -e c5 -e esp32 -t buildfs
+"$HOME/.platformio/penv/bin/pio" run -e s3 -e s3-8mb -e c3 -e c6 -e c5 -e esp32
 
 # Resolve final version: tag if set, else read the core from version.h.
 # Dev FW_VERSION_STRING carries a "+<counter>" suffix (e.g. "0.8.4+1116");
@@ -113,6 +113,9 @@ check_size "$PIO_BUILD/c3/firmware.bin"    $APP_4MB_SYM   "c3 app"
 check_size "$PIO_BUILD/c3/littlefs.bin"    $FS_4MB_SYM    "c3 fs"
 check_size "$PIO_BUILD/c6/firmware.bin"    $APP_4MB_SYM   "c6 app"
 check_size "$PIO_BUILD/c6/littlefs.bin"    $FS_4MB_SYM    "c6 fs"
+# C5: 4-MB-Devkit (DevKitC-1 N4, kein PSRAM) -> gleiches A/B-OTA-Layout wie c3/c6.
+check_size "$PIO_BUILD/c5/firmware.bin"    $APP_4MB_SYM   "c5 app"
+check_size "$PIO_BUILD/c5/littlefs.bin"    $FS_4MB_SYM    "c5 fs"
 check_size "$PIO_BUILD/s3/firmware.bin"    $APP_16MB      "s3 app"
 check_size "$PIO_BUILD/s3/littlefs.bin"    $FS_16MB       "s3 fs"
 check_size "$PIO_BUILD/s3-8mb/firmware.bin" $APP_8MB      "s3-8mb app"
@@ -149,7 +152,9 @@ merge_target() {
 
 # bootloader offset:
 #   ESP32 (classic): 0x1000  (Boot-ROM springt dorthin)
-#   S3 / C3 / C6 / S2 / C2 / C5 / C61 / H2 / P4: 0x0
+#   S3 / C3 / C6 / S2 / C2 / H2: 0x0
+#   ESP32-C5 / C61 / P4: 0x2000  (8-KB-Key-Manager-Sektor davor; verifiziert an
+#       IDF-Doku + esptool ESP32C5ROM.BOOTLOADER_FLASH_OFFSET + 0xE9 @ 0x2000)
 # spiffs offsets must match the corresponding partition table:
 #   partitions.csv     (16 MB)     -> spiffs @ 0x610000   (s3)
 #   partitions-4mb.csv ( 4 MB A/B) -> spiffs @ 0x3B0000   (esp32-classic + c3/c6)
@@ -161,6 +166,37 @@ merge_target s3     esp32s3 16MB 0x610000  0x0
 merge_target s3-8mb esp32s3 8MB  0x610000  0x0      # Seeed XIAO u.a. (Issue #23)
 merge_target c3     esp32c3 4MB  0x3B0000  0x0
 merge_target c6     esp32c6 4MB  0x3B0000  0x0
+
+# --- C5: eigener Merge (NICHT merge_target) -------------------------------
+# Zwei C5-Spezifika, die merge_target nicht abdeckt:
+#  (a) bootloader @ 0x2000 (nicht 0x0) — siehe Offset-Kommentar oben.
+#  (b) der globale ESPTOOL (platformio/tool-esptoolpy, 4.x) kennt esp32c5 NICHT
+#      -> wir brauchen das von der gepinnten pioarduino-Plattform gelieferte
+#      esptoolpy-v5.1.2 (enthaelt esptool/targets/esp32c5.py). 5.x akzeptiert
+#      die alten Underscore-Flags weiterhin, daher identische Flag-Syntax.
+find_c5_esptool() {
+  local d
+  for d in "$HOME"/.platformio/packages/tool-esptoolpy*; do
+    [ -f "$d/esptool/targets/esp32c5.py" ] && { echo "$d"; return 0; }
+  done
+  return 1
+}
+C5_ESPTOOL_PKG="$(find_c5_esptool || true)"
+if [ -z "$C5_ESPTOOL_PKG" ]; then
+  echo "ABORT: kein C5-faehiges esptool gefunden (brauche esptoolpy>=5 mit esp32c5)." >&2
+  echo "  -> einmal 'pio run -e c5' laufen lassen; das zieht esptoolpy-v5.1.2."   >&2
+  exit 2
+fi
+echo ">>> Merging c5 (esp32c5, 4MB, boot@0x2000, spiffs@0x3B0000) via $(basename "$C5_ESPTOOL_PKG")"
+PYTHONPATH="$C5_ESPTOOL_PKG" "$HOME/.platformio/penv/bin/python" -m esptool --chip esp32c5 merge_bin \
+  -o "$OUT/sixback-c5-factory.bin" \
+  --flash_mode dio --flash_size 4MB --flash_freq 80m \
+  0x2000   "$PIO_BUILD/c5/bootloader.bin" \
+  0x8000   "$PIO_BUILD/c5/partitions.bin" \
+  0x10000  "$PIO_BUILD/c5/firmware.bin" \
+  0x3B0000 "$PIO_BUILD/c5/littlefs.bin"
+cp "$PIO_BUILD/c5/firmware.bin"  "$OUT/sixback-c5-firmware.bin"
+cp "$PIO_BUILD/c5/littlefs.bin"  "$OUT/sixback-c5-littlefs.bin"
 
 # --- 3) Manifest-Writer: atomar + fsync (NFS-Regel) -----------------------
 # webflasher/ liegt auf NFS — nackte cat-Redirects koennen dem nachgelagerten
@@ -209,6 +245,12 @@ write_manifest "$OUT/manifest.json" <<EOF
       "parts": [
         { "path": "sixback-c6-factory.bin", "offset": 0 }
       ]
+    },
+    {
+      "chipFamily": "ESP32-C5",
+      "parts": [
+        { "path": "sixback-c5-factory.bin", "offset": 0 }
+      ]
     }
   ]
 }
@@ -256,6 +298,13 @@ write_manifest "$OUT/manifest-update.json" <<EOF
       "parts": [
         { "path": "sixback-c6-firmware.bin",    "offset": 65536    },
         { "path": "sixback-c6-littlefs.bin",    "offset": 3866624  }
+      ]
+    },
+    {
+      "chipFamily": "ESP32-C5",
+      "parts": [
+        { "path": "sixback-c5-firmware.bin",    "offset": 65536    },
+        { "path": "sixback-c5-littlefs.bin",    "offset": 3866624  }
       ]
     }
   ]
