@@ -974,7 +974,14 @@ std::vector<Group> g_groups;
 SemaphoreHandle_t  g_groups_mtx = nullptr;
 uint32_t           g_next_group_id = 1000000;
 
-void groupsSave_() {
+// Health-Flag: false = letzter bfx_groups-Save scheiterte (NVS voll trotz
+// Cleanup) → Stereo-Paar NICHT reboot-persistent. Der Speaker (BMX-Client)
+// bekommt trotzdem 201/200 (Gruppe lebt in g_groups/RAM diese Session) — das
+// ehrliche Signal geht an Operator/WebUI via /api/status.groups_persist_ok,
+// NICHT als 500 an die eingefrorene FW (BMX-Contract).
+bool g_groupsPersistOk = true;
+
+bool groupsSave_() {
     JsonDocument doc;
     doc["next_id"] = g_next_group_id;
     JsonArray arr  = doc["groups"].to<JsonArray>();
@@ -990,7 +997,20 @@ void groupsSave_() {
             ro["role"] = r.role;
         }
     }
-    sixback::nvsSaveJson("bfx_groups", "list", doc);
+    // Cleanup-Variante wie die anderen User-Settings-Stores: bei vollem NVS erst
+    // regenerable Caches purgen + retry statt Silent-Fail (sonst geht die Stereo-
+    // Paar-Persistenz ueber Reboot still verloren).
+    bool ok = sixback::nvsSaveJsonWithCleanup("bfx_groups", "list", doc);
+    g_groupsPersistOk = ok;
+    if (!ok) {
+        // KEIN 500 an den Speaker (BMX-Contract) — die Gruppe funktioniert diese
+        // Session im RAM, die FW erwartet hier 201/200. Ehrliches Signal geht an
+        // Operator/WebUI: lautes Serial + Health-Flag in /api/status.
+        Serial.println("[group] PERSIST FAIL — Stereo-Paar NICHT reboot-persistent "
+                       "(NVS voll trotz Cleanup); Speaker erhaelt weiter 201/200, "
+                       "Gruppe lebt in RAM. -> /api/status groups_persist_ok=false");
+    }
+    return ok;
 }
 
 void groupsInit_() {
@@ -1551,6 +1571,13 @@ void handleNotFound(AsyncWebServerRequest* req) {
 }
 
 } // anon
+
+// Getter fuer /api/status (deklariert in bose_endpoints.h): letzter
+// groupsSave_-Persist-Stand. Bewusst GLOBALE Linkage (der uebrige Group-Code
+// liegt im anon-NS oben) — handleStatus in api_endpoints.cpp ruft es TU-
+// uebergreifend. g_groupsPersistOk lebt im anon-NS, ist aber in derselben TU
+// aus dem globalen Scope sichtbar.
+bool groupsPersistOk() { return g_groupsPersistOk; }
 
 // -----------------------------------------------------------------------------
 // Catch-All-Logger Public API (P3) — fuer UI-Endpoint /api/unknown-requests.

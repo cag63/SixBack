@@ -17,4 +17,10 @@ void registerBoseEndpoints(AsyncWebServer& server);
 void getUnknownRequestsJson(JsonArray out);
 void clearUnknownRequests();
 
+// true = letzter Stereo-Paar-Store-Write (bfx_groups) persistierte. false =
+// NVS voll trotz Cleanup → Gruppe lebt nur im RAM, nicht reboot-persistent.
+// Exponiert in /api/status als groups_persist_ok (Diagnostik; bewusst KEIN
+// 500 an die Speaker-FW, die 201/200 erwartet).
+bool groupsPersistOk();
+
 #endif // BOSEFIX32_BOSE_ENDPOINTS_H

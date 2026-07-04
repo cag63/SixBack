@@ -571,14 +571,18 @@ AutoModeConfig loadAutoModeConfig() {
     return c;
 }
 
-void saveAutoModeConfig(const AutoModeConfig& cfg) {
+bool saveAutoModeConfig(const AutoModeConfig& cfg) {
     JsonDocument doc;
     doc["enabled"]         = cfg.enabled;
     doc["dry_run"]         = cfg.dryRun;
     doc["boot_delay_ms"]   = cfg.bootDelayMs;
     doc["max_per_boot"]    = cfg.maxPerBoot;
     doc["cron_interval_s"] = cfg.cronIntervalS;
-    nvsSaveJson(NVS_NS, NVS_KEY, doc);
+    // Cleanup-Variante wie alle anderen User-Settings-Stores (preset_store,
+    // speaker_inventory, ui_auth, spotify_player): bei vollem NVS werden erst
+    // regenerable Caches gepurgt + retried, statt den Save still zu verschlucken.
+    // Rueckgabe propagiert bis in den PUT-Handler (ehrliche UI-Antwort).
+    return nvsSaveJsonWithCleanup(NVS_NS, NVS_KEY, doc);
 }
 
 void startAutoModeTask() {

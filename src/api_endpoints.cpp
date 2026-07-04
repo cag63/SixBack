@@ -209,6 +209,10 @@ void handleStatus(AsyncWebServerRequest* req) {
     cloud["base_url"] = myBaseUrl();
     doc["speakers_count"]    = sixback::SpeakerInventory::instance().list().size();
     doc["scan_in_progress"]  = sixback::SpeakerInventory::instance().isScanRunning();
+    // Stereo-Paar-Persistenz-Health (Diagnostik): false = letzter bfx_groups-Save
+    // scheiterte (NVS voll trotz Cleanup) → Gruppe nur im RAM. Der Speaker bekommt
+    // weiterhin 201/200 (BMX-Contract), der Fehlschlag ist NUR hier sichtbar.
+    doc["groups_persist_ok"] = groupsPersistOk();
 
     // Health-Snapshot: boot/crash-counter, last reset reason, watchdog state
     JsonObject health = doc["health"].to<JsonObject>();
@@ -3145,12 +3149,36 @@ void writeOtaStatus_(AsyncWebServerRequest* req) {
 }
 } // anon
 
+#ifdef SIXBACK_OTA_SELFUPDATE_UNSUPPORTED
+// ESP32-C5: der Online-OTA-Pull braucht einen TLS-Handshake, dessen mbedtls- +
+// esp-aes-DMA-Puffer auf dem no-PSRAM-C5 (~252 KB Heap, WiFi-6-Dual-Band-Stack)
+// nicht allozierbar sind ("esp-aes: Failed to allocate memory" ->
+// ssl_starttls_handshake ERROR). Verifiziert 2026-07-03, 6/6 reproduzierbar.
+// Der lokale Multipart-Upload (/api/ota) bleibt nutzbar; nur der Online-Pull
+// (Check + Install) wird sauber als "nicht unterstuetzt" gemeldet statt
+// kryptischem "HTTP -1". Siehe ~/.claude/docs/esp32-c5-ota-tls-heap.md
+static constexpr const char* kOtaSelfUpdateUnsupportedBody =
+    "{\"state\":\"error\","
+    "\"error\":\"Online OTA is not available on the ESP32-C5 (not enough RAM for the TLS download) \\u2014 update via the Web-Flasher at https://sixback.io/\","
+    "\"current\":\"\",\"latest\":\"\",\"progress\":0,\"total\":0,"
+    "\"phase\":\"\",\"phase_idx\":0,\"phase_n\":0,"
+    "\"updater\":\"https://sixback.io/\"}";
+#endif
+
 void handleOtaUpdateCheck(AsyncWebServerRequest* req) {
+#ifdef SIXBACK_OTA_SELFUPDATE_UNSUPPORTED
+    req->send(200, "application/json", kOtaSelfUpdateUnsupportedBody);
+    return;
+#endif
     sixback::ota::checkOnline();
     writeOtaStatus_(req);
 }
 
 void handleOtaUpdateInstall(AsyncWebServerRequest* req) {
+#ifdef SIXBACK_OTA_SELFUPDATE_UNSUPPORTED
+    req->send(200, "application/json", kOtaSelfUpdateUnsupportedBody);
+    return;
+#endif
     // Optional: ?force=1 erlaubt Re-Install des gleichen oder eines aelteren
     // Versions-Standes (z.B. "ich will von sixback.io denselben Build
     // nochmal pullen", oder Demo des Progress-Bars wenn current >= latest).
@@ -3331,16 +3359,24 @@ void handlePutAutoMode(AsyncWebServerRequest* req, JsonDocument& body) {
     if (body["boot_delay_ms"].is<uint32_t>())  cfg.bootDelayMs   = body["boot_delay_ms"].as<uint32_t>();
     if (body["max_per_boot"].is<uint32_t>())   cfg.maxPerBoot    = body["max_per_boot"].as<uint32_t>();
     if (body["cron_interval_s"].is<uint32_t>())cfg.cronIntervalS = body["cron_interval_s"].as<uint32_t>();
-    sixback::saveAutoModeConfig(cfg);
+
+    bool saved = sixback::saveAutoModeConfig(cfg);
+    // Bei Fehlschlag NICHT den angeforderten Wert echoen — das war der Bug: die UI
+    // meldete Erfolg (ok:true + Wunschwert), obwohl NVS nichts persistierte, sodass
+    // der Toggle nach Reboot/Re-GET zuruecksprang (FHEM 144729, betateilchen C5).
+    // Stattdessen den TATSAECHLICH persistierten Stand zuruecklesen und mit 500
+    // melden, damit toggleAutoMode()->loadAutoMode() den echten Zustand zeigt.
+    auto actual = saved ? cfg : sixback::loadAutoModeConfig();
     JsonDocument resp;
-    resp["ok"]                         = true;
-    resp["config"]["enabled"]          = cfg.enabled;
-    resp["config"]["dry_run"]          = cfg.dryRun;
-    resp["config"]["boot_delay_ms"]    = cfg.bootDelayMs;
-    resp["config"]["max_per_boot"]     = cfg.maxPerBoot;
-    resp["config"]["cron_interval_s"]  = cfg.cronIntervalS;
+    resp["ok"]                         = saved;
+    if (!saved) resp["error"]          = "nvs write failed — setting not persisted";
+    resp["config"]["enabled"]          = actual.enabled;
+    resp["config"]["dry_run"]          = actual.dryRun;
+    resp["config"]["boot_delay_ms"]    = actual.bootDelayMs;
+    resp["config"]["max_per_boot"]     = actual.maxPerBoot;
+    resp["config"]["cron_interval_s"]  = actual.cronIntervalS;
     String b; serializeJson(resp, b);
-    req->send(200, "application/json", b);
+    req->send(saved ? 200 : 500, "application/json", b);
 }
 
 // -----------------------------------------------------------------------------

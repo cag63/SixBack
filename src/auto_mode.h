@@ -60,7 +60,11 @@ struct AutoModeStatus {
 };
 
 AutoModeConfig loadAutoModeConfig();
-void           saveAutoModeConfig(const AutoModeConfig& cfg);
+// true = in NVS persistiert. false = Write fehlgeschlagen (Partition voll trotz
+// Cleanup, oder Heap-Enge beim Preferences::begin/serialize). Der PUT-Handler
+// MUSS den Rueckgabewert auswerten — sonst meldet die UI faelschlich Erfolg und
+// der Toggle springt nach Reboot/Re-GET zurueck (FHEM 144729, betateilchen C5).
+bool           saveAutoModeConfig(const AutoModeConfig& cfg);
 
 // Spawn der FreeRTOS-Task, die die Pipeline ausfuehrt. Idempotent —
 // mehrfache Aufrufe innerhalb eines Boots starten die Pipeline nur einmal.
