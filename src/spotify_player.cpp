@@ -335,14 +335,36 @@ static QueueHandle_t g_pressQueue = nullptr;
 
 void init() {
     ensureMutex_();
-    ensureTlsClients_();   // Eager-init: TLS-Heap-Allokation bei Boot, nicht
-                           // im Trigger-Context (vermeidet Fragmentation-Spikes).
+
+    // FHEM 144729 #121 / no-PSRAM-Heap: Spotify laeuft nur mit PSRAM (der TLS-
+    // Handshake scheitert reproduzierbar auf dem knappen no-PSRAM-Heap, C5/C6 —
+    // S3-only via PSRAM-mbedtls-Hook). Die Eager-init (2x WiFiClientSecure +
+    // 12KB-Worker-Task = ~22KB) auf no-PSRAM-Boards NICHT anwerfen: sie ist dort
+    // reine Verschwendung (die g_tls*-Singletons werden ohnehin nicht mehr
+    // dereferenziert — Trigger-/Refresh-Pfade nutzen lokale WiFiClientSecure) und
+    // druecken die Heap-Reserve unter die WebUI-Last-Kollaps-Schwelle. S3 (PSRAM)
+    // unveraendert. Verifiziert 2026-07-04 (K=8, min_free nach 1-Tab-Last):
+    // +~22KB Baseline-Heap, #121 1-Tab-Crash 3/8 -> 0/8.
+    const bool spotifyUsable = (ESP.getPsramSize() > 0);
+
+    if (spotifyUsable) {
+        ensureTlsClients_();   // Eager-init: TLS-Heap-Allokation bei Boot, nicht
+                               // im Trigger-Context (vermeidet Fragmentation-Spikes).
+    }
+
     if (xSemaphoreTake(g_mtx, pdMS_TO_TICKS(200)) == pdTRUE) {
-        loadFromNVS_();
-        loadLibraryFromNVS_();
-        migrateSlotsToLibrary_();
+        loadFromNVS_();          // Account/Library-Daten sind billig (NVS-Read,
+        loadLibraryFromNVS_();   // kein TLS) — auch ohne PSRAM laden, damit die
+        migrateSlotsToLibrary_();// UI konsistent bleibt.
         xSemaphoreGive(g_mtx);
     }
+
+    if (!spotifyUsable) {
+        Serial.println("[spot] no PSRAM -> Spotify eager-init skipped "
+                       "(TLS/worker/callback), ~22KB heap saved (FHEM 144729 #121)");
+        return;
+    }
+
     eventStoreSetPresetPressedCallback(onPresetPressed);
 
     // Persistenter Worker-Task am Boot starten (statt xTaskCreate-per-press).

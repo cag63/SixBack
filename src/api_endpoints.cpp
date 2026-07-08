@@ -46,6 +46,54 @@
 #include <LittleFS.h>
 #include <Update.h>
 #include <Preferences.h>
+#include <atomic>
+
+// -----------------------------------------------------------------------------
+// Heap-/Concurrency-Guard fuer synchrone Outbound-Handler (FHEM 144729 #121).
+//
+// handleGetHardwarePresets + handleNowPlayingLive holen /presets bzw.
+// /now_playing SYNCHRON per HTTPClient.GET() im AsyncWebServer-Callback (blockt
+// den einzelnen async_tcp-Task bis zu ~5s) und akkumulieren den XML-Body als
+// String. Beim Oeffnen der WebUI feuert der Browser diese Reads fuer JEDEN
+// gefundenen Speaker gleichzeitig -> auf dem no-PSRAM-C5 (~250KB Heap) stauen
+// sich TCP-Backlog + HTTPClient-Puffer + String-Bodies -> Heap-Kollaps -> Crash
+// -> WLAN weg. (Lab-verifiziert 2026-07-04: min_free 52KB->22.9KB, crash++.)
+//
+// Fix: vor der teuren Outbound-Arbeit Heap-Boden + max-Inflight pruefen; darunter
+// sofort 503 "busy" (die WebUI retryt ohnehin). So bleibt der async_tcp-Task
+// frei zum Draenen des Connection-Backlogs statt zu crashen. PSRAM-Boards (S3)
+// haben Reserve -> grosszuegig; no-PSRAM (C5/C6/C3) -> streng.
+// -----------------------------------------------------------------------------
+namespace {
+std::atomic<int> g_outboundInflight{0};
+
+inline bool     outboundHasPsram()    { return ESP.getPsramSize() > 0; }
+inline uint32_t outboundHeapFloor()   { return outboundHasPsram() ? 20000u : 45000u; }
+inline int      outboundMaxInflight() { return outboundHasPsram() ? 8 : 2; }
+
+struct OutboundGuard {
+    bool acquired = false;
+    OutboundGuard() {
+        if (ESP.getFreeHeap() < outboundHeapFloor()) return;   // Heap zu knapp -> ablehnen
+        int n = g_outboundInflight.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n > outboundMaxInflight()) {
+            g_outboundInflight.fetch_sub(1, std::memory_order_relaxed);
+            return;
+        }
+        acquired = true;
+    }
+    ~OutboundGuard() {
+        if (acquired) g_outboundInflight.fetch_sub(1, std::memory_order_relaxed);
+    }
+};
+
+// true = abgelehnt (503 gesendet), Handler soll sofort returnen.
+inline bool outboundReject(AsyncWebServerRequest* req) {
+    req->send(503, "application/json",
+              "{\"error\":\"device busy (low heap) \\u2014 retry\",\"retry\":true}");
+    return true;
+}
+} // namespace
 
 // Setzt einen TUNEIN/LIR-Sender per /select an einen Speaker (plain HTTP :8090).
 // ACHTUNG: doPush_ haelt eine bewusst getrennte, BYTE-IDENTISCHE Kopie dieses
@@ -524,7 +572,14 @@ void handleRefreshStatus(AsyncWebServerRequest* req) {
     // UI pollt dann /api/speakers bis scan_in_progress==false und faehrt erst
     // danach die Per-Speaker-Phasen (hardware-presets / discard).
     auto& inv = sixback::SpeakerInventory::instance();
-    inv.refreshStatusesAsync();
+    // FHEM 144729 #121: den schweren Probe-Fan-out (Telnet+BMX+Spotify+sources je
+    // Speaker, HTTPClient-Puffer + String-Bodies) NICHT anwerfen, wenn der Heap
+    // auf dem no-PSRAM-C5 schon knapp ist (z.B. gleichzeitiges Bundle-/Per-Speaker-
+    // Serving beim Page-Load) — das war der Haupt-Heap-Treiber ins Kollaps-Fenster.
+    // Snapshot wird trotzdem geliefert; die WebUI kann spaeter erneut refreshen.
+    if (ESP.getFreeHeap() >= outboundHeapFloor()) {
+        inv.refreshStatusesAsync();
+    }
     JsonDocument doc;
     emitSpeakers(req, doc);   // setzt scan_in_progress = isScanRunning()
 }
@@ -2164,6 +2219,8 @@ void handleSpeakerRename(AsyncWebServerRequest* req, JsonDocument& body) {
 //   per stationId/streamUrl zu matchen, was die SCMUDC-Variante nicht kennt.
 // -----------------------------------------------------------------------------
 void handleNowPlayingLive(AsyncWebServerRequest* req) {
+    OutboundGuard guard;                                   // FHEM 144729 #121
+    if (!guard.acquired) { outboundReject(req); return; }
     String id = pathParam(0);
     auto& inv = sixback::SpeakerInventory::instance();
     String spIp;
@@ -2719,6 +2776,8 @@ static bool fetchHardwarePresets_(const String& spIp, HwSlotInfo_ out[6]) {
 //   Zeile in der Slot-Karte gebraucht, parallel zum Store-Endpoint.
 // -----------------------------------------------------------------------------
 void handleGetHardwarePresets(AsyncWebServerRequest* req) {
+    OutboundGuard guard;                                   // FHEM 144729 #121
+    if (!guard.acquired) { outboundReject(req); return; }
     String id = pathParam(0);
     auto& inv = sixback::SpeakerInventory::instance();
     String spIp;
@@ -3245,6 +3304,18 @@ void handleOtaUpdateStatus(AsyncWebServerRequest* req) {
 #endif // SIXBACK_OTA_ENABLED
 
 void handleRoot(AsyncWebServerRequest* req) {
+    // FHEM 144729 #121: unter Heap-Druck (Page-Load-Burst / mehrere Tabs auf dem
+    // no-PSRAM-C5) das schwere 74-KB-Bundle-Serving kurz mit 503 abweisen statt
+    // einen Heap-Kollaps zu riskieren (der crasht das Board + wirft WLAN ab).
+    // Der Floor ist so hoch, dass ein normaler Einzel-Load nie triggert; die
+    // Auto-Refresh-Seite holt sich das Bundle nach ~2 s selbst. Nur no-PSRAM
+    // gated (PSRAM-S3 hat Reserve -> outboundHeapFloor() dort niedrig).
+    if (ESP.getFreeHeap() < outboundHeapFloor()) {
+        req->send(503, "text/html",
+                  "<!doctype html><meta http-equiv=\"refresh\" content=\"2\">"
+                  "<body style=\"font-family:sans-serif\">SixBack is busy \xE2\x80\x94 retrying\xE2\x80\xA6</body>");
+        return;
+    }
     // index.html ist >100 KB; AsyncWebServer schafft das im uncompressed-Pfad
     // nicht zuverlaessig (Truncation/Timeouts unter Last). Wenn index.html.gz
     // im LittleFS liegt -> serve mit Content-Encoding: gzip. Browser entpackt.
