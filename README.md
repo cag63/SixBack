@@ -90,7 +90,8 @@ Open the **web flasher** in Chrome or Edge desktop and click *Connect*:
 
 > 🔗 **<https://sixback.io/>**
 
-The page reads [`webflasher/manifest.json`](webflasher/manifest.json),
+The page reads [`webflasher/manifest.json`](webflasher/manifest.json) or
+a board-specific manifest file,
 detects the chip family of the connected board, and writes the matching
 factory image — bootloader + partition table + firmware + Web UI — in a
 single shot.  Right after the flash, esp-web-tools also offers to hand
@@ -178,6 +179,7 @@ page auto-redirects to the device's freshly assigned LAN IP via
 | ESP32-C3      | `esp32-c3-devkitm-1`             | 4 MB  | flashes over the chip's built-in USB-Serial-JTAG                 |
 | ESP32-C6      | `esp32-c6-devkitc-1`             | 4 MB  | WiFi 6 — works, but cold-start discovery occasionally drops SSDP-multicast packets and rare HTTP-server hangs need a reset |
 | ESP32-C5      | `esp32-c5-devkitc1-n4`          | 4 MB  | **dual-band Wi-Fi 6 (2.4 + 5 GHz)** — native USB-Serial-JTAG; verified connecting on 5 GHz (channel 40; `band`/`channel` shown in `/api/status`). 4 MB / no-PSRAM devkit, A/B-OTA like C3/C6. **Note:** the C5 second-stage bootloader lives at flash `0x2000` (not `0x0`), and merging its factory image needs esptool ≥ 5. 8 MB+PSRAM C5 boards (e.g. Seeed XIAO ESP32-C5) would warrant a separate build target |
+| Arduino Nano ESP32 | `arduino_nano_esp32` | 16MB | 8MB PSRAM. Uses an ESP32-S3 like the esp32-s3-devkitc-1, but with a single USB connector. Because this board identifies itself as an ESP32-S3 but uses a different USB connector than the esp32-s3-devkitc-1 for initial IP provisioning, it's image is not the same as the esp32-s3-devkitc-1 image and it therefore can't use the default S3 download/update buttons. **Use the dedicated "Arduino Nano ESP32" buttons for these.** |
 
 **S3 is the recommended target for distribution.** During the 4-phase
 end-to-end test (S3 ↔ C6 ping-pong with full erase/flash/provision each
@@ -224,8 +226,8 @@ Requires PlatformIO and a Linux/macOS host.
 
 ```bash
 # build everything (all targets) + LittleFS images
-pio run -e esp32 -e s3 -e s3-8mb -e c3 -e c6
-pio run -e esp32 -e s3 -e s3-8mb -e c3 -e c6 -t buildfs
+pio run -e esp32 -e s3 -e s3-8mb -e c3 -e c6 -e nano-esp32 
+pio run -e esp32 -e s3 -e s3-8mb -e c3 -e c6 -e nano-esp32 -t buildfs
 
 # produce tagged factory images + manifest for the web flasher
 ./scripts/build_release.sh v0.8.22    # tag arg bakes the version into all firmwares
