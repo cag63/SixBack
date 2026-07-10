@@ -61,9 +61,12 @@
 </div>
 
 <div class="panel flash">
-  <h2 style="margin-top:0">Install SixBack on your ESP32</h2>
-  <p>Plug your ESP32 board into USB, click below, and pick the serial port that appears.<br>
-     The browser detects the chip and flashes the matching image.</p>
+  <h2 style="margin-top:0">Install SixBack on your Espressif ESP32</h2>
+  <p>Connect your ESP32 board (except ESP32-S3 boards with only
+     8&nbsp;MB flash + PSRAM, e.g. Seeed&nbsp;XIAO&nbsp;ESP32S3 or an Arduino Nano ESP32; 
+     see below for those) to your computer using a data USB cable, click below, 
+     and pick the serial port that appears.<br>
+     The browser detects the chip family and flashes the matching image.</p>
   <p style="display:flex; gap:1.5em; justify-content:center; flex-wrap:wrap; align-items:flex-start; margin-top:1em">
     <span style="text-align:center">
       <esp-web-install-button manifest="manifest.json"></esp-web-install-button>
@@ -79,9 +82,9 @@
     <b>Update existing</b> for a stick that already runs SixBack.
   </p>
   <div class="warn">
-    <strong>ESP32-S3-DevKitC-1 has two USB sockets — flash over the one labelled <code>UART</code>.</strong>
-    That socket appears as a <code>CH340</code>/<code>CH343</code> serial port. If you flash over
-    the board's other, native <code>USB</code> socket instead, the flash still succeeds, but the
+    <strong>The ESP32-S3-DevKitC-1 has two USB ports — flash over the one labelled <code>UART</code>.</strong>
+    That port appears as a <code>CH340</code>/<code>CH343</code> serial port. If you flash over
+    the board's other USB port, the native <code>USB</code> port instead, the flash still succeeds, but the
     browser's <b>“Connect device to Wi-Fi”</b> step afterwards will <em>not</em> appear — SixBack
     answers the provisioning handshake only on the <code>UART</code> port. You'd then have to set up
     WiFi through the <code>SixBack-…</code> hotspot the stick opens instead. Single-socket boards
@@ -89,9 +92,12 @@
   </div>
   <hr style="border:none; border-top:1px solid var(--mute); opacity:.3; margin:1.2em 0">
   <h3 style="margin:.2em 0 .4em">ESP32-S3 with 8&nbsp;MB flash (Seeed XIAO ESP32S3 &amp; similar)</h3>
-  <p style="font-size:.9em">The buttons above flash the <b>16&nbsp;MB</b> S3 layout. Boards with only
-     <b>8&nbsp;MB flash + PSRAM</b> (e.g. Seeed&nbsp;XIAO&nbsp;ESP32S3) need this dedicated image instead —
-     the standard one does not fit and the flash would fail partway through.</p>
+  <p style="font-size:.9em">Use for ESP32-S3 boards with only
+     <b>8&nbsp;MB flash + PSRAM</b> (e.g. Seeed&nbsp;XIAO&nbsp;ESP32S3). Because of limitation with
+     the ESP32 Web Tools, these boards have their own buttons and manifest files. 
+     The standard ESP32-S3 image downloaded by the above buttons does not fit and the flash would fail
+     partway through.
+  </p>
   <p style="display:flex; gap:1.5em; justify-content:center; flex-wrap:wrap; align-items:flex-start; margin-top:.6em">
     <span style="text-align:center">
       <esp-web-install-button manifest="manifest-s3-8mb.json"></esp-web-install-button>
@@ -103,7 +109,7 @@
     </span>
   </p>
   <p style="color:var(--mute); font-size:.85em">
-    Not sure which one you have? The <code>Nxx</code> in the module name tells the flash size:
+    Not sure which Espressif board you have? The <code>Nxx</code> in the module name tells the flash size:
     <code>N8…</code>&nbsp;=&nbsp;8&nbsp;MB, <code>N16…</code>&nbsp;=&nbsp;16&nbsp;MB.
     XIAO&nbsp;ESP32S3 / Sense&nbsp;=&nbsp;8&nbsp;MB; XIAO&nbsp;ESP32S3&nbsp;<em>Plus</em>&nbsp;=&nbsp;16&nbsp;MB
     (use the standard buttons above). PSRAM is required either way.<br>
@@ -114,6 +120,31 @@
     Manual flashing (esptool): <a href="sixback-s3-8mb-factory.bin">factory</a> @0x0 ·
     <a href="sixback-s3-8mb-firmware.bin">firmware</a> @0x10000 ·
     <a href="sixback-s3-8mb-littlefs.bin">littlefs</a> @0x610000
+  </p>
+  <hr style="border:none; border-top:1px solid var(--mute); opacity:.3; margin:1.2em 0">
+  <h3 style="margin:.2em 0 .4em">Arduino Nano ESP32</h3>
+  <p style="font-size:.9em">The Arduino Nano ESP32 has a ESP32-S3 microcontroller, 
+    but it only has one USB port. cause of limitation with the ESP32 Web Tools, the Arduino Nano ESP32 
+    has its own buttons and manifest files.
+    <br>
+    <strong>NOTE: </strong>The fresh install image replaces the bootloader on the Arduino Nano ESP32. 
+    The board must be placed in the bootloader flash mode before hitting the Connect button. 
+    To do this, short pin B1 to GND and press and release the RST button. The built-in RGB LED
+    should go green. Remove the short between B1 and GND; the Built-in LED should go red/blue (purple).
+    The board is ready to flash. Press the Connect button and select the ttyACM0 (USB JTAG/serial debug unit) 
+    port (in Linux). After flashing, the built-in LED should go off. Follow
+    the same steps to enter the bootloader flash mode again to flash the update image. The update image
+    does not replace the bootloader. Or do an Over-the-Air (OTA) update from the Web UI after the initial flash.
+   </p>
+  <p style="display:flex; gap:1.5em; justify-content:center; flex-wrap:wrap; align-items:flex-start; margin-top:.6em">
+    <span style="text-align:center">
+      <esp-web-install-button manifest="manifest-nano-esp32.json"></esp-web-install-button>
+      <br><small style="color:var(--mute); display:block; margin-top:.4em">Fresh install Arduino Nano ESP32 — erases all settings</small>
+    </span>
+    <span style="text-align:center">
+      <esp-web-install-button manifest="manifest-update-nano-esp32.json"></esp-web-install-button>
+      <br><small style="color:var(--mute); display:block; margin-top:.4em">Update existing Arduino Nano ESP32 — keeps settings</small>
+    </span>
   </p>
 </div>
 
@@ -135,7 +166,7 @@
 </div>
 
 <div class="ok">
-  <strong>Recommended hardware: ESP32-S3-DevKitC-1-N16R8</strong> —
+  <strong>Recommended hardware: ESP32-S3-DevKitC-1-N16R8 or Arduino Nano ESP32</strong> —
   16 MB flash, 8 MB PSRAM, mature WiFi 5 stack.  In extended end-to-end
   testing this was the most robust target.  ESP32 / C3 / C6 / C5 work too
   (factory image auto-selected), but the C6's WiFi 6 stack occasionally
@@ -156,7 +187,12 @@
 </div>
 
 <h2>What you get</h2>
-<p>After flashing, point your browser at <code>http://sixback.local/</code>: discover the speakers
+<p>After flashing the initial install image, hit the next button. A dialog box should appear
+asking for your WiFi credentials. You have 2 minutes to 
+enter your Wi-Fi SSID and password. The stick also opens for 5 minutes an **open** AP called 
+`SixBack-XXYYZZ`(no password) with a DNS hijack 
+so any browser connecting to it gets the WiFi-setup form automatically. After provisioning the WiFi,
+point your browser at <code>http://sixback.local/</code>: discover the speakers
 on your LAN, migrate them off the dead Bose cloud, and manage all six preset buttons by
 drag &amp; drop — search TuneIn / add custom streams in the sidebar, drag tiles onto preset
 slots, push to the speaker.</p>
@@ -182,7 +218,7 @@ slots, push to the speaker.</p>
       flashing, so you can hand over Wi-Fi SSID and password from the same page.</li>
   <li>The device then advertises itself as <code>sixback.local</code> on mDNS;
       open <code>http://sixback.local/</code> to manage your Bose speakers.</li>
-</ol>
+ </ol>
 
 <div class="ok">
   <strong>OTA updates later:</strong> once SixBack runs on the device, future
