@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SixBack — build release artefacts for ESP-Web-Tools distribution.
 #
-# For each target (esp32, s3, s3-8mb, c3, c6, c5) it produces:
+# For each target (esp32, s3, s3-8mb, c3, c6, c5, nano-esp32) it produces:
 #   webflasher/sixback-<tgt>-factory.bin   — merged bootloader+parts+app+fs
 #   webflasher/sixback-<tgt>-firmware.bin  — app-only (for OTA over WiFi)
 #   webflasher/sixback-<tgt>-littlefs.bin  — Web-UI image (for FS-OTA)
@@ -57,8 +57,8 @@ fi
 # partitions-4mb.csv. Followup umgesetzt: scripts/fs_exclude_esp32.py strippt
 # silence.mp3 (Spotify-only, ~120 KB) NUR fuer env:esp32 aus dem FS-Image
 # (PROJECT_DATA_DIR -> gefilterte Staging-Kopie). Damit passt esp32 wieder rein.
-"$HOME/.platformio/penv/bin/pio" run -e s3 -e s3-8mb -e c3 -e c6 -e c5 -e esp32 -t buildfs
-"$HOME/.platformio/penv/bin/pio" run -e s3 -e s3-8mb -e c3 -e c6 -e c5 -e esp32
+"$HOME/.platformio/penv/bin/pio" run -e s3 -e s3-8mb -e c3 -e c6 -e c5 -e esp32 -e nano-esp32 -t buildfs
+"$HOME/.platformio/penv/bin/pio" run -e s3 -e s3-8mb -e c3 -e c6 -e c5 -e esp32 -e nano-esp32
 
 # Resolve final version: tag if set, else read the core from version.h.
 # Dev FW_VERSION_STRING carries a "+<counter>" suffix (e.g. "0.8.4+1116");
@@ -120,6 +120,8 @@ check_size "$PIO_BUILD/s3/firmware.bin"    $APP_16MB      "s3 app"
 check_size "$PIO_BUILD/s3/littlefs.bin"    $FS_16MB       "s3 fs"
 check_size "$PIO_BUILD/s3-8mb/firmware.bin" $APP_8MB      "s3-8mb app"
 check_size "$PIO_BUILD/s3-8mb/littlefs.bin" $FS_8MB       "s3-8mb fs"
+check_size "$PIO_BUILD/nano-esp32/firmware.bin"	$APP_16MB	"nano-esp32 app"
+check_size "$PIO_BUILD/nano-esp32/littlefs.bin"	$FS_16MB	"nano-esp32 fs"
 
 if [ "$size_errors" -gt 0 ]; then
   echo >&2
@@ -166,6 +168,8 @@ merge_target s3     esp32s3 16MB 0x610000  0x0
 merge_target s3-8mb esp32s3 8MB  0x610000  0x0      # Seeed XIAO u.a. (Issue #23)
 merge_target c3     esp32c3 4MB  0x3B0000  0x0
 merge_target c6     esp32c6 4MB  0x3B0000  0x0
+merge_target nano-esp32	esp32s3	16MB	0x610000	0x0
+
 
 # --- C5: eigener Merge (NICHT merge_target) -------------------------------
 # Zwei C5-Spezifika, die merge_target nicht abdeckt:
@@ -354,7 +358,49 @@ write_manifest "$OUT/manifest-update-s3-8mb.json" <<EOF
 }
 EOF
 
-# --- 3d) Deploy-Reihenfolge-Guard ------------------------------------------
+# ---3d) nano-esp32 variant--------------------
+# esp-web-tools selects builds ONLY via chipFamily — a second ESP32-S3
+# entry in the main manifest would be ineffective (the first one wins). The
+# Arduino Nano ESP32 variant therefore gets its OWN manifest pair + own
+# install button on the landing page.
+# Offsets identical to the 16 MB S3 (app slots the same size, spiffs the same
+# Offset 0x610000)
+write_manifest "$OUT/manifest-nano-esp32.json" <<EOF
+{
+  "name": "SixBack (Arduino Nano ESP32)",
+  "version": "$VERSION",
+  "funding_url": "https://paypal.me/busware",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        { "path": "sixback-nano-esp32-factory.bin", "offset": 0 }
+      ]
+    }
+  ]
+}
+EOF
+
+write_manifest "$OUT/manifest-update-nano-esp32.json" <<EOF
+{
+  "name": "SixBack (Arduino Nano ESP32 update)",
+  "version": "$VERSION",
+  "funding_url": "https://paypal.me/busware",
+  "new_install_prompt_erase": false,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        { "path": "sixback-nano-esp32-firmware.bin", "offset": 65536   },
+        { "path": "sixback-nano-esp32-littlefs.bin", "offset": 6356992 }
+      ]
+    }
+  ]
+}
+EOF
+
+# --- 3e) Deploy-Reihenfolge-Guard ------------------------------------------
 # Jede in index.html referenzierte Manifest-Datei muss in $OUT existieren —
 # verhindert tote Install-Buttons, wenn die Seite vor den Artefakten deployed
 # wuerde (Praezedenzfall v0.8.10: Page-only-Fix per rsync).
