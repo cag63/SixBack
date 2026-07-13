@@ -2,15 +2,18 @@
 // SixBack — Diagnostic Snapshot Implementation
 
 #include "speaker_diagnostic.h"
+#include "bose_endpoints.h"
 #include "config.h"
 #include "diag_settings.h"
 #include "speaker_inventory.h"
 #include "speaker_telnet.h"
+#include "system_health.h"
 #include "version.h"
 #include <HTTPClient.h>
 #include <LittleFS.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <esp_chip_info.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -154,6 +157,39 @@ bool captureLiveSnapshot(const String& deviceId, JsonDocument& out) {
     out["sixback_build"]    = FW_BUILD_DATE;
     out["captured_at_ms"]   = (uint32_t)millis();
     out["esp_base_url"]     = "http://" + WiFi.localIP().toString() + ":" + String(BOSE_HTTP_PORT);
+
+    // Device-Health-Block (v0.8.x): macht den Snapshot-Knopf zum 1-Klick-Bug-
+    // Report-Kanal. Spiegelt die diagnostisch relevanten Felder aus /api/status
+    // (Chip/PSRAM/Heap/WiFi + Health-Counter), sodass sich aus einem einzigen
+    // Snapshot Reboot-vs-reiner-Disassoc (boot_count/wifi_reboots/last_reset)
+    // UND die Board-Identitaet (C5/S3, 4/16 MB, PSRAM ja/nein) ablesen lassen.
+    // Bewusst VOR dem outbound bmx-Loop erhoben: so zeigt heap.free den
+    // Ruhezustand und nicht den Dip durch die Capture-eigenen HTTP-Puffer
+    // (min_free ist der Boot-Tiefstwert und davon ohnehin unberuehrt).
+    JsonObject dev = out["device"].to<JsonObject>();
+    esp_chip_info_t chipInfo; esp_chip_info(&chipInfo);
+    JsonObject dchip   = dev["chip"].to<JsonObject>();
+    dchip["model"]      = chipModelStr();
+    dchip["cores"]      = chipInfo.cores;
+    dchip["revision"]   = chipInfo.revision;
+    dchip["flash_size"] = ESP.getFlashChipSize();
+    JsonObject dpsram = dev["psram"].to<JsonObject>();
+    dpsram["free"]    = ESP.getFreePsram();
+    dpsram["total"]   = ESP.getPsramSize();
+    JsonObject dheap  = dev["heap"].to<JsonObject>();
+    dheap["free"]     = ESP.getFreeHeap();
+    dheap["min_free"] = ESP.getMinFreeHeap();
+    dheap["total"]    = ESP.getHeapSize();
+    JsonObject dwifi  = dev["wifi"].to<JsonObject>();
+    dwifi["connected"] = WiFi.status() == WL_CONNECTED;
+    dwifi["ssid"]      = WiFi.SSID();
+    dwifi["rssi"]      = WiFi.RSSI();
+    dwifi["channel"]   = WiFi.channel();
+    dwifi["band"]      = (WiFi.getBand() == WIFI_BAND_5G) ? "5GHz" : "2.4GHz";
+    dev["speakers_count"]    = inv.list().size();
+    dev["scan_in_progress"]  = inv.isScanRunning();
+    dev["groups_persist_ok"] = groupsPersistOk();
+    healthToJson(dev["health"].to<JsonObject>());
 
     JsonObject sp = out["speaker"].to<JsonObject>();
     sp["device_id"]         = deviceId;
