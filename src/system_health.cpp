@@ -7,6 +7,7 @@
 #include <Preferences.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <esp_chip_info.h>
 #include <esp_system.h>
 #include <esp_task_wdt.h>
 
@@ -32,12 +33,15 @@ struct HealthState {
     uint32_t crash_count      = 0;
     uint32_t wifi_reboots     = 0;
     uint32_t heap_reboots     = 0;
+    uint32_t wifi_disconnects = 0;   // erkannte WLAN-Abrisse (auch ohne Reboot)
     uint8_t  last_reset_raw   = 0;   // esp_reset_reason() vom letzten Boot
     bool     wdt_subscribed   = false;
 
     // Laufzeit-Tracking (kein NVS)
     uint32_t wifi_down_since_ms   = 0;   // 0 = WiFi up
     uint32_t wifi_last_reconnect_ms = 0;
+    uint32_t last_wifi_down_s     = 0;   // Dauer des zuletzt abgeschlossenen Abrisses
+    bool     wifi_ever_up         = false; // erst-Connect nicht als Abriss zaehlen
     uint32_t heap_low_since_ms    = 0;   // 0 = ok
     uint32_t last_ping_ms         = 0;
     // Miss-Counter pro Speaker via Map (deviceId -> u8). Da wir nicht viele
@@ -93,6 +97,7 @@ void persistCounters() {
     p.putUInt("crash_count",  g.crash_count);
     p.putUInt("wifi_reboots", g.wifi_reboots);
     p.putUInt("heap_reboots", g.heap_reboots);
+    p.putUInt("wifi_disc",    g.wifi_disconnects);
     p.putUChar("last_reason", g.last_reset_raw);
     p.end();
 }
@@ -170,6 +175,7 @@ void healthInit() {
         g.crash_count    = p.getUInt("crash_count",  0);
         g.wifi_reboots   = p.getUInt("wifi_reboots", 0);
         g.heap_reboots   = p.getUInt("heap_reboots", 0);
+        g.wifi_disconnects = p.getUInt("wifi_disc", 0);
         g.last_reset_raw = p.getUChar("last_reason", 0);
         p.end();
     }
@@ -225,14 +231,31 @@ void healthTick() {
     if (g.wdt_subscribed) esp_task_wdt_reset();
 
     // 2) WiFi-Watchdog
-    bool wifi = (WiFi.status() == WL_CONNECTED);
+    // "Verbunden" heisst WL_CONNECTED UND gueltige IP. Ein STA kann
+    // WL_CONNECTED bei 0.0.0.0 halten (stiller Drop / DHCP-Renew-Fail) —
+    // eine reine status()-Pruefung sieht das nicht und der Watchdog wuerde
+    // nie armen. Deshalb die IP mitpruefen (globale WLAN-Checkliste).
+    bool wifi = (WiFi.status() == WL_CONNECTED) && (uint32_t)WiFi.localIP() != 0;
     if (wifi) {
+        if (g.wifi_down_since_ms != 0) {
+            // war down, jetzt wieder da — Dauer des Abrisses festhalten
+            g.last_wifi_down_s = (now - g.wifi_down_since_ms) / 1000;
+            Serial.printf("[health] WiFi recovered after %lus\n",
+                          (unsigned long)g.last_wifi_down_s);
+        }
         g.wifi_down_since_ms = 0;
+        g.wifi_ever_up = true;
     } else {
         if (g.wifi_down_since_ms == 0) {
             g.wifi_down_since_ms = now;
             g.wifi_last_reconnect_ms = 0;
-            Serial.println("[health] WiFi disconnected — watchdog armed");
+            // Erst-Connect nach dem Boot (noch nie up) NICHT als Abriss zaehlen.
+            if (g.wifi_ever_up) {
+                ++g.wifi_disconnects;
+                persistCounters();
+            }
+            Serial.printf("[health] WiFi disconnected — watchdog armed "
+                          "(disconnect #%u)\n", g.wifi_disconnects);
         }
         // Periodisch reconnect anstossen (nicht im Sekundentakt - alle 10s)
         if (now - g.wifi_last_reconnect_ms > HEALTH_WIFI_RECONNECT_S * 1000) {
@@ -276,6 +299,8 @@ void healthToJson(JsonObject out) {
     out["crash_count"]     = g.crash_count;
     out["wifi_reboots"]    = g.wifi_reboots;
     out["heap_reboots"]    = g.heap_reboots;
+    out["wifi_disconnects"] = g.wifi_disconnects;
+    out["last_wifi_down_s"] = g.last_wifi_down_s;
     out["last_reset"]      = resetReasonText((esp_reset_reason_t)g.last_reset_raw);
     out["wdt_subscribed"]  = g.wdt_subscribed;
     out["wifi_down_for_s"] = g.wifi_down_since_ms == 0 ? 0
@@ -288,6 +313,15 @@ void healthToJson(JsonObject out) {
 
 const char* lastResetReasonStr() {
     return resetReasonText((esp_reset_reason_t)g.last_reset_raw);
+}
+
+const char* chipModelStr() {
+    esp_chip_info_t info; esp_chip_info(&info);
+    return info.model == CHIP_ESP32S3 ? "ESP32-S3" :
+           info.model == CHIP_ESP32   ? "ESP32"    :
+           info.model == CHIP_ESP32C3 ? "ESP32-C3" :
+           info.model == CHIP_ESP32C6 ? "ESP32-C6" :
+           info.model == CHIP_ESP32C5 ? "ESP32-C5" : "?";
 }
 
 }  // namespace sixback
