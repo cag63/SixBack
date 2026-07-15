@@ -43,6 +43,8 @@ struct HealthState {
     uint32_t last_wifi_down_s     = 0;   // Dauer des zuletzt abgeschlossenen Abrisses
     bool     wifi_ever_up         = false; // erst-Connect nicht als Abriss zaehlen
     uint32_t heap_low_since_ms    = 0;   // 0 = ok
+    uint32_t heap_low_events      = 0;   // Episoden free-heap < Schwelle (runtime, KEIN NVS)
+    uint32_t last_heap_low_s      = 0;   // uptime-s beim letzten heap-low-Event
     uint32_t last_ping_ms         = 0;
     // Miss-Counter pro Speaker via Map (deviceId -> u8). Da wir nicht viele
     // haben, simple std::map waere ok, aber wir bleiben minimalistisch und
@@ -274,8 +276,10 @@ void healthTick() {
     if (freeHeap < HEALTH_HEAP_LOW_BYTES) {
         if (g.heap_low_since_ms == 0) {
             g.heap_low_since_ms = now;
-            Serial.printf("[health] free-heap %u < %u — watchdog armed\n",
-                          freeHeap, HEALTH_HEAP_LOW_BYTES);
+            ++g.heap_low_events;                       // FHEM 144729: Feld-Beleg der
+            g.last_heap_low_s = millis() / 1000;       // Heap-Druck-Episode (auch ohne Reboot)
+            Serial.printf("[health] free-heap %u < %u — watchdog armed (event #%u)\n",
+                          freeHeap, HEALTH_HEAP_LOW_BYTES, g.heap_low_events);
         }
         if (now - g.heap_low_since_ms > HEALTH_HEAP_LOW_REBOOT_S * 1000) {
             doSelfReboot("free-heap low > threshold", g.heap_reboots);
@@ -307,6 +311,8 @@ void healthToJson(JsonObject out) {
                               : (millis() - g.wifi_down_since_ms) / 1000;
     out["heap_low_for_s"]  = g.heap_low_since_ms == 0 ? 0
                               : (millis() - g.heap_low_since_ms) / 1000;
+    out["heap_low_events"] = g.heap_low_events;
+    out["last_heap_low_s"] = g.last_heap_low_s;
     out["last_ping_age_s"] = g.last_ping_ms == 0 ? -1
                               : (int)((millis() - g.last_ping_ms) / 1000);
 }

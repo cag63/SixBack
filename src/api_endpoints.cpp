@@ -33,6 +33,7 @@
 #include "gabbo_watcher.h"
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <esp_heap_caps.h>
 #include "speaker_diagnostic.h"
 #include "diag_settings.h"
 #include "spotify_player.h"
@@ -71,10 +72,25 @@ inline bool     outboundHasPsram()    { return ESP.getPsramSize() > 0; }
 inline uint32_t outboundHeapFloor()   { return outboundHasPsram() ? 20000u : 45000u; }
 inline int      outboundMaxInflight() { return outboundHasPsram() ? 8 : 2; }
 
+// FHEM 144729 (v0.8.32): kurze, empirisch abgesicherte Timeouts fuer die zwei
+// synchronen Live-Outbound-Handler. Lab-Messung (Kueche/Emma/Greta, wach):
+// /presets + /now_playing antworten in <60 ms; der alte 3s-Read (bzw. FEHLENDE
+// Timeout in now-playing-live -> HTTPClient-Default ~5s) hielt bei einem
+// nicht-antwortenden Standby-Speaker den EINEN async_tcp-Task sekundenlang fest
+// -> Connection-Backlog + Heap-Drain -> Stick "taub" ohne Disassoc (lab-repro).
+// 600/800 ms = >13x Marge ueber gemessenem Max, kappt die worst-case-Blockade.
+constexpr uint16_t LIVE_OUT_CONNECT_MS = 600;
+constexpr uint16_t LIVE_OUT_READ_MS    = 800;
+
 struct OutboundGuard {
     bool acquired = false;
     OutboundGuard() {
-        if (ESP.getFreeHeap() < outboundHeapFloor()) return;   // Heap zu knapp -> ablehnen
+        // Fragmentierungs-ehrlich: groesster zusammenhaengender Block statt
+        // getFreeHeap()-Summe. HTTPClient-RX + getString()-Body brauchen einen
+        // CONTIGUOUSEN Block; 45KB freie Kruemel helfen nicht. Internal-RAM,
+        // weil WiFi/LWIP-Puffer nicht ins PSRAM koennen.
+        if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) < outboundHeapFloor())
+            return;
         int n = g_outboundInflight.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n > outboundMaxInflight()) {
             g_outboundInflight.fetch_sub(1, std::memory_order_relaxed);
@@ -92,6 +108,46 @@ inline bool outboundReject(AsyncWebServerRequest* req) {
     req->send(503, "application/json",
               "{\"error\":\"device busy (low heap) \\u2014 retry\",\"retry\":true}");
     return true;
+}
+
+// -----------------------------------------------------------------------------
+// Micro-Cache fuer die zwei synchronen Live-Outbound-Handler (FHEM 144729,
+// v0.8.32). ALLE AsyncWebServer-Handler laufen im selben async_tcp-Task
+// (serialisiert) -> KEIN Mutex noetig. Ein kurzes TTL-Fenster kollabiert den
+// Cold-Load-Fan-out (je 1 Request pro Speaker), die kickPoll-Bursts (0/800/
+// 2500 ms) und neuer-Tab-Reloads auf max EINEN echten Outbound pro
+// (Speaker x Endpoint) pro TTL -> weniger Blockaden, weniger Heap-Druck.
+// Nur erfolgreiche (200) Bodies werden gecached; Fehler bleiben un-gecached.
+// -----------------------------------------------------------------------------
+constexpr uint32_t OUT_CACHE_TTL_MS = 2500;
+constexpr int      OUT_CACHE_N      = 12;   // 6 Speaker x 2 Endpoints
+struct OutCacheEntry {
+    String   key;
+    String   body;
+    uint32_t expiresMs = 0;
+};
+OutCacheEntry g_outCache[OUT_CACHE_N];
+
+bool outCacheGet(const String& key, String& body) {
+    uint32_t now = millis();
+    for (auto& e : g_outCache) {
+        if (e.expiresMs > now && e.key == key) { body = e.body; return true; }
+    }
+    return false;
+}
+void outCachePut(const String& key, const String& body) {
+    uint32_t now = millis();
+    OutCacheEntry* victim = nullptr;
+    uint32_t oldest = UINT32_MAX;
+    for (auto& e : g_outCache) {
+        if (e.key == key)          { victim = &e; break; }   // gleicher key -> ersetzen
+        if (e.expiresMs <= now)    { victim = &e; break; }   // freier/abgelaufener Slot
+        if (e.expiresMs < oldest)  { oldest = e.expiresMs; victim = &e; }
+    }
+    if (!victim) victim = &g_outCache[0];
+    victim->key = key;
+    victim->body = body;
+    victim->expiresMs = now + OUT_CACHE_TTL_MS;
 }
 } // namespace
 
@@ -650,6 +706,26 @@ void handlePutPreset(AsyncWebServerRequest* req, JsonDocument& body) {
                   "remove unused speakers or try POST /api/nvs/cleanup\"}");
         return;
     }
+    // Echtes (nicht-Sentinel-)Preset ueber einen Spotify-gebundenen Slot:
+    // die Bindung waere ab jetzt verwaist (tote Sub-Row in der UI, Playlist-
+    // Name in Fremd-Clients wie FHEM BOSEST — 144729 #151). Hier mitraeumen,
+    // damit die Invariante "Nicht-Sentinel-Preset => keine Bindung" fuer ALLE
+    // Clients gilt, nicht nur die WebUI. Drei Ausnahmen: sspot{N}-Writes
+    // (applySpotifyDrop Schritt 2), Imports mit spotify-Feld (Block unten
+    // setzt die Bindung gewollt neu) und EMPTY-Writes (leerer Slot + Bindung
+    // = Click-to-Play-Feature). getSlot-Vorabcheck, weil setSlot("") sonst
+    // bei jedem Preset-PUT grundlos NVS schreiben wuerde (Flash-Wear).
+    if (p.source != sixback::PresetSource::EMPTY &&
+        p.stationId != String("sspot") + String((int)slot) &&
+        !body["spotify"].is<JsonObject>()) {
+        sixback::spotify::SlotMapping stale;
+        if (sixback::spotify::getSlot(id, slot, stale) && stale.spotifyUri.length() > 0) {
+            sixback::spotify::setSlot(id, slot, "", "");
+            Serial.printf("[spot] slot %s/%d: stale binding cleared by preset overwrite\n",
+                          id.c_str(), slot);
+        }
+    }
+
     // Single-Preset-Import via File-Drop: optionales spotify-Feld mitnehmen,
     // sonst geht beim Re-Import die Track/Album-Bindung verloren. Wird hier
     // ZUSAETZLICH zur PresetStore-Schreibung gemacht (idempotent zum 2-Step-
@@ -2215,9 +2291,12 @@ void handleSpeakerRename(AsyncWebServerRequest* req, JsonDocument& body) {
 //   per stationId/streamUrl zu matchen, was die SCMUDC-Variante nicht kennt.
 // -----------------------------------------------------------------------------
 void handleNowPlayingLive(AsyncWebServerRequest* req) {
+    String id = pathParam(0);
+    String cacheKey = "np#" + id;                          // FHEM 144729 v0.8.32
+    String cached;
+    if (outCacheGet(cacheKey, cached)) { req->send(200, "application/json", cached); return; }
     OutboundGuard guard;                                   // FHEM 144729 #121
     if (!guard.acquired) { outboundReject(req); return; }
-    String id = pathParam(0);
     auto& inv = sixback::SpeakerInventory::instance();
     String spIp;
     {
@@ -2228,6 +2307,8 @@ void handleNowPlayingLive(AsyncWebServerRequest* req) {
     }
     HTTPClient h;
     h.setReuse(false);
+    h.setConnectTimeout(LIVE_OUT_CONNECT_MS);              // FHEM 144729: hatte KEIN
+    h.setTimeout(LIVE_OUT_READ_MS);                        // Timeout -> Default ~5s Blockade
     String u = "http://" + spIp + ":" + String(BOSE_BMX_PORT) + "/now_playing";
     if (!h.begin(u)) { req->send(502, "application/json", "{\"error\":\"http begin failed\"}"); return; }
     int code = h.GET();
@@ -2286,6 +2367,7 @@ void handleNowPlayingLive(AsyncWebServerRequest* req) {
     out["art_url"] = art;
     out["play_status"] = playStatus;
     String body; serializeJson(out, body);
+    outCachePut(cacheKey, body);                           // FHEM 144729 v0.8.32
     req->send(200, "application/json", body);
 }
 
@@ -2727,7 +2809,8 @@ struct HwSlotInfo_ {
 
 static bool fetchHardwarePresets_(const String& spIp, HwSlotInfo_ out[6]) {
     HTTPClient h; h.setReuse(false);
-    h.setTimeout(3000);
+    h.setConnectTimeout(LIVE_OUT_CONNECT_MS);   // FHEM 144729: Connect bounden
+    h.setTimeout(LIVE_OUT_READ_MS);             // (toter Standby-Speaker -> kurz raus)
     String url = "http://" + spIp + ":" + String(BOSE_BMX_PORT) + "/presets";
     if (!h.begin(url)) return false;
     int code = h.GET();
@@ -2772,9 +2855,12 @@ static bool fetchHardwarePresets_(const String& spIp, HwSlotInfo_ out[6]) {
 //   Zeile in der Slot-Karte gebraucht, parallel zum Store-Endpoint.
 // -----------------------------------------------------------------------------
 void handleGetHardwarePresets(AsyncWebServerRequest* req) {
+    String id = pathParam(0);
+    String cacheKey = "hp#" + id;                          // FHEM 144729 v0.8.32
+    String cached;
+    if (outCacheGet(cacheKey, cached)) { req->send(200, "application/json", cached); return; }
     OutboundGuard guard;                                   // FHEM 144729 #121
     if (!guard.acquired) { outboundReject(req); return; }
-    String id = pathParam(0);
     auto& inv = sixback::SpeakerInventory::instance();
     String spIp;
     {
@@ -2799,6 +2885,7 @@ void handleGetHardwarePresets(AsyncWebServerRequest* req) {
         }
     }
     String body; serializeJson(doc, body);
+    if (ok) outCachePut(cacheKey, body);                   // nur Erfolg cachen
     req->send(ok ? 200 : 502, "application/json", body);
 }
 
