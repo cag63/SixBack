@@ -69,9 +69,22 @@ namespace {
 std::atomic<int>      g_outboundInflight{0};
 std::atomic<uint32_t> g_outboundRejects{0};   // 503-Zaehler (runtime, KEIN NVS) —
                                               // forensisch via /api/status ablesbar
+// Per-Ursache-Aufschluesselung (FHEM 144729 #155): "low heap" im UI kann
+// total-Floor, largest-Block ODER Inflight-Cap sein — ohne Aufschluesselung
+// ist ein Feld-Report wie betateilchens 4.-Box-Fall nicht diagnostizierbar.
+std::atomic<uint32_t> g_rejFloorTotal{0};
+std::atomic<uint32_t> g_rejFloorBlock{0};
+std::atomic<uint32_t> g_rejInflight{0};
 
 inline bool     outboundHasPsram()    { return ESP.getPsramSize() > 0; }
-inline uint32_t outboundHeapFloor()   { return outboundHasPsram() ? 20000u : 45000u; }
+// no-PSRAM-Floor 45K -> 30K (Lab .58 2026-07-17): 45K war auf die Vor-.32-Lage
+// ohne Outbound-Timeouts kalibriert. Seit .32 ist der Drain pro Handler auf
+// 600/800 ms + inflight<=2 gebunden; gemessener Normalbetrieb C5 dippt auf
+// ~61K (UI-Burst) bzw. min_free 28.7K ueber 8.7h ohne Kollaps. Der harte
+// Accept-Storm-Kollaps (#121-Klasse) passiert bei free >=48K und wird von
+// KEINEM Handler-Floor verhindert — 45K blockierte also nur den Normalbetrieb
+// (betateilchen #155: Baseline 45-62K = Dauer-Reject).
+inline uint32_t outboundHeapFloor()   { return outboundHasPsram() ? 20000u : 30000u; }
 inline int      outboundMaxInflight() { return outboundHasPsram() ? 8 : 2; }
 // Contiguous-Bedarf der zwei leichten Live-Handler (HTTPClient-RX-Puffer +
 // getString()-Body von /presets bzw. /now_playing = wenige KB) — bewusst
@@ -105,13 +118,18 @@ struct OutboundGuard {
         // (Lab-Repro 2026-07-17: seriell 10/10 200er, UI-Burst 17/18 503er).
         // Die Handler brauchen contiguous nur wenige KB (RX-Puffer + XML-Body)
         // -> eigener Floor 16K statt 45K; 45K-total bleibt als Kollaps-Netz.
-        if (ESP.getFreeHeap() < outboundHeapFloor())
+        if (ESP.getFreeHeap() < outboundHeapFloor()) {
+            g_rejFloorTotal.fetch_add(1, std::memory_order_relaxed);
             return;
-        if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) < outboundBlockFloor())
+        }
+        if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) < outboundBlockFloor()) {
+            g_rejFloorBlock.fetch_add(1, std::memory_order_relaxed);
             return;
+        }
         int n = g_outboundInflight.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n > outboundMaxInflight()) {
             g_outboundInflight.fetch_sub(1, std::memory_order_relaxed);
+            g_rejInflight.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         acquired = true;
@@ -316,6 +334,13 @@ void handleStatus(AsyncWebServerRequest* req) {
     // outbound_rejects zaehlt gesendete 503er seit Boot (runtime-only).
     heap["largest_block"]    = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     heap["outbound_rejects"] = g_outboundRejects.load(std::memory_order_relaxed);
+    // Aufschluesselung nach Reject-Ursache (FHEM 144729 #155) — nur wenn
+    // ueberhaupt rejected wurde, sonst Status-Noise fuer alle.
+    if (g_outboundRejects.load(std::memory_order_relaxed) > 0) {
+        heap["rej_floor_total"] = g_rejFloorTotal.load(std::memory_order_relaxed);
+        heap["rej_floor_block"] = g_rejFloorBlock.load(std::memory_order_relaxed);
+        heap["rej_inflight"]    = g_rejInflight.load(std::memory_order_relaxed);
+    }
     JsonObject psram  = doc["psram"].to<JsonObject>();
     psram["free"]     = ESP.getFreePsram();
     psram["total"]    = ESP.getPsramSize();
@@ -3422,6 +3447,19 @@ void handleOtaUpdateStatus(AsyncWebServerRequest* req) {
 }
 #endif // SIXBACK_OTA_ENABLED
 
+// Lab-Befund 2026-07-17 (FHEM 144729 #155): ZWEI gleichzeitige Transfers des
+// 75-KB-Bundles machen den no-PSRAM-C5 in ~1-2 s dauerhaft netz-taub — der
+// Heap-Sturz passiert WAEHREND der parallelen chunked-Sends, ein Heap-Check am
+// Request-Anfang (beide sehen noch ~78K free) greift prinzipiell nicht. Ein
+// einzelner Transfer ist auch im Dauerfeuer stabil (256 Loads in Folge, 0
+// Loss). Deshalb harte Parallel-Grenze. Decrement via onDisconnect ist hier
+// zuverlaessig transfer-genau: diese Lib-Version (ESPAsyncWebServer 3.x)
+// schliesst die Verbindung nach JEDER fertigen Response (_onAck ->
+// _client->close()), es gibt keinen Keep-Alive-Pfad der den Zaehler pinnen
+// koennte.
+std::atomic<int> g_indexInflight{0};
+inline int indexMaxInflight() { return outboundHasPsram() ? 3 : 1; }
+
 void handleRoot(AsyncWebServerRequest* req) {
     // FHEM 144729 #121: unter Heap-Druck (Page-Load-Burst / mehrere Tabs auf dem
     // no-PSRAM-C5) das schwere 74-KB-Bundle-Serving kurz mit 503 abweisen statt
@@ -3435,6 +3473,17 @@ void handleRoot(AsyncWebServerRequest* req) {
                   "<body style=\"font-family:sans-serif\">SixBack is busy \xE2\x80\x94 retrying\xE2\x80\xA6</body>");
         return;
     }
+    int n = g_indexInflight.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n > indexMaxInflight()) {
+        g_indexInflight.fetch_sub(1, std::memory_order_relaxed);
+        req->send(503, "text/html",
+                  "<!doctype html><meta http-equiv=\"refresh\" content=\"1\">"
+                  "<body style=\"font-family:sans-serif\">SixBack is busy \xE2\x80\x94 retrying\xE2\x80\xA6</body>");
+        return;
+    }
+    req->onDisconnect([]() {
+        g_indexInflight.fetch_sub(1, std::memory_order_relaxed);
+    });
     // index.html ist >100 KB; AsyncWebServer schafft das im uncompressed-Pfad
     // nicht zuverlaessig (Truncation/Timeouts unter Last). Wenn index.html.gz
     // im LittleFS liegt -> serve mit Content-Encoding: gzip. Browser entpackt.

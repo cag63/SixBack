@@ -127,6 +127,16 @@ bool PresetStore::saveToNVS() {
     JsonDocument doc;
     JsonArray arr = doc["speakers"].to<JsonArray>();
     for (auto& s : speakers_) {
+        // Komplett leere Eintraege nicht persistieren: semantisch identisch
+        // zu "absent" (buildDevicePresets_ liefert so oder so kein <presets>),
+        // aber sie akkumulieren sonst als Dauer-Cruft im Blob (jeder je
+        // gesehene/geloeschte Speaker bliebe fuer immer drin). Spotify-
+        // Bindings liegen separat in sixback-spot und sind nicht betroffen.
+        bool any = false;
+        for (int i = 0; i < 6; ++i) {
+            if (s.slots[i].source != PresetSource::EMPTY) { any = true; break; }
+        }
+        if (!any) continue;
         JsonObject ps = arr.add<JsonObject>();
         ps["deviceId"] = s.deviceId;
         JsonArray pa  = ps["presets"].to<JsonArray>();
