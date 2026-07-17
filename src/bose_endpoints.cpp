@@ -397,6 +397,24 @@ void handleAccountFull(AsyncWebServerRequest* req) {
         }
     }
 
+    // Boot-Load-Fail-Gate (FHEM 144729 #153, 2026-07-17): konnte der
+    // Preset-Store beim Boot NICHT geladen werden, obwohl ein Blob in NVS
+    // LIEGT (unlesbar/korrupt), ist jeder 200er hier brandgefaehrlich —
+    // die anyMediaServers-Lockerung unten wuerde Device-Bloecke OHNE
+    // <presets>-Element ausliefern und die Speaker wipen ihre Caches
+    // (Vorfall 2026-05-20, s.u.), obwohl der User Presets HAT. Dann lieber
+    // pauschal 404 (Speaker behalten den Cache) — bis der erste
+    // erfolgreiche Save den defekten Blob ersetzt hat (loescht das Flag;
+    // auch Recovery via import-from-device bleibt so moeglich, weil die
+    // Speaker-HW-Presets nie ueberschrieben wurden). Fresh-Install (KEIN
+    // Blob vorhanden) setzt das Flag nicht — Migration/Kueche-DLNA-Pfad
+    // (2026-05-21) bleibt unangetastet.
+    if (sixback::PresetStore::instance().loadFailedFromNvs()) {
+        Serial.println("[bmx][safe] account/full -> 404 (preset store unlesbar — schuetzt Speaker-Cache bis zum ersten erfolgreichen Save)");
+        req->send(404, "application/vnd.bose.streaming-v1.2+xml", "");
+        return;
+    }
+
     // Defense (Race-Fix 2026-05-20): wenn KEIN matched Speaker Presets im
     // Store hat, returnen wir 404 statt account/full mit fehlendem
     // <presets>-Block pro Device. Symmetrisch zu handleAccountPresets +

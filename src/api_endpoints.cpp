@@ -66,11 +66,17 @@
 // haben Reserve -> grosszuegig; no-PSRAM (C5/C6/C3) -> streng.
 // -----------------------------------------------------------------------------
 namespace {
-std::atomic<int> g_outboundInflight{0};
+std::atomic<int>      g_outboundInflight{0};
+std::atomic<uint32_t> g_outboundRejects{0};   // 503-Zaehler (runtime, KEIN NVS) —
+                                              // forensisch via /api/status ablesbar
 
 inline bool     outboundHasPsram()    { return ESP.getPsramSize() > 0; }
 inline uint32_t outboundHeapFloor()   { return outboundHasPsram() ? 20000u : 45000u; }
 inline int      outboundMaxInflight() { return outboundHasPsram() ? 8 : 2; }
+// Contiguous-Bedarf der zwei leichten Live-Handler (HTTPClient-RX-Puffer +
+// getString()-Body von /presets bzw. /now_playing = wenige KB) — bewusst
+// GETRENNT vom total-free-Floor oben, siehe Guard-Kommentar (FHEM 144729 #153).
+inline uint32_t outboundBlockFloor()  { return 16000u; }
 
 // FHEM 144729 (v0.8.32): kurze, empirisch abgesicherte Timeouts fuer die zwei
 // synchronen Live-Outbound-Handler. Lab-Messung (Kueche/Emma/Greta, wach):
@@ -85,11 +91,23 @@ constexpr uint16_t LIVE_OUT_READ_MS    = 800;
 struct OutboundGuard {
     bool acquired = false;
     OutboundGuard() {
-        // Fragmentierungs-ehrlich: groesster zusammenhaengender Block statt
-        // getFreeHeap()-Summe. HTTPClient-RX + getString()-Body brauchen einen
-        // CONTIGUOUSEN Block; 45KB freie Kruemel helfen nicht. Internal-RAM,
-        // weil WiFi/LWIP-Puffer nicht ins PSRAM koennen.
-        if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) < outboundHeapFloor())
+        // Doppel-Bedingung (v0.8.33-Fix, FHEM 144729 #153):
+        // (1) total-free-Floor wie v0.8.30/31 — Kollaps-Schutz gegen den
+        //     #121-Heap-Absturz unter Page-Load-Concurrency.
+        // (2) largest-block-Floor fuer die contiguous HTTPClient/String-
+        //     Allokation der zwei leichten Handler — Fragmentierungs-Check.
+        // REGRESSION v0.8.32: dort wurde largest_free_block gegen den ALTEN
+        // total-Floor (45K no-PSRAM) gemessen. Der war fuer die getFreeHeap-
+        // SUMME kalibriert; largest block liegt auf dem no-PSRAM-C5 schon
+        // beim normalen WebUI-Lade-Burst (6 gequeueste Connections) darunter
+        // -> Guard lehnte praktisch JEDEN Per-Speaker-Read ab, WebUI dauerhaft
+        // ohne Presets ("device busy"), obwohl free ~70-80K gesund war
+        // (Lab-Repro 2026-07-17: seriell 10/10 200er, UI-Burst 17/18 503er).
+        // Die Handler brauchen contiguous nur wenige KB (RX-Puffer + XML-Body)
+        // -> eigener Floor 16K statt 45K; 45K-total bleibt als Kollaps-Netz.
+        if (ESP.getFreeHeap() < outboundHeapFloor())
+            return;
+        if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) < outboundBlockFloor())
             return;
         int n = g_outboundInflight.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n > outboundMaxInflight()) {
@@ -105,6 +123,7 @@ struct OutboundGuard {
 
 // true = abgelehnt (503 gesendet), Handler soll sofort returnen.
 inline bool outboundReject(AsyncWebServerRequest* req) {
+    g_outboundRejects.fetch_add(1, std::memory_order_relaxed);
     req->send(503, "application/json",
               "{\"error\":\"device busy (low heap) \\u2014 retry\",\"retry\":true}");
     return true;
@@ -292,6 +311,11 @@ void handleStatus(AsyncWebServerRequest* req) {
     heap["free"]      = ESP.getFreeHeap();
     heap["min_free"]  = ESP.getMinFreeHeap();
     heap["total"]     = ESP.getHeapSize();
+    // FHEM 144729 #153: Fragmentierungs-Sicht + Guard-Forensik. largest_block
+    // ist die Groesse, gegen die der OutboundGuard prueft (internal RAM);
+    // outbound_rejects zaehlt gesendete 503er seit Boot (runtime-only).
+    heap["largest_block"]    = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    heap["outbound_rejects"] = g_outboundRejects.load(std::memory_order_relaxed);
     JsonObject psram  = doc["psram"].to<JsonObject>();
     psram["free"]     = ESP.getFreePsram();
     psram["total"]    = ESP.getPsramSize();
@@ -313,6 +337,18 @@ void handleStatus(AsyncWebServerRequest* req) {
     // scheiterte (NVS voll trotz Cleanup) → Gruppe nur im RAM. Der Speaker bekommt
     // weiterhin 201/200 (BMX-Contract), der Fehlschlag ist NUR hier sichtbar.
     doc["groups_persist_ok"] = groupsPersistOk();
+
+    // Preset-Store-Forensik (FHEM 144729 #153): load_ok=false = beim Boot lag
+    // ein Store-Blob in NVS, war aber unlesbar (Store startete leer, /full
+    // gated auf 404); save_fails = fehlgeschlagene NVS-Saves seit Boot
+    // (inkl. JsonDocument-Overflow); speakers = geladene Store-Slices.
+    {
+        auto& ps = sixback::PresetStore::instance();
+        JsonObject pstore = doc["preset_store"].to<JsonObject>();
+        pstore["load_ok"]    = !ps.loadFailedFromNvs();
+        pstore["save_fails"] = ps.saveFails();
+        pstore["speakers"]   = (uint32_t)ps.speakerCount();
+    }
 
     // Health-Snapshot: boot/crash-counter, last reset reason, watchdog state
     JsonObject health = doc["health"].to<JsonObject>();

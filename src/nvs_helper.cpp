@@ -164,7 +164,9 @@ bool hsDecompress_(const uint8_t* in, size_t inLen, std::unique_ptr<char[]>& out
 
 } // namespace
 
-bool nvsLoadJson(const char* ns, const char* key, JsonDocument& doc) {
+bool nvsLoadJson(const char* ns, const char* key, JsonDocument& doc,
+                 bool* dataPresent) {
+    if (dataPresent) *dataPresent = false;
     Preferences p;
     if (!p.begin(ns, true)) return false;
     // Seit dem Blob-Umbau (2026-06-07) liegen JSON-Payloads als NVS-BLOB —
@@ -174,11 +176,21 @@ bool nvsLoadJson(const char* ns, const char* key, JsonDocument& doc) {
     // Eintrag typ-wechselnd durch ein Blob (NVS: neuer Wert ersetzt Typ+Wert).
     size_t blen = p.getBytesLength(key);
     if (blen > 0) {
+        if (dataPresent) *dataPresent = true;
         std::unique_ptr<uint8_t[]> buf(new (std::nothrow) uint8_t[blen + 1]);
-        if (!buf) { p.end(); return false; }
+        if (!buf) {
+            p.end();
+            Serial.printf("[nvs-load] FAIL alloc ns=%s key=%s blob=%u\n",
+                          ns, key, (unsigned)blen);
+            return false;
+        }
         size_t got = p.getBytes(key, buf.get(), blen);
         p.end();
-        if (got != blen) return false;
+        if (got != blen) {
+            Serial.printf("[nvs-load] FAIL getBytes ns=%s key=%s want=%u got=%u\n",
+                          ns, key, (unsigned)blen, (unsigned)got);
+            return false;
+        }
         buf[blen] = '\0';
         // "HS"-Frame -> heatshrink-komprimiert (seit Kompressions-Stufe);
         // sonst Klartext-JSON-Blob (v0.8.15/16 + kleine Werte).
@@ -191,16 +203,29 @@ bool nvsLoadJson(const char* ns, const char* key, JsonDocument& doc) {
             }
             // const char* erzwingt Copy-Mode in ArduinoJson (kein zero-copy
             // in den gleich freigegebenen Buffer).
-            return deserializeJson(doc, (const char*)plain.get())
-                   == DeserializationError::Ok;
+            DeserializationError e = deserializeJson(doc, (const char*)plain.get());
+            if (e != DeserializationError::Ok)
+                // War bis 2026-07-17 STILL — ein korrupter Blob startete den
+                // Store kommentarlos leer (fred/144729-#153-Forensik-Luecke).
+                Serial.printf("[nvs-load] FAIL json-parse ns=%s key=%s err=%s\n",
+                              ns, key, e.c_str());
+            return e == DeserializationError::Ok;
         }
-        return deserializeJson(doc, (const char*)buf.get())
-               == DeserializationError::Ok;
+        DeserializationError e = deserializeJson(doc, (const char*)buf.get());
+        if (e != DeserializationError::Ok)
+            Serial.printf("[nvs-load] FAIL json-parse ns=%s key=%s err=%s\n",
+                          ns, key, e.c_str());
+        return e == DeserializationError::Ok;
     }
     String s = p.getString(key, "");
     p.end();
     if (s.length() == 0) return false;
-    return deserializeJson(doc, s) == DeserializationError::Ok;
+    if (dataPresent) *dataPresent = true;
+    DeserializationError e = deserializeJson(doc, s);
+    if (e != DeserializationError::Ok)
+        Serial.printf("[nvs-load] FAIL json-parse(str) ns=%s key=%s err=%s\n",
+                      ns, key, e.c_str());
+    return e == DeserializationError::Ok;
 }
 
 bool nvsSaveJson(const char* ns, const char* key, JsonDocument& doc) {

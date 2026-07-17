@@ -74,7 +74,25 @@ PresetSource presetSourceFromStr(const String& s) {
 void PresetStore::loadFromNVS() {
     LockGuard g(*this);
     JsonDocument doc;
-    if (!nvsLoadJson(NVS_NS, NVS_KEY, doc)) return;
+    bool dataPresent = false;
+    if (!nvsLoadJson(NVS_NS, NVS_KEY, doc, &dataPresent)) {
+        // FHEM 144729 #153: "fresh" (kein Blob) von "Blob vorhanden aber
+        // UNLESBAR" unterscheiden. Letzteres war bis 2026-07-17 komplett
+        // still — der Store startete kommentarlos leer, und der naechste
+        // /full-Poll konnte die Speaker-Caches wipen. Jetzt: Flag setzen
+        // (handleAccountFull gated damit auf 404, /api/status zeigt
+        // preset_store.load_ok=false) + laut loggen. Das Flag loescht der
+        // erste erfolgreiche saveToNVS (der ersetzt den defekten Blob).
+        loadFailed_ = dataPresent;
+        if (dataPresent)
+            Serial.println("[preset] LOAD FAILED — stored blob unreadable; "
+                           "store startet leer, /full liefert 404 bis zum "
+                           "ersten erfolgreichen Save (load_ok=false)");
+        else
+            Serial.println("[preset] no stored presets (fresh)");
+        return;
+    }
+    loadFailed_ = false;
     speakers_.clear();
     for (JsonObject ps : doc["speakers"].as<JsonArray>()) {
         PerSpeaker s;
@@ -128,7 +146,33 @@ bool PresetStore::saveToNVS() {
             }
         }
     }
-    return nvsSaveJsonWithCleanup(NVS_NS, NVS_KEY, doc);
+    // FHEM 144729 #153: ein bei Heap-Knappheit ueberlaufenes JsonDocument
+    // (ArduinoJson dropt Nodes still) wuerde als VALIDES Teil-JSON committed
+    // und verloere die hinteren Speaker-Slices dauerhaft. Dann lieber gar
+    // nicht schreiben — der alte NVS-Stand bleibt intakt, RAM ist weiterhin
+    // vollstaendig, der naechste Save (mit mehr Heap) heilt.
+    if (doc.overflowed()) {
+        ++saveFails_;
+        Serial.println("[preset] saveToNVS ABORT: JsonDocument overflowed "
+                       "(heap zu knapp) — NVS-Stand bleibt unangetastet");
+        return false;
+    }
+    bool ok = nvsSaveJsonWithCleanup(NVS_NS, NVS_KEY, doc);
+    if (ok) {
+        // Erfolgreicher Save ersetzt einen ggf. defekten Boot-Blob ->
+        // Load-Fail-Zustand ist damit geheilt, /full darf wieder servieren.
+        loadFailed_ = false;
+    } else {
+        // Zentrale Zaehlung fuer ALLE Caller — clear()/syncToGroup()
+        // ignorierten das Ergebnis bis 2026-07-17 komplett (silent loss).
+        ++saveFails_;
+    }
+    return ok;
+}
+
+size_t PresetStore::speakerCount() {
+    LockGuard g(*this);
+    return speakers_.size();
 }
 
 PresetStore::PerSpeaker* PresetStore::findOrCreate_(const String& deviceId) {

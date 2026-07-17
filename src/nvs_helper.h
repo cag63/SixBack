@@ -13,7 +13,12 @@ namespace sixback {
 // und heatshrink-komprimiertes Blob ("HS"-Frame, seit der Kompressions-
 // Stufe). Aeltere Formate werden beim naechsten Save in-place ersetzt.
 // Gibt false zurueck wenn nicht da, Decode- oder Parse-Fehler.
-bool nvsLoadJson(const char* ns, const char* key, JsonDocument& doc);
+// dataPresent (optional, FHEM 144729 #153): wird true gesetzt, wenn unter
+// ns/key DATEN LIEGEN (Blob/String nicht leer) — erlaubt dem Caller,
+// "fresh/leer" (false+false) von "vorhanden aber UNLESBAR" (false+true)
+// zu unterscheiden. Letzteres ist der forensisch wichtige Fall.
+bool nvsLoadJson(const char* ns, const char* key, JsonDocument& doc,
+                 bool* dataPresent = nullptr);
 
 // Serialisiert 'doc' und schreibt als BLOB unter ns/key; Werte >= 512 B
 // werden heatshrink-komprimiert (w=8/l=4, ~1,6 KB transienter Heap,
