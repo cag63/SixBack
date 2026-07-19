@@ -111,6 +111,22 @@ public:
     // werden.  Liefert true wenn gefunden + befuellt out.
     bool findByStationId(const String& stationId, Preset& out);
 
+    // --- Forensik (FHEM 144729 #153, 2026-07-17) -------------------------
+    // true = beim Boot LAG ein Store-Blob in NVS, war aber UNLESBAR
+    // (hs-decode-/getBytes-/JSON-Parse-Fehler) -> Store startete leer,
+    // OBWOHL der User Presets hatte. handleAccountFull gated darauf mit
+    // 404 (Speaker behalten ihren Cache), bis der erste erfolgreiche
+    // saveToNVS den defekten Blob ersetzt hat. Fresh-Install (kein Blob)
+    // setzt das Flag NICHT.
+    bool     loadFailedFromNvs() const { return loadFailed_; }
+    // Fehlgeschlagene saveToNVS() seit Boot (inkl. JsonDocument-Overflow),
+    // zentral gezaehlt fuer ALLE Caller (set/setSlots/clear/syncToGroup/
+    // importJson) — runtime-only, via /api/status preset_store.save_fails.
+    uint32_t saveFails() const         { return saveFails_; }
+    // Anzahl Speaker-Eintraege im Store (Boot-Forensik: wie viele Slices
+    // der Load tatsaechlich geliefert hat).
+    size_t   speakerCount();
+
 private:
     PresetStore() = default;
 
@@ -127,6 +143,8 @@ private:
     void initMutex_();
 
     mutable SemaphoreHandle_t mx_ = nullptr;
+    bool     loadFailed_ = false;   // Blob vorhanden aber unlesbar (Boot)
+    uint32_t saveFails_  = 0;       // saveToNVS-Fehlschlaege seit Boot
 };
 
 const char* presetSourceToStr(PresetSource s);

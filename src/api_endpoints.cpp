@@ -33,6 +33,7 @@
 #include "gabbo_watcher.h"
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <esp_heap_caps.h>
 #include "speaker_diagnostic.h"
 #include "diag_settings.h"
 #include "spotify_player.h"
@@ -65,19 +66,70 @@
 // haben Reserve -> grosszuegig; no-PSRAM (C5/C6/C3) -> streng.
 // -----------------------------------------------------------------------------
 namespace {
-std::atomic<int> g_outboundInflight{0};
+std::atomic<int>      g_outboundInflight{0};
+std::atomic<uint32_t> g_outboundRejects{0};   // 503-Zaehler (runtime, KEIN NVS) —
+                                              // forensisch via /api/status ablesbar
+// Per-Ursache-Aufschluesselung (FHEM 144729 #155): "low heap" im UI kann
+// total-Floor, largest-Block ODER Inflight-Cap sein — ohne Aufschluesselung
+// ist ein Feld-Report wie betateilchens 4.-Box-Fall nicht diagnostizierbar.
+std::atomic<uint32_t> g_rejFloorTotal{0};
+std::atomic<uint32_t> g_rejFloorBlock{0};
+std::atomic<uint32_t> g_rejInflight{0};
 
 inline bool     outboundHasPsram()    { return ESP.getPsramSize() > 0; }
-inline uint32_t outboundHeapFloor()   { return outboundHasPsram() ? 20000u : 45000u; }
+// no-PSRAM-Floor 45K -> 30K (Lab .58 2026-07-17): 45K war auf die Vor-.32-Lage
+// ohne Outbound-Timeouts kalibriert. Seit .32 ist der Drain pro Handler auf
+// 600/800 ms + inflight<=2 gebunden; gemessener Normalbetrieb C5 dippt auf
+// ~61K (UI-Burst) bzw. min_free 28.7K ueber 8.7h ohne Kollaps. Der harte
+// Accept-Storm-Kollaps (#121-Klasse) passiert bei free >=48K und wird von
+// KEINEM Handler-Floor verhindert — 45K blockierte also nur den Normalbetrieb
+// (betateilchen #155: Baseline 45-62K = Dauer-Reject).
+inline uint32_t outboundHeapFloor()   { return outboundHasPsram() ? 20000u : 30000u; }
 inline int      outboundMaxInflight() { return outboundHasPsram() ? 8 : 2; }
+// Contiguous-Bedarf der zwei leichten Live-Handler (HTTPClient-RX-Puffer +
+// getString()-Body von /presets bzw. /now_playing = wenige KB) — bewusst
+// GETRENNT vom total-free-Floor oben, siehe Guard-Kommentar (FHEM 144729 #153).
+inline uint32_t outboundBlockFloor()  { return 16000u; }
+
+// FHEM 144729 (v0.8.32): kurze, empirisch abgesicherte Timeouts fuer die zwei
+// synchronen Live-Outbound-Handler. Lab-Messung (Kueche/Emma/Greta, wach):
+// /presets + /now_playing antworten in <60 ms; der alte 3s-Read (bzw. FEHLENDE
+// Timeout in now-playing-live -> HTTPClient-Default ~5s) hielt bei einem
+// nicht-antwortenden Standby-Speaker den EINEN async_tcp-Task sekundenlang fest
+// -> Connection-Backlog + Heap-Drain -> Stick "taub" ohne Disassoc (lab-repro).
+// 600/800 ms = >13x Marge ueber gemessenem Max, kappt die worst-case-Blockade.
+constexpr uint16_t LIVE_OUT_CONNECT_MS = 600;
+constexpr uint16_t LIVE_OUT_READ_MS    = 800;
 
 struct OutboundGuard {
     bool acquired = false;
     OutboundGuard() {
-        if (ESP.getFreeHeap() < outboundHeapFloor()) return;   // Heap zu knapp -> ablehnen
+        // Doppel-Bedingung (v0.8.33-Fix, FHEM 144729 #153):
+        // (1) total-free-Floor wie v0.8.30/31 — Kollaps-Schutz gegen den
+        //     #121-Heap-Absturz unter Page-Load-Concurrency.
+        // (2) largest-block-Floor fuer die contiguous HTTPClient/String-
+        //     Allokation der zwei leichten Handler — Fragmentierungs-Check.
+        // REGRESSION v0.8.32: dort wurde largest_free_block gegen den ALTEN
+        // total-Floor (45K no-PSRAM) gemessen. Der war fuer die getFreeHeap-
+        // SUMME kalibriert; largest block liegt auf dem no-PSRAM-C5 schon
+        // beim normalen WebUI-Lade-Burst (6 gequeueste Connections) darunter
+        // -> Guard lehnte praktisch JEDEN Per-Speaker-Read ab, WebUI dauerhaft
+        // ohne Presets ("device busy"), obwohl free ~70-80K gesund war
+        // (Lab-Repro 2026-07-17: seriell 10/10 200er, UI-Burst 17/18 503er).
+        // Die Handler brauchen contiguous nur wenige KB (RX-Puffer + XML-Body)
+        // -> eigener Floor 16K statt 45K; 45K-total bleibt als Kollaps-Netz.
+        if (ESP.getFreeHeap() < outboundHeapFloor()) {
+            g_rejFloorTotal.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) < outboundBlockFloor()) {
+            g_rejFloorBlock.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         int n = g_outboundInflight.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n > outboundMaxInflight()) {
             g_outboundInflight.fetch_sub(1, std::memory_order_relaxed);
+            g_rejInflight.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         acquired = true;
@@ -89,9 +141,50 @@ struct OutboundGuard {
 
 // true = abgelehnt (503 gesendet), Handler soll sofort returnen.
 inline bool outboundReject(AsyncWebServerRequest* req) {
+    g_outboundRejects.fetch_add(1, std::memory_order_relaxed);
     req->send(503, "application/json",
               "{\"error\":\"device busy (low heap) \\u2014 retry\",\"retry\":true}");
     return true;
+}
+
+// -----------------------------------------------------------------------------
+// Micro-Cache fuer die zwei synchronen Live-Outbound-Handler (FHEM 144729,
+// v0.8.32). ALLE AsyncWebServer-Handler laufen im selben async_tcp-Task
+// (serialisiert) -> KEIN Mutex noetig. Ein kurzes TTL-Fenster kollabiert den
+// Cold-Load-Fan-out (je 1 Request pro Speaker), die kickPoll-Bursts (0/800/
+// 2500 ms) und neuer-Tab-Reloads auf max EINEN echten Outbound pro
+// (Speaker x Endpoint) pro TTL -> weniger Blockaden, weniger Heap-Druck.
+// Nur erfolgreiche (200) Bodies werden gecached; Fehler bleiben un-gecached.
+// -----------------------------------------------------------------------------
+constexpr uint32_t OUT_CACHE_TTL_MS = 2500;
+constexpr int      OUT_CACHE_N      = 12;   // 6 Speaker x 2 Endpoints
+struct OutCacheEntry {
+    String   key;
+    String   body;
+    uint32_t expiresMs = 0;
+};
+OutCacheEntry g_outCache[OUT_CACHE_N];
+
+bool outCacheGet(const String& key, String& body) {
+    uint32_t now = millis();
+    for (auto& e : g_outCache) {
+        if (e.expiresMs > now && e.key == key) { body = e.body; return true; }
+    }
+    return false;
+}
+void outCachePut(const String& key, const String& body) {
+    uint32_t now = millis();
+    OutCacheEntry* victim = nullptr;
+    uint32_t oldest = UINT32_MAX;
+    for (auto& e : g_outCache) {
+        if (e.key == key)          { victim = &e; break; }   // gleicher key -> ersetzen
+        if (e.expiresMs <= now)    { victim = &e; break; }   // freier/abgelaufener Slot
+        if (e.expiresMs < oldest)  { oldest = e.expiresMs; victim = &e; }
+    }
+    if (!victim) victim = &g_outCache[0];
+    victim->key = key;
+    victim->body = body;
+    victim->expiresMs = now + OUT_CACHE_TTL_MS;
 }
 } // namespace
 
@@ -236,6 +329,18 @@ void handleStatus(AsyncWebServerRequest* req) {
     heap["free"]      = ESP.getFreeHeap();
     heap["min_free"]  = ESP.getMinFreeHeap();
     heap["total"]     = ESP.getHeapSize();
+    // FHEM 144729 #153: Fragmentierungs-Sicht + Guard-Forensik. largest_block
+    // ist die Groesse, gegen die der OutboundGuard prueft (internal RAM);
+    // outbound_rejects zaehlt gesendete 503er seit Boot (runtime-only).
+    heap["largest_block"]    = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    heap["outbound_rejects"] = g_outboundRejects.load(std::memory_order_relaxed);
+    // Aufschluesselung nach Reject-Ursache (FHEM 144729 #155) — nur wenn
+    // ueberhaupt rejected wurde, sonst Status-Noise fuer alle.
+    if (g_outboundRejects.load(std::memory_order_relaxed) > 0) {
+        heap["rej_floor_total"] = g_rejFloorTotal.load(std::memory_order_relaxed);
+        heap["rej_floor_block"] = g_rejFloorBlock.load(std::memory_order_relaxed);
+        heap["rej_inflight"]    = g_rejInflight.load(std::memory_order_relaxed);
+    }
     JsonObject psram  = doc["psram"].to<JsonObject>();
     psram["free"]     = ESP.getFreePsram();
     psram["total"]    = ESP.getPsramSize();
@@ -257,6 +362,18 @@ void handleStatus(AsyncWebServerRequest* req) {
     // scheiterte (NVS voll trotz Cleanup) → Gruppe nur im RAM. Der Speaker bekommt
     // weiterhin 201/200 (BMX-Contract), der Fehlschlag ist NUR hier sichtbar.
     doc["groups_persist_ok"] = groupsPersistOk();
+
+    // Preset-Store-Forensik (FHEM 144729 #153): load_ok=false = beim Boot lag
+    // ein Store-Blob in NVS, war aber unlesbar (Store startete leer, /full
+    // gated auf 404); save_fails = fehlgeschlagene NVS-Saves seit Boot
+    // (inkl. JsonDocument-Overflow); speakers = geladene Store-Slices.
+    {
+        auto& ps = sixback::PresetStore::instance();
+        JsonObject pstore = doc["preset_store"].to<JsonObject>();
+        pstore["load_ok"]    = !ps.loadFailedFromNvs();
+        pstore["save_fails"] = ps.saveFails();
+        pstore["speakers"]   = (uint32_t)ps.speakerCount();
+    }
 
     // Health-Snapshot: boot/crash-counter, last reset reason, watchdog state
     JsonObject health = doc["health"].to<JsonObject>();
@@ -650,6 +767,26 @@ void handlePutPreset(AsyncWebServerRequest* req, JsonDocument& body) {
                   "remove unused speakers or try POST /api/nvs/cleanup\"}");
         return;
     }
+    // Echtes (nicht-Sentinel-)Preset ueber einen Spotify-gebundenen Slot:
+    // die Bindung waere ab jetzt verwaist (tote Sub-Row in der UI, Playlist-
+    // Name in Fremd-Clients wie FHEM BOSEST — 144729 #151). Hier mitraeumen,
+    // damit die Invariante "Nicht-Sentinel-Preset => keine Bindung" fuer ALLE
+    // Clients gilt, nicht nur die WebUI. Drei Ausnahmen: sspot{N}-Writes
+    // (applySpotifyDrop Schritt 2), Imports mit spotify-Feld (Block unten
+    // setzt die Bindung gewollt neu) und EMPTY-Writes (leerer Slot + Bindung
+    // = Click-to-Play-Feature). getSlot-Vorabcheck, weil setSlot("") sonst
+    // bei jedem Preset-PUT grundlos NVS schreiben wuerde (Flash-Wear).
+    if (p.source != sixback::PresetSource::EMPTY &&
+        p.stationId != String("sspot") + String((int)slot) &&
+        !body["spotify"].is<JsonObject>()) {
+        sixback::spotify::SlotMapping stale;
+        if (sixback::spotify::getSlot(id, slot, stale) && stale.spotifyUri.length() > 0) {
+            sixback::spotify::setSlot(id, slot, "", "");
+            Serial.printf("[spot] slot %s/%d: stale binding cleared by preset overwrite\n",
+                          id.c_str(), slot);
+        }
+    }
+
     // Single-Preset-Import via File-Drop: optionales spotify-Feld mitnehmen,
     // sonst geht beim Re-Import die Track/Album-Bindung verloren. Wird hier
     // ZUSAETZLICH zur PresetStore-Schreibung gemacht (idempotent zum 2-Step-
@@ -2215,9 +2352,12 @@ void handleSpeakerRename(AsyncWebServerRequest* req, JsonDocument& body) {
 //   per stationId/streamUrl zu matchen, was die SCMUDC-Variante nicht kennt.
 // -----------------------------------------------------------------------------
 void handleNowPlayingLive(AsyncWebServerRequest* req) {
+    String id = pathParam(0);
+    String cacheKey = "np#" + id;                          // FHEM 144729 v0.8.32
+    String cached;
+    if (outCacheGet(cacheKey, cached)) { req->send(200, "application/json", cached); return; }
     OutboundGuard guard;                                   // FHEM 144729 #121
     if (!guard.acquired) { outboundReject(req); return; }
-    String id = pathParam(0);
     auto& inv = sixback::SpeakerInventory::instance();
     String spIp;
     {
@@ -2228,6 +2368,8 @@ void handleNowPlayingLive(AsyncWebServerRequest* req) {
     }
     HTTPClient h;
     h.setReuse(false);
+    h.setConnectTimeout(LIVE_OUT_CONNECT_MS);              // FHEM 144729: hatte KEIN
+    h.setTimeout(LIVE_OUT_READ_MS);                        // Timeout -> Default ~5s Blockade
     String u = "http://" + spIp + ":" + String(BOSE_BMX_PORT) + "/now_playing";
     if (!h.begin(u)) { req->send(502, "application/json", "{\"error\":\"http begin failed\"}"); return; }
     int code = h.GET();
@@ -2286,6 +2428,7 @@ void handleNowPlayingLive(AsyncWebServerRequest* req) {
     out["art_url"] = art;
     out["play_status"] = playStatus;
     String body; serializeJson(out, body);
+    outCachePut(cacheKey, body);                           // FHEM 144729 v0.8.32
     req->send(200, "application/json", body);
 }
 
@@ -2727,7 +2870,8 @@ struct HwSlotInfo_ {
 
 static bool fetchHardwarePresets_(const String& spIp, HwSlotInfo_ out[6]) {
     HTTPClient h; h.setReuse(false);
-    h.setTimeout(3000);
+    h.setConnectTimeout(LIVE_OUT_CONNECT_MS);   // FHEM 144729: Connect bounden
+    h.setTimeout(LIVE_OUT_READ_MS);             // (toter Standby-Speaker -> kurz raus)
     String url = "http://" + spIp + ":" + String(BOSE_BMX_PORT) + "/presets";
     if (!h.begin(url)) return false;
     int code = h.GET();
@@ -2772,9 +2916,12 @@ static bool fetchHardwarePresets_(const String& spIp, HwSlotInfo_ out[6]) {
 //   Zeile in der Slot-Karte gebraucht, parallel zum Store-Endpoint.
 // -----------------------------------------------------------------------------
 void handleGetHardwarePresets(AsyncWebServerRequest* req) {
+    String id = pathParam(0);
+    String cacheKey = "hp#" + id;                          // FHEM 144729 v0.8.32
+    String cached;
+    if (outCacheGet(cacheKey, cached)) { req->send(200, "application/json", cached); return; }
     OutboundGuard guard;                                   // FHEM 144729 #121
     if (!guard.acquired) { outboundReject(req); return; }
-    String id = pathParam(0);
     auto& inv = sixback::SpeakerInventory::instance();
     String spIp;
     {
@@ -2799,6 +2946,7 @@ void handleGetHardwarePresets(AsyncWebServerRequest* req) {
         }
     }
     String body; serializeJson(doc, body);
+    if (ok) outCachePut(cacheKey, body);                   // nur Erfolg cachen
     req->send(ok ? 200 : 502, "application/json", body);
 }
 
@@ -3299,6 +3447,19 @@ void handleOtaUpdateStatus(AsyncWebServerRequest* req) {
 }
 #endif // SIXBACK_OTA_ENABLED
 
+// Lab-Befund 2026-07-17 (FHEM 144729 #155): ZWEI gleichzeitige Transfers des
+// 75-KB-Bundles machen den no-PSRAM-C5 in ~1-2 s dauerhaft netz-taub — der
+// Heap-Sturz passiert WAEHREND der parallelen chunked-Sends, ein Heap-Check am
+// Request-Anfang (beide sehen noch ~78K free) greift prinzipiell nicht. Ein
+// einzelner Transfer ist auch im Dauerfeuer stabil (256 Loads in Folge, 0
+// Loss). Deshalb harte Parallel-Grenze. Decrement via onDisconnect ist hier
+// zuverlaessig transfer-genau: diese Lib-Version (ESPAsyncWebServer 3.x)
+// schliesst die Verbindung nach JEDER fertigen Response (_onAck ->
+// _client->close()), es gibt keinen Keep-Alive-Pfad der den Zaehler pinnen
+// koennte.
+std::atomic<int> g_indexInflight{0};
+inline int indexMaxInflight() { return outboundHasPsram() ? 3 : 1; }
+
 void handleRoot(AsyncWebServerRequest* req) {
     // FHEM 144729 #121: unter Heap-Druck (Page-Load-Burst / mehrere Tabs auf dem
     // no-PSRAM-C5) das schwere 74-KB-Bundle-Serving kurz mit 503 abweisen statt
@@ -3312,6 +3473,17 @@ void handleRoot(AsyncWebServerRequest* req) {
                   "<body style=\"font-family:sans-serif\">SixBack is busy \xE2\x80\x94 retrying\xE2\x80\xA6</body>");
         return;
     }
+    int n = g_indexInflight.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n > indexMaxInflight()) {
+        g_indexInflight.fetch_sub(1, std::memory_order_relaxed);
+        req->send(503, "text/html",
+                  "<!doctype html><meta http-equiv=\"refresh\" content=\"1\">"
+                  "<body style=\"font-family:sans-serif\">SixBack is busy \xE2\x80\x94 retrying\xE2\x80\xA6</body>");
+        return;
+    }
+    req->onDisconnect([]() {
+        g_indexInflight.fetch_sub(1, std::memory_order_relaxed);
+    });
     // index.html ist >100 KB; AsyncWebServer schafft das im uncompressed-Pfad
     // nicht zuverlaessig (Truncation/Timeouts unter Last). Wenn index.html.gz
     // im LittleFS liegt -> serve mit Content-Encoding: gzip. Browser entpackt.

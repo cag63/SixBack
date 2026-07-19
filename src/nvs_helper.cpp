@@ -164,85 +164,267 @@ bool hsDecompress_(const uint8_t* in, size_t inLen, std::unique_ptr<char[]>& out
 
 } // namespace
 
-bool nvsLoadJson(const char* ns, const char* key, JsonDocument& doc) {
+// Definiert weiter unten beim A/B-Save; hier schon gebraucht.
+static void slotKeys_(const char* key, String& k1, String& g0, String& g1);
+
+// Laedt EINEN Slot (Blob, HS oder Klartext) — kein String-Fallback hier.
+static bool loadSlotBlob_(Preferences& p, const char* ns, const char* key,
+                          JsonDocument& doc) {
+    size_t blen = p.getBytesLength(key);
+    if (blen == 0) return false;
+    std::unique_ptr<uint8_t[]> buf(new (std::nothrow) uint8_t[blen + 1]);
+    if (!buf) {
+        Serial.printf("[nvs-load] FAIL alloc ns=%s key=%s blob=%u\n",
+                      ns, key, (unsigned)blen);
+        return false;
+    }
+    size_t got = p.getBytes(key, buf.get(), blen);
+    if (got != blen) {
+        Serial.printf("[nvs-load] FAIL getBytes ns=%s key=%s want=%u got=%u\n",
+                      ns, key, (unsigned)blen, (unsigned)got);
+        return false;
+    }
+    buf[blen] = '\0';
+    // "HS"-Frame -> heatshrink-komprimiert; sonst Klartext-JSON-Blob.
+    if (blen >= kHsHeader && buf[0] == 'H' && buf[1] == 'S') {
+        std::unique_ptr<char[]> plain;
+        if (!hsDecompress_(buf.get(), blen, plain)) {
+            Serial.printf("[nvs-load] FAIL hs-decode ns=%s key=%s blob=%u\n",
+                          ns, key, (unsigned)blen);
+            return false;
+        }
+        // const char* erzwingt Copy-Mode in ArduinoJson.
+        DeserializationError e = deserializeJson(doc, (const char*)plain.get());
+        if (e != DeserializationError::Ok)
+            Serial.printf("[nvs-load] FAIL json-parse ns=%s key=%s err=%s\n",
+                          ns, key, e.c_str());
+        return e == DeserializationError::Ok;
+    }
+    DeserializationError e = deserializeJson(doc, (const char*)buf.get());
+    if (e != DeserializationError::Ok)
+        Serial.printf("[nvs-load] FAIL json-parse ns=%s key=%s err=%s\n",
+                      ns, key, e.c_str());
+    return e == DeserializationError::Ok;
+}
+
+bool nvsLoadJson(const char* ns, const char* key, JsonDocument& doc,
+                 bool* dataPresent) {
+    if (dataPresent) *dataPresent = false;
     Preferences p;
     if (!p.begin(ns, true)) return false;
-    // Seit dem Blob-Umbau (2026-06-07) liegen JSON-Payloads als NVS-BLOB —
-    // nvs_set_blob ist ueber Pages gechunkt, das harte 4000-B-Limit von
-    // nvs_set_str entfaellt. Bestands-Daten (<= v0.8.14) liegen noch als
-    // STRING unter demselben Key -> Fallback; der naechste Save ersetzt den
-    // Eintrag typ-wechselnd durch ein Blob (NVS: neuer Wert ersetzt Typ+Wert).
-    size_t blen = p.getBytesLength(key);
-    if (blen > 0) {
-        std::unique_ptr<uint8_t[]> buf(new (std::nothrow) uint8_t[blen + 1]);
-        if (!buf) { p.end(); return false; }
-        size_t got = p.getBytes(key, buf.get(), blen);
+    // A/B-Slots (2026-07-17): kritische Stores liegen unter "<key>" ODER
+    // "<key>~", die Generation ("<key>#0"/"#1") entscheidet welcher aktiv
+    // ist. Einzel-Key-Stores (TuneIn-Cache etc.) haben nie Slot-1/Gen-Keys
+    // -> identisches Verhalten wie vorher. Ist der hoeher-generierte Slot
+    // unlesbar/unparsebar, faellt der Load auf den anderen zurueck
+    // (Self-Heal auf den letzten guten Stand).
+    String k1, g0k, g1k;
+    slotKeys_(key, k1, g0k, g1k);
+    uint32_t g0 = p.getUInt(g0k.c_str(), 0);
+    uint32_t g1 = p.getUInt(g1k.c_str(), 0);
+    const bool p0 = p.getBytesLength(key) > 0;
+    const bool p1 = p.getBytesLength(k1.c_str()) > 0;
+    if (p0 && g0 == 0) g0 = 1;   // Bestands-Blob ohne Gen-Entry (Legacy)
+    if (p1 && g1 == 0) g1 = 1;
+    if (dataPresent) *dataPresent = p0 || p1;
+
+    const char* first  = (p1 && g1 > g0) ? k1.c_str() : key;
+    const char* second = (first == key) ? (p1 ? k1.c_str() : nullptr)
+                                        : (p0 ? key : nullptr);
+    if (((first == key) ? p0 : p1) && loadSlotBlob_(p, ns, first, doc)) {
         p.end();
-        if (got != blen) return false;
-        buf[blen] = '\0';
-        // "HS"-Frame -> heatshrink-komprimiert (seit Kompressions-Stufe);
-        // sonst Klartext-JSON-Blob (v0.8.15/16 + kleine Werte).
-        if (blen >= kHsHeader && buf[0] == 'H' && buf[1] == 'S') {
-            std::unique_ptr<char[]> plain;
-            if (!hsDecompress_(buf.get(), blen, plain)) {
-                Serial.printf("[nvs-load] FAIL hs-decode ns=%s key=%s blob=%u\n",
-                              ns, key, (unsigned)blen);
-                return false;
-            }
-            // const char* erzwingt Copy-Mode in ArduinoJson (kein zero-copy
-            // in den gleich freigegebenen Buffer).
-            return deserializeJson(doc, (const char*)plain.get())
-                   == DeserializationError::Ok;
-        }
-        return deserializeJson(doc, (const char*)buf.get())
-               == DeserializationError::Ok;
+        return true;
     }
+    if (second) {
+        doc.clear();   // Parse-Reste des kaputten Slots nicht stehen lassen
+        if (loadSlotBlob_(p, ns, second, doc)) {
+            Serial.printf("[nvs-load] slot-fallback ns=%s key=%s -> %s (letzter guter Stand)\n",
+                          ns, key, second);
+            p.end();
+            return true;
+        }
+    }
+    if (p0 || p1) {   // Blob(s) vorhanden aber unlesbar -> harter Load-Fail
+        p.end();
+        return false;
+    }
+    // Bestands-Daten (<= v0.8.14) als STRING unter dem Basis-Key.
     String s = p.getString(key, "");
     p.end();
     if (s.length() == 0) return false;
-    return deserializeJson(doc, s) == DeserializationError::Ok;
+    if (dataPresent) *dataPresent = true;
+    DeserializationError e = deserializeJson(doc, s);
+    if (e != DeserializationError::Ok)
+        Serial.printf("[nvs-load] FAIL json-parse(str) ns=%s key=%s err=%s\n",
+                      ns, key, e.c_str());
+    return e == DeserializationError::Ok;
 }
 
-bool nvsSaveJson(const char* ns, const char* key, JsonDocument& doc) {
-    String s;
+// Serialisiert + komprimiert das Dokument in einen schreibfertigen Blob.
+// data/dlen zeigen entweder in 's' (Klartext) oder in 'packed' (HS-Frame).
+static bool packPayload_(JsonDocument& doc, String& s,
+                         std::unique_ptr<uint8_t[]>& packed,
+                         const uint8_t*& data, size_t& dlen, bool& hs) {
     serializeJson(doc, s);
     if (s.length() == 0) return false;
-    Preferences p;
-    if (!p.begin(ns, false)) {
-        Serial.printf("[nvs-save] FAIL begin ns=%s key=%s\n", ns, key);
-        return false;
-    }
-    // BLOB statt String (Lab-Befund 2026-06-07): nvs_set_str kann max
-    // 4000 B inkl. NUL und braucht die Entries zusammenhaengend in EINER
-    // Page — der Preset-Store ueberschritt das ab ~5 Speakern und JEDER
-    // Save schlug fehl, obwohl die Partition zu 2/3 leer war. nvs_set_blob
-    // chunkt ueber Pages; Limit jetzt ~Partitionsgroesse.
-    //
-    // Groessere Werte zusaetzlich heatshrink-komprimiert (Faktor ~2-3,6 auf
-    // Store-JSON) — hebt die Speaker-Decke der 24-KB-Partition entsprechend.
-    // Bei OOM / nicht-lohnender Kompression faellt der Save auf Klartext
-    // zurueck; der Load erkennt beides am Frame.
-    const uint8_t* data = (const uint8_t*)s.c_str();
-    size_t         dlen = s.length();
-    std::unique_ptr<uint8_t[]> packed;
+    data = (const uint8_t*)s.c_str();
+    dlen = s.length();
+    hs   = false;
     size_t packedLen = 0;
-    bool hs = false;
     if (dlen >= kCompressMin && hsCompress_(s, packed, packedLen)) {
         data = packed.get();
         dlen = packedLen;
         hs   = true;
     }
+    return true;
+}
+
+// Gate + putBytes + Logging. WRITE-GATE (Lab-Befund 2026-07-17): ein
+// putBytes, das mangels Platz MITTEN im Multi-Chunk-Blob-Write abbricht,
+// hinterlaesst einen inkonsistenten Blob — danach schlagen selbst
+// Kleinst-Writes fehl (wrote=0 bei 792 B / 135 freien Entries beobachtet)
+// und nvs_flash_init raeumt den Key beim NAECHSTEN BOOT komplett weg:
+// Totalverlust mit Fresh-Install-Optik. Writes, die nicht sicher passen,
+// werden gar nicht erst versucht. free_entries ist zudem KEIN hinreichender
+// Erfolgs-Praediktor (Chunk-Geometrie) — deshalb ist die eigentliche
+// Verlust-Absicherung der A/B-Slot-Mechanismus (nvsSaveJsonAB_), das Gate
+// reduziert nur die Wedge-Wahrscheinlichkeit.
+static bool writeBlobGated_(Preferences& p, const char* ns, const char* key,
+                            const uint8_t* data, size_t dlen,
+                            size_t jsonLen, bool hs) {
+    nvs_stats_t st{};
+    if (nvs_get_stats(NULL, &st) == ESP_OK) {
+        const size_t needed = dlen / 32 + (dlen / 4000) * 2 + 10;
+        if (needed > st.free_entries) {
+            Serial.printf("[nvs-save] REFUSED ns=%s key=%s blob=%u (brauche ~%u entries, "
+                          "frei %u) — Write nicht gestartet\n",
+                          ns, key, (unsigned)dlen, (unsigned)needed,
+                          (unsigned)st.free_entries);
+            return false;
+        }
+    }
     size_t n = p.putBytes(key, data, dlen);
-    p.end();
     if (n != dlen) {
         Serial.printf("[nvs-save] FAIL putBytes ns=%s key=%s json_len=%u blob=%u wrote=%u%s\n",
-                      ns, key, (unsigned)s.length(), (unsigned)dlen, (unsigned)n,
+                      ns, key, (unsigned)jsonLen, (unsigned)dlen, (unsigned)n,
                       hs ? " (hs)" : "");
         return false;
     }
     Serial.printf("[nvs-save] ok ns=%s key=%s json_len=%u blob=%u%s\n",
-                  ns, key, (unsigned)s.length(), (unsigned)dlen,
+                  ns, key, (unsigned)jsonLen, (unsigned)dlen,
                   hs ? " (hs)" : " (plain)");
+    return true;
+}
+
+bool nvsSaveJson(const char* ns, const char* key, JsonDocument& doc) {
+    // BLOB statt String (Lab-Befund 2026-06-07): nvs_set_str kann max
+    // 4000 B inkl. NUL — nvs_set_blob chunkt ueber Pages. Groessere Werte
+    // heatshrink-komprimiert (Faktor ~2-3,6); Load erkennt beides am Frame.
+    // Einzel-Key-Semantik: fuer kleine, regenerable Werte (TuneIn-Cache,
+    // Diag). Kritische Stores gehen ueber nvsSaveJsonWithCleanup = A/B-Slots.
+    String s;
+    std::unique_ptr<uint8_t[]> packed;
+    const uint8_t* data = nullptr;
+    size_t dlen = 0;
+    bool hs = false;
+    if (!packPayload_(doc, s, packed, data, dlen, hs)) return false;
+    Preferences p;
+    if (!p.begin(ns, false)) {
+        Serial.printf("[nvs-save] FAIL begin ns=%s key=%s\n", ns, key);
+        return false;
+    }
+    bool ok = writeBlobGated_(p, ns, key, data, dlen, s.length(), hs);
+    p.end();
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// A/B-Slot-Save (Lab-Befund 2026-07-17, fred/144729 Totalverlust-Klasse):
+// Der neue Stand wird IMMER in den inaktiven Slot geschrieben ("<key>" bzw.
+// "<key>~"), nach Readback-Verify wird die Generation ("<key>#0"/"#1", u32 =
+// atomarer Einzel-Entry) hochgezaehlt und erst dann der alte Slot geraeumt.
+// Ein mittendrin scheiternder oder vom naechsten nvs_flash_init weggeraeumter
+// Write kann so nur den SPARE-Slot treffen — der aktive Stand bleibt in jedem
+// beobachteten Fehlermodus (wrote=0-Wedge, unlesbarer Blob, Init-Cleanup)
+// konsistent und bootfest. Peak-Platzbedarf unveraendert (Update-in-place
+// hielt alt+neu ebenfalls gleichzeitig).
+// ---------------------------------------------------------------------------
+static void slotKeys_(const char* key, String& k1, String& g0, String& g1) {
+    k1 = String(key) + "~";
+    g0 = String(key) + "#0";
+    g1 = String(key) + "#1";
+}
+
+static bool nvsSaveJsonAB_(const char* ns, const char* key, JsonDocument& doc) {
+    String s;
+    std::unique_ptr<uint8_t[]> packed;
+    const uint8_t* data = nullptr;
+    size_t dlen = 0;
+    bool hs = false;
+    if (!packPayload_(doc, s, packed, data, dlen, hs)) return false;
+
+    String k1, g0k, g1k;
+    slotKeys_(key, k1, g0k, g1k);
+
+    Preferences p;
+    if (!p.begin(ns, false)) {
+        Serial.printf("[nvs-save] FAIL begin ns=%s key=%s\n", ns, key);
+        return false;
+    }
+    // Aktiven Slot bestimmen: hoehere Generation; Bestands-Blob ohne
+    // Gen-Entry (Legacy/<= v0.8.33 oder NVS-Preseed) zaehlt als Gen 1.
+    uint32_t g0 = p.getUInt(g0k.c_str(), 0);
+    uint32_t g1 = p.getUInt(g1k.c_str(), 0);
+    if (g0 == 0 && p.getBytesLength(key) > 0)          g0 = 1;
+    if (g1 == 0 && p.getBytesLength(k1.c_str()) > 0)   g1 = 1;
+    const bool  activeIs0 = g0 >= g1;
+    const char* tgtKey    = activeIs0 ? k1.c_str() : key;
+    const char* tgtGenKey = activeIs0 ? g1k.c_str() : g0k.c_str();
+    const char* oldKey    = activeIs0 ? key : k1.c_str();
+    const char* oldGenKey = activeIs0 ? g0k.c_str() : g1k.c_str();
+
+    // Ziel-Slot raeumen (Stale-Reste von vorvorigem Save) — inhaerent safe,
+    // der aktive Slot wird hier NIE angefasst.
+    p.remove(tgtKey);
+    if (!writeBlobGated_(p, ns, tgtKey, data, dlen, s.length(), hs)) {
+        p.end();
+        return false;
+    }
+    // Readback-Verify: nur ein nachweislich vollstaendig lesbarer Spare darf
+    // den aktiven Stand abloesen (Lab: putBytes meldete Erfolg, getBytes
+    // scheiterte anschliessend).
+    bool verified = false;
+    {
+        size_t blen = p.getBytesLength(tgtKey);
+        if (blen == dlen) {
+            std::unique_ptr<uint8_t[]> rb(new (std::nothrow) uint8_t[dlen]);
+            if (rb && p.getBytes(tgtKey, rb.get(), dlen) == dlen &&
+                memcmp(rb.get(), data, dlen) == 0) {
+                verified = true;
+            }
+        }
+    }
+    if (!verified) {
+        Serial.printf("[nvs-save] FAIL readback ns=%s key=%s blob=%u — Spare verworfen, "
+                      "aktiver Stand unangetastet\n", ns, tgtKey, (unsigned)dlen);
+        p.remove(tgtKey);
+        p.end();
+        return false;
+    }
+    uint32_t newGen = (g0 > g1 ? g0 : g1) + 1;
+    if (p.putUInt(tgtGenKey, newGen) == 0) {
+        // Gen-Commit fehlgeschlagen -> Load wuerde weiter den alten Slot
+        // bevorzugen. Spare aufraeumen, Save als gescheitert melden.
+        Serial.printf("[nvs-save] FAIL gen-commit ns=%s key=%s\n", ns, tgtGenKey);
+        p.remove(tgtKey);
+        p.end();
+        return false;
+    }
+    // Alten Slot freigeben (best effort — scheitert das, verliert er beim
+    // Load ohnehin gegen die hoehere Generation).
+    p.remove(oldKey);
+    p.remove(oldGenKey);
+    p.end();
     return true;
 }
 
@@ -280,12 +462,20 @@ void nvsGetStatsJson(JsonDocument& out) {
 }
 
 bool nvsSaveJsonWithCleanup(const char* ns, const char* key, JsonDocument& doc) {
-    if (nvsSaveJson(ns, key, doc)) return true;
+    // Kritische Stores: IMMER ueber den A/B-Slot-Save (siehe nvsSaveJsonAB_)
+    // — ein fehlschlagender Write kann damit konstruktionsbedingt nur den
+    // Spare-Slot treffen, nie den aktiven Stand. Der fruehere Pass 3
+    // (Ziel-Key erasen + Backup/Restore) ist damit obsolet: er hat im Lab
+    // (2026-07-17, 42-Delete-Storm ueber der 9-Speaker-Kante) den letzten
+    // guten Stand trotz Restore-Logik zweimal komplett verloren (unlesbarer
+    // Blob nach putBytes-Abbruch -> nvs_flash_init raeumt den Key beim
+    // naechsten Boot weg, Fresh-Install-Optik).
+    if (nvsSaveJsonAB_(ns, key, doc)) return true;
     Serial.printf("[nvs-cleanup] %s/%s save fail — pass1 purging caches + retry\n", ns, key);
     // Pass 1: Cache-Namespaces wegpurgen (regenerable, kein User-Verlust).
     nvsEraseAllInNamespace("sixback-tune");      // TuneIn-Resolver-Cache
     nvsEraseAllInNamespace("sixback-sys");       // Health/Counters
-    if (nvsSaveJson(ns, key, doc)) {
+    if (nvsSaveJsonAB_(ns, key, doc)) {
         Serial.printf("[nvs-cleanup] pass1 retry %s/%s -> OK\n", ns, key);
         return true;
     }
@@ -298,75 +488,13 @@ bool nvsSaveJsonWithCleanup(const char* ns, const char* key, JsonDocument& doc) 
     nvsEraseAllInNamespace("sixback-c");         // Captive-Stub-State
     nvsEraseAllInNamespace("sixback-s");         // Speaker-Discovery-Cache
     nvsEraseAllInNamespace("sixback-esp");       // ESP-Web-Tools-Cache (falls vorhanden)
-    if (nvsSaveJson(ns, key, doc)) {
+    if (nvsSaveJsonAB_(ns, key, doc)) {
         Serial.printf("[nvs-cleanup] pass2 retry %s/%s -> OK (aggressive purge)\n", ns, key);
         return true;
     }
-    // Pass 3: den ZIEL-Key explizit loeschen + retry. Hilft wenn NVS-internes
-    // GC die alte Version noch nicht reclaim't hat.
-    //
-    // ABER (Lab-Befund 2026-06-07): NIEMALS den letzten guten Stand opfern.
-    // Die alte Fassung loeschte den Key bedingungslos — wenn der Neuschreib
-    // dann ebenfalls scheiterte (damals: String > 4000 B = IMMER), war der
-    // letzte persistierte Stand vernichtet -> Total-Preset-Verlust nach dem
-    // naechsten Reboot. Deshalb: alten Wert vorher sichern und bei erneutem
-    // Fehlschlag zurueckschreiben (die soeben freigegebenen Entries reichen
-    // dafuer sicher aus).
-    Serial.printf("[nvs-cleanup] %s/%s pass2-fail — pass3 erase target-key + retry\n", ns, key);
-    // Backup-Buffer nothrow (Review 2026-06-07): ein bad_alloc-Abort genau
-    // hier wuerde den Alt-Stand zwischen remove und rewrite vernichten.
-    // Wenn das Backup nicht allozierbar ist, wird Pass 3 uebersprungen —
-    // lieber Save-Fail als Datenverlust.
-    std::unique_ptr<uint8_t[]> oldBlob;
-    size_t oldBlobLen = 0;
-    String oldStr;
-    bool backupOk = true;
-    {
-        Preferences p;
-        if (p.begin(ns, true)) {
-            size_t blen = p.getBytesLength(key);
-            if (blen > 0) {
-                oldBlob.reset(new (std::nothrow) uint8_t[blen]);
-                if (oldBlob && p.getBytes(key, oldBlob.get(), blen) == blen) {
-                    oldBlobLen = blen;
-                } else {
-                    oldBlob.reset();
-                    backupOk = false;
-                }
-            } else {
-                oldStr = p.getString(key, "");
-            }
-            p.end();
-        }
-    }
-    if (!backupOk) {
-        Serial.printf("[nvs-cleanup] pass3 %s/%s SKIPPED (backup alloc fail) — alter Stand bleibt\n",
-                      ns, key);
-        return false;
-    }
-    {
-        Preferences p;
-        if (p.begin(ns, false)) { p.remove(key); p.end(); }
-    }
-    bool ok = nvsSaveJson(ns, key, doc);
-    if (!ok && (oldBlobLen > 0 || oldStr.length() > 0)) {
-        Preferences p;
-        bool restored = false;
-        if (p.begin(ns, false)) {
-            if (oldBlobLen > 0) {
-                restored = p.putBytes(key, oldBlob.get(), oldBlobLen) == oldBlobLen;
-            } else {
-                restored = p.putString(key, oldStr) > 0;
-            }
-            p.end();
-        }
-        Serial.printf("[nvs-cleanup] pass3 %s/%s restore alter Stand: %s\n",
-                      ns, key, restored ? "OK" : "FAIL — Daten verloren!");
-    }
-    Serial.printf("[nvs-cleanup] pass3 retry %s/%s -> %s%s\n", ns, key,
-                  ok ? "OK" : "STILL-FAIL",
-                  ok ? "" : " — NVS partition genuinely full");
-    return ok;
+    Serial.printf("[nvs-cleanup] %s/%s -> STILL-FAIL — NVS partition genuinely full "
+                  "(aktiver Stand bleibt konsistent)\n", ns, key);
+    return false;
 }
 
 namespace {

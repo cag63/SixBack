@@ -206,6 +206,12 @@
                        cursor: pointer; flex: 0 0 auto; }
   .preset .slot-undo:hover { color: #fff; background: var(--mute); }
   .preset .slot-undo:disabled { opacity: .5; cursor: wait; }
+  .preset .spot-unbind { margin-left: auto; padding: 0 .35em; font-size: .78em;
+                         line-height: 1.4; background: transparent; color: var(--mute);
+                         border: 1px solid transparent; border-radius: 4px;
+                         cursor: pointer; flex: 0 0 auto; }
+  .preset .spot-unbind:hover { color: #fff; background: var(--mute); border-color: var(--mute); }
+  .preset .spot-unbind:disabled { opacity: .5; cursor: wait; }
   .preset .slot-single { display: flex; align-items: center; gap: .5em; padding: .3em 0; }
   .preset .slot-single .row-cover, .preset .slot-single .row-cover-ph {
                        width: 48px; height: 48px; font-size: 1.4em; }
@@ -2053,12 +2059,30 @@ function presetCard(devId, slotNum) {
   const _spotIconTitle = (spotBind && spotBind.uri)
     ? (spotBind.shuffle ? 'shuffle ' : '') + 'repeat=' + (spotBind.repeat || 'off')
     : '';
+  // The binding has three states, and the ✕ must speak differently in each:
+  //   live  — slot still carries the sspot{N} sentinel: the binding IS what
+  //           the hardware button plays. Removing it silences the button.
+  //   idle  — slot empty on both sides: binding only powers the click-to-play
+  //           in this UI (deliberate feature, see playSpeakerSlot).
+  //   stale — a real station replaced the tunnel preset and the mapping was
+  //           left behind (should no longer occur: handlePutPreset clears it
+  //           on overwrite; this state covers pre-fix leftovers + DLNA pushes,
+  //           which bypass the preset PUT).
+  const _sentinel = `sspot${slotNum}`;
+  const _bindState =
+    (hw.station_id === _sentinel || store.stationId === _sentinel) ? 'live' :
+    (storeEmpty && hwEmpty)                                        ? 'idle' : 'stale';
+  const _unbindTitle =
+    _bindState === 'live' ? `Remove the Spotify binding — preset ${slotNum} will then play nothing until you drop a station on it` :
+    _bindState === 'idle' ? `Remove the Spotify binding — slot ${slotNum}'s click-to-play in this UI goes away` :
+                            `Remove the leftover Spotify binding — preset ${slotNum} itself stays as it is`;
   const spotLabel = (spotBind && spotBind.uri)
     ? `<div class="slot-row spotify">` +
         `<span class="row-label">spotify</span>` +
         `<span class="row-name" style="color:#1DB954">🎵 ${esc(spotBind.name || spotBind.uri)}` +
           (_spotIcons ? `<span class="spot-mode" title="${esc(_spotIconTitle)}">${_spotIcons}</span>` : '') +
         `</span>` +
+        `<button class="spot-unbind" title="${esc(_unbindTitle)}" onclick="event.stopPropagation(); unbindSpotifySlot('${esc(devId)}', ${slotNum}, '${_bindState}')">✕</button>` +
       `</div>`
     : '';
 
@@ -2491,8 +2515,9 @@ async function applyExternalPreset(payload, dst) {
       const spotMsg = payload.spotify && payload.spotify.uri ? ' + Spotify mapping' : '';
       toast(`Imported "${payload.name || payload.source}"${spotMsg} → slot ${dst.slot}` +
             (payload.exported_from ? ` (from ${payload.exported_from})` : ''));
-      loadPresetsFor(dst.dev);
       if (payload.spotify && payload.spotify.uri) loadSpotifySlots();
+      else dropStaleSpotBind_(dst.dev, dst.slot, body);
+      loadPresetsFor(dst.dev);
       kickPoll(dst.dev);
     } else {
       toast('Import failed: '+(r && r.error || 'unknown'));
@@ -2591,6 +2616,7 @@ async function onPresetDrop(ev) {
       if (r && r.ok) {
         markDirty(dst.dev);
         patchStoreSlot_(dst.dev, dst.slot, putBody);   // optimistic — instant diff
+        dropStaleSpotBind_(dst.dev, dst.slot, putBody);
         const note = src.libSource === 'TUNEIN' ? ''
                    : ' (native Custom-Stations — HTTP streams most reliable on older Bose-FW; playlists .m3u/.pls not resolved)';
         toast(`"${src.name}" → slot ${dst.slot}${note}. Click the slot's push button to save to speaker.`);
@@ -2646,6 +2672,7 @@ async function onPresetDrop(ev) {
       if (r && r.ok) {
         markDirty(dst.dev);
         patchStoreSlot_(dst.dev, dst.slot, putBody);   // optimistic — instant diff
+        dropStaleSpotBind_(dst.dev, dst.slot, putBody);
         toast(`Copied "${putBody.name || srcSlot.source}" → ${dst.dev.substring(0,6)}… slot ${dst.slot}. Click push to save on speaker.`);
         loadPresetsFor(dst.dev);
         kickPoll(dst.dev);
@@ -5295,6 +5322,52 @@ async function loadSpotifySlots() {
     // re-render speaker cards so the badge appears
     renderSpeakers();
   } catch(_) {}
+}
+
+// Mirror of the firmware invariant (handlePutPreset): PUT of a real
+// non-sentinel preset auto-clears a stale Spotify binding server-side.
+// Drop the local copy too, or the card keeps showing the dead sub-row
+// until the next full reload (STATE.spotifySlots has no periodic refresh).
+function dropStaleSpotBind_(devId, slot, putBody) {
+  if (putBody && putBody.stationId === 'sspot' + slot) return;  // tunnel write — binding stays
+  delete STATE.spotifySlots[`${devId}_${slot}`];
+}
+
+// Remove a slot's Spotify binding (DELETE /api/spotify/slot/{dev}/{slot}).
+// The Bose preset in that slot is not touched — binding and preset are two
+// separate layers. bindState ('live'|'idle'|'stale', see presetCard) picks
+// the confirm wording: live = the hardware button goes silent, idle = the
+// UI's click-to-play goes away, stale = pure leftover, nothing changes.
+async function unbindSpotifySlot(devId, slot, bindState) {
+  const key  = `${devId}_${slot}`;
+  const bind = STATE.spotifySlots[key];
+  if (!bind || !bind.uri) return;
+  const what = bind.name || bind.uri;
+  const msg =
+    bindState === 'live'
+    ? `Remove the Spotify binding "${what}" from preset ${slot}?\n\n` +
+      `Preset ${slot} still points at Spotify, so the speaker's button ${slot} ` +
+      `will play nothing afterwards. Drop a station on the slot to give it new content.`
+    : bindState === 'idle'
+    ? `Remove the Spotify binding "${what}" from slot ${slot}?\n\n` +
+      `Slot ${slot} is empty on the speaker — this binding only powers the ` +
+      `click-to-play here in the UI.`
+    : `Remove the leftover Spotify binding "${what}" from preset ${slot}?\n\n` +
+      `Preset ${slot} itself stays as it is — only the stale Spotify entry goes away.`;
+  if (!confirm(msg)) return;
+  try {
+    const r = await api(`/api/spotify/slot/${encodeURIComponent(devId)}/${slot}`, {method:'DELETE'});
+    if (r && r.ok === false) { toast('Unbind failed: ' + (r.error || 'unknown'), 'error'); return; }
+    // Drop it locally and re-render just this speaker's six cards. Note:
+    // loadSpotifySlots() would NOT do it — its renderSpeakers() is incremental
+    // and only re-renders slots for speakers it adds fresh, so an existing
+    // card would keep showing the removed row until the next full reload.
+    delete STATE.spotifySlots[key];
+    renderSpeakerSlots(devId);
+    toast(`Spotify binding removed from preset ${slot}`, 'success');
+  } catch (e) {
+    toast('Unbind failed: ' + e.message, 'error');
+  }
 }
 
 // ---- Spotify-Library (Sidebar-Tile-Storage, D&D-Source) ---------------

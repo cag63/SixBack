@@ -46,3 +46,7 @@ compile_commands.json
 webflasher/manifest*.json
 ._*
 .DS_Store
+
+# PlatformIO/pioarduino build artefact — must NOT ship in a release tag
+# (a src/idf_component.yml turns on the IDF component manager for downstream builders)
+src/idf_component.yml
