@@ -147,6 +147,21 @@ const char* probeFailReasonStr(ProbeFailReason r) {
     }
 }
 
+// deviceID-Chokepoint-Validierung: die ID landet UI-seitig in onclick-Strings,
+// Attribut-Selektoren und URL-Pfaden — ein feindliches Geraet mit praeparierter
+// /info-deviceID (Quotes/Klammern) waere stored XSS. Echte SoundTouch-IDs sind
+// 12 Hex-Zeichen; wir lassen defensiv alnum bis 24 zu und blocken alles andere
+// an der EINZIGEN Einlese-Stelle (probeIp_) + beim NVS-Load (Altbestand).
+static bool deviceIdSafe_(const String& id) {
+    if (id.length() == 0 || id.length() > 24) return false;
+    for (size_t i = 0; i < id.length(); i++) {
+        char c = id[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+              (c >= 'a' && c <= 'z'))) return false;
+    }
+    return true;
+}
+
 void SpeakerInventory::loadFromNVS() {
     LockGuard g(*this);
     JsonDocument doc;
@@ -158,6 +173,10 @@ void SpeakerInventory::loadFromNVS() {
     for (JsonObject o : doc["speakers"].as<JsonArray>()) {
         Speaker s;
         s.deviceId   = (const char*)o["deviceId"];
+        if (!deviceIdSafe_(s.deviceId)) {   // Altbestand-Hygiene (Chokepoint s.o.)
+            Serial.printf("[inv] NVS entry with unsafe deviceID skipped\n");
+            continue;
+        }
         s.name       = (const char*)o["name"];
         s.model      = (const char*)o["model"];
         s.firmware   = (const char*)o["firmware"];
@@ -168,6 +187,7 @@ void SpeakerInventory::loadFromNVS() {
         s.ownedByUs  = o["ownedByUs"] | false;
         s.lastSeenMs = 0;  // resetten nach reboot
         s.groupId    = (const char*)(o["groupId"] | "");
+        s.hidden     = o["hidden"] | false;
         if (o["mediaServerUuids"].is<JsonArray>()) {
             for (JsonVariant v : o["mediaServerUuids"].as<JsonArray>()) {
                 s.mediaServerUuids.emplace_back((const char*)v);
@@ -187,7 +207,7 @@ void SpeakerInventory::loadFromNVS() {
                   (unsigned)speakers_.size());
 }
 
-void SpeakerInventory::saveToNVS() {
+bool SpeakerInventory::saveToNVS() {
     LockGuard g(*this);
     JsonDocument doc;
     JsonArray arr = doc["speakers"].to<JsonArray>();
@@ -203,6 +223,7 @@ void SpeakerInventory::saveToNVS() {
         o["cloudUrl"]  = s.cloudUrl;
         o["ownedByUs"] = s.ownedByUs;
         o["groupId"]   = s.groupId;
+        if (s.hidden) o["hidden"] = true;   // nur wenn gesetzt — spart Blob-Bytes
         if (!s.mediaServerUuids.empty()) {
             JsonArray msa = o["mediaServerUuids"].to<JsonArray>();
             for (const auto& uuid : s.mediaServerUuids) msa.add(uuid);
@@ -216,7 +237,14 @@ void SpeakerInventory::saveToNVS() {
             }
         }
     }
-    nvsSaveJsonWithCleanup(NVS_NS, NVS_KEY, doc);
+    bool ok = nvsSaveJsonWithCleanup(NVS_NS, NVS_KEY, doc);
+    if (!ok) {
+        // Sichtbar machen statt still verlieren (Analog preset_store.save_fails;
+        // die Callsites melden dem Client sonst 200 trotz verlorenem Write).
+        saveFails_++;
+        Serial.printf("[inv] saveToNVS FAILED (#%u)\n", (unsigned)saveFails_);
+    }
+    return ok;
 }
 
 void SpeakerInventory::mergeSpeaker_(const Speaker& s) {
@@ -307,6 +335,12 @@ bool SpeakerInventory::probeIp_(const String& ip, Speaker& out,
         Serial.printf("[probe] %s <info> present but deviceID attribute empty\n", ip.c_str());
         setFail(ProbeFailReason::NO_DEVICE_ID,
                 "<info> tag present but deviceID attribute empty");
+        return false;
+    }
+    if (!deviceIdSafe_(out.deviceId)) {
+        Serial.printf("[probe] %s deviceID rejected (non-alnum or >24 chars)\n", ip.c_str());
+        setFail(ProbeFailReason::NO_DEVICE_ID,
+                "deviceID contains invalid characters (alnum, max 24 expected)");
         return false;
     }
     Serial.printf("[probe] %s OK after %u ms — %s (%s)\n",
@@ -1133,6 +1167,20 @@ bool SpeakerInventory::remove(const String& deviceId) {
         if (it->deviceId == deviceId) {
             speakers_.erase(it);
             saveToNVS();
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SpeakerInventory::setHidden(const String& deviceId, bool hidden) {
+    LockGuard g(*this);  // rekursiv — saveToNVS() nimmt ihn erneut
+    for (auto& s : speakers_) {
+        if (s.deviceId == deviceId) {
+            if (s.hidden != hidden) {
+                s.hidden = hidden;
+                saveToNVS();
+            }
             return true;
         }
     }

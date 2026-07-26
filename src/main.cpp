@@ -37,6 +37,7 @@
 #include "gabbo_ws.h"
 #include "gabbo_watcher.h"
 #include "ui_auth.h"
+#include "host_settings.h"
 
 static AsyncWebServer boseServer(BOSE_HTTP_PORT);
 static AsyncWebServer uiServer(UI_HTTP_PORT);
@@ -81,12 +82,14 @@ static void connectWifi() {
 }
 
 static void startMDNS() {
-    if (!MDNS.begin(MDNS_HOSTNAME)) { Serial.println("[mdns] failed"); return; }
+    // Hostname aus NVS-Override oder Default (Zwei-Stick-Betrieb, s.
+    // host_settings.h) — DHCP-seitig setzt provisionWifi() denselben Wert.
+    if (!MDNS.begin(sixback::hostname().c_str())) { Serial.println("[mdns] failed"); return; }
     MDNS.addService("http", "tcp", UI_HTTP_PORT);
     MDNS.addService("sixback", "tcp", BOSE_HTTP_PORT);
     MDNS.addServiceTxt("sixback", "tcp", "version", FW_VERSION_STRING);
     MDNS.addServiceTxt("sixback", "tcp", "build",   FW_BUILD_DATE);
-    Serial.printf("[mdns] %s.local advertised\n", MDNS_HOSTNAME);
+    Serial.printf("[mdns] %s.local advertised\n", sixback::hostname().c_str());
 }
 
 static void startBoseServer() {
@@ -103,7 +106,7 @@ static void startUiServer() {
     uiServer.begin();              // routes already registered early in setup()
     Serial.printf("[ui]   web/api listening on http://%s:%d/\n",
                   WiFi.localIP().toString().c_str(), UI_HTTP_PORT);
-    Serial.printf("[ui]   mDNS: http://%s.local/\n", MDNS_HOSTNAME);
+    Serial.printf("[ui]   mDNS: http://%s.local/\n", sixback::hostname().c_str());
 }
 
 static void initInventory() {
@@ -164,9 +167,9 @@ void setup() {
     sixback::startGabboWatcher();    // #15 HW-Tasten-Re-Arm (no-op wenn Flag off)
 
     Serial.println();
-    Serial.printf("[setup] SixBack ready - UI: http://%s.local/\n", MDNS_HOSTNAME);
+    Serial.printf("[setup] SixBack ready - UI: http://%s.local/\n", sixback::hostname().c_str());
     Serial.printf("[setup] Trigger speaker discovery: curl -X POST http://%s.local/api/speakers/discover\n",
-                  MDNS_HOSTNAME);
+                  sixback::hostname().c_str());
 }
 
 void loop() {

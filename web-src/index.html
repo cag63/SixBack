@@ -51,6 +51,7 @@
     background: var(--card); border: 1px solid var(--line);
     border-radius: 8px; padding: 1em; margin-bottom: .8em;
   }
+  .speaker.spk-hidden { opacity: .55; }   /* im Reveal-Modus sichtbar-gedimmt */
   .speaker-head { display: flex; justify-content: space-between; align-items: start;
                   gap: 1em; flex-wrap: wrap; }
   .speaker-title { font-weight: 600; font-size: 1.05em; }
@@ -611,6 +612,8 @@
 <div class="topbar">
   <img src="/assets/sixback-mark.png" alt="" style="height:1.7em; vertical-align:-.35em; margin-right:.35em">
   <h1 style="display:inline">SixBack</h1>
+  <span class="pill offline" id="save-fails-badge" style="display:none"
+        title="NVS preset-store writes failed since boot — recent preset changes may not survive a reboot. See the System panel.">…</span>
   <div class="meta" id="status-meta">…</div>
 </div>
 <p class="subline">Bring your Six back — local SoundTouch cloud replacement. Discover speakers on the LAN, migrate them, manage presets — all from this page.</p>
@@ -748,6 +751,20 @@
     the speaker's own controls stay reachable on the LAN — this is deterrence,
     not network isolation. Forgot the password? Send <code>auth-reset</code>
     over the USB serial console.
+  </span>
+</div>
+
+<div class="automode-bar" id="hostname-bar" style="margin-top:1em">
+  <span class="label">Hostname (.local):</span>
+  <input type="text" id="host-input" maxlength="24" pattern="[a-z0-9-]+"
+         placeholder="sixback" style="width:11em">
+  <button onclick="saveHostname()">Save</button>
+  <span class="pill" id="host-pill">…</span>
+  <span class="detail">
+    Default <code>sixback</code> — change this when you run <b>two SixBack
+    sticks</b> in one network (both would otherwise announce
+    <code>sixback.local</code>). Allowed: a-z, 0-9, dash; max 24 chars.
+    Leave empty + Save to reset. Takes effect after a reboot.
   </span>
 </div>
 
@@ -1018,6 +1035,24 @@ async function loadStatus() {
     document.getElementById('fw-installed').textContent = s.version;
     document.getElementById('fw-builddate').textContent = s.build;
 
+    // Preset-Store-Degradation sichtbar machen (A/B-Slot-Save, v0.8.34):
+    // save_fails ist ein Seit-Boot-Zaehler; load_ok=false = Store beim Boot
+    // nicht ladbar. Beides rot im Header — sonst merkt der User erst nach
+    // dem naechsten Reboot, dass Preset-Aenderungen nicht persistiert wurden.
+    const ps = s.preset_store || {};
+    const sf = ps.save_fails|0;
+    const isf = ((s.inventory || {}).save_fails)|0;
+    const storeBad = sf > 0 || isf > 0 || ps.load_ok === false;
+    const sfB = document.getElementById('save-fails-badge');
+    if (sfB) {
+      const parts = [];
+      if (ps.load_ok === false) parts.push('load failed');
+      if (sf > 0)  parts.push(`${sf} preset save fail${sf === 1 ? '' : 's'}`);
+      if (isf > 0) parts.push(`${isf} inventory save fail${isf === 1 ? '' : 's'}`);
+      sfB.textContent = '⚠ store: ' + parts.join(' · ');
+      sfB.style.display = storeBad ? '' : 'none';
+    }
+
     const h = s.health || {};
     const heapKind  = s.heap.free < 30*1024 ? 'bad'
                     : s.heap.free < 60*1024 ? 'warn' : 'ok';
@@ -1039,6 +1074,10 @@ async function loadStatus() {
       sysCell('Last Reset',  lastReset, lastKind),
       sysCell('Boot #',      h.boot_count|0),
       sysCell('Crashes',     h.crash_count|0,    crashKind),
+      sysCell('Store saves', (sf > 0 || ps.load_ok === false)
+                ? (ps.load_ok === false ? 'LOAD FAILED' : `${sf} FAILED`) : 'ok',
+              (sf > 0 || ps.load_ok === false) ? 'bad' : 'ok'),
+      sysCell('Inventory saves', isf > 0 ? `${isf} FAILED` : 'ok', isf > 0 ? 'bad' : 'ok'),
       sysCell('WiFi Reboots',h.wifi_reboots|0),
       sysCell('Heap Reboots',h.heap_reboots|0),
       sysCell('WiFi down',   wifiDown ? fmtUptime(wifiDown) : '—', wifiKind),
@@ -1067,6 +1106,7 @@ async function loadStatus() {
   loadAutoMode();
   loadDiagShare();
   loadUiAuth();
+  loadHostname();
 }
 
 // ---- Auto-Mode toggle ----
@@ -1156,6 +1196,34 @@ async function toggleDiagShare(en) {
              : 'Diagnostic sharing disabled', 'success');
   } catch (e) { toast('Diag-Share toggle failed: '+e.message, 'error'); }
   loadDiagShare();
+}
+
+// ---- Konfigurierbarer mDNS-Hostname (Zwei-Stick-Betrieb) ----
+async function loadHostname() {
+  try {
+    const j = await api('/api/hostname');
+    const inp = document.getElementById('host-input');
+    // j.hostname = persistierter (ggf. pending) Wert, j.active = laeuft seit
+    // Boot. Feld zeigt den persistierten Wert — springt nach Save NICHT auf
+    // den Boot-Wert zurueck (Review-Fund v0.8.35).
+    if (document.activeElement !== inp) inp.value = j.hostname || '';
+    document.getElementById('host-pill').textContent = j.pending_reboot
+      ? `${j.active}.local → ${j.hostname}.local after reboot`
+      : (j.hostname || '?') + '.local';
+  } catch (e) { /* silent — page-load tick, no toast */ }
+}
+
+async function saveHostname() {
+  const inp = document.getElementById('host-input');
+  try {
+    const j = await api('/api/hostname', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({hostname: inp.value.trim()})
+    });
+    toast(`Hostname saved: ${j.hostname}.local — takes effect after reboot`, 'success');
+    loadHostname();
+  } catch (e) { toast('Hostname not saved: ' + e.message, 'error'); }
 }
 
 // ---- Web-UI password protection (Issue #31: default OFF, opt-in) ----
@@ -1677,6 +1745,23 @@ function renderSpeakers() {
   const host = document.getElementById('speakers-host');
   const myBase = STATE.myBase || '';
 
+  // Hidden-Filter (fremde/Nachbar-Boxen, FHEM 144729): versteckte Speaker
+  // werden nicht gerendert -> loadPresetsFor/Zone-Polls entfallen fuer sie
+  // mit (spart den Per-Speaker-Fetch-Fan-out). Reveal-Zustand fluechtig in
+  // localStorage, Hide-Flag selbst kommt persistent vom Backend (s.hidden).
+  if (STATE.showHidden === undefined) {
+    try { STATE.showHidden = localStorage.SIXBACK_SHOW_HIDDEN === '1'; }
+    catch (e) { STATE.showHidden = false; }
+  }
+  const showHidden   = !!STATE.showHidden;
+  const visible      = STATE.speakers.filter(s => !s.hidden || showHidden);
+  const hiddenCount  = STATE.speakers.filter(s => s.hidden).length;
+
+  // Toggle-Zeile vor dem Card-Diff entfernen — sie darf das Order-Diff
+  // (cursor = host.firstElementChild) nicht stoeren; kommt unten neu ans Ende.
+  const oldToggle = document.getElementById('hidden-toggle-line');
+  if (oldToggle) oldToggle.remove();
+
   if (STATE.speakers.length === 0) {
     host.innerHTML = `<div class="speaker"><p style="color:var(--mute)">No speakers known yet. Click "Discover speakers" or "Add manually".</p></div>`;
     return;
@@ -1693,7 +1778,7 @@ function renderSpeakers() {
   }
 
   const wanted = new Set();
-  for (const s of STATE.speakers) {
+  for (const s of visible) {
     wanted.add(s.device_id);
     const prev = existing.get(s.device_id);
     if (prev) {
@@ -1705,24 +1790,41 @@ function renderSpeakers() {
       host.appendChild(tmp.firstElementChild);
       loadPresetsFor(s.device_id);
     }
+    const card = host.querySelector(`.speaker[data-device-id="${s.device_id}"]`);
+    if (card) card.classList.toggle('spk-hidden', !!s.hidden);
   }
 
   // Reihenfolge anpassen falls Backend sortiert hat.
   let cursor = host.firstElementChild;
-  for (const s of STATE.speakers) {
+  for (const s of visible) {
     const card = host.querySelector(`.speaker[data-device-id="${s.device_id}"]`);
     if (!card) continue;
     if (card !== cursor) host.insertBefore(card, cursor);
     cursor = card.nextElementSibling;
   }
 
-  // Cards die nicht mehr im State sind: weg.
+  // Cards die nicht mehr im State sind (geloescht ODER frisch versteckt): weg.
   for (const [id, el] of existing) {
     if (!wanted.has(id)) el.remove();
   }
 
   // Issue #7: refresh the header status dots after add/update/reorder.
-  for (const s of STATE.speakers) updateSpeakerDot_(s.device_id);
+  for (const s of visible) updateSpeakerDot_(s.device_id);
+
+  if (hiddenCount > 0) {
+    const t = document.createElement('div');
+    t.id = 'hidden-toggle-line';
+    t.style.cssText = 'margin:.4em 0 .8em; color:var(--mute); cursor:pointer; user-select:none; font-size:.9em';
+    t.textContent = showHidden
+      ? `▾ ${hiddenCount} hidden speaker(s) shown dimmed — click to collapse`
+      : `▸ ${hiddenCount} hidden speaker(s) — click to show`;
+    t.onclick = () => {
+      STATE.showHidden = !STATE.showHidden;
+      try { localStorage.SIXBACK_SHOW_HIDDEN = STATE.showHidden ? '1' : '0'; } catch (e) {}
+      renderSpeakers();
+    };
+    host.appendChild(t);
+  }
 }
 
 // In-place Update der mutablen Card-Bestandteile (Status-Pill, Info-Zeile,
@@ -1786,6 +1888,9 @@ function actionButtonsHtml(s) {
     `<button title="Upload a previously exported preset-set JSON for this speaker (replaces store; push to hardware afterwards)" onclick="importPresetsSet('${s.device_id}')">⬆ Import</button>` +
     `<button title="Download diagnostic snapshot — BMX endpoints + Telnet config — to send us for unsupported-source debugging" onclick="downloadSnapshot('${s.device_id}')">📋 Snapshot</button>` +
     `<button title="Restore the speaker's preset state captured at first migration. Useful if you overwrote slots while experimenting." onclick="openRestorePreMigration('${s.device_id}')">⏮ Restore</button>` +
+    (s.hidden
+      ? `<button title="Show this speaker in the list again" onclick="setSpeakerHidden('${s.device_id}',false)">👁 Unhide</button>`
+      : `<button title="Hide this speaker from the list — it stays served and monitored, just not shown. For boxes that belong to a neighbour or a second stick." onclick="setSpeakerHidden('${s.device_id}',true)">🙈 Hide</button>`) +
     `<button class="danger" onclick="removeSpeaker('${s.device_id}')">✕</button>`;
 }
 
@@ -2872,7 +2977,7 @@ function renderZoneRow_(devId) {
     const existing = document.getElementById('zonepick-' + devId);
     if (existing && existing.value) return;
     const others = (STATE.speakers || []).filter(s =>
-      s.device_id && s.device_id !== devId && (s.status || '') !== 'OFFLINE');
+      s.device_id && s.device_id !== devId && !s.hidden && (s.status || '') !== 'OFFLINE');
     if (others.length === 0) { row.innerHTML = ''; return; }
     const opts = others.map(s =>
       `<option value="${esc(s.device_id)}">${esc(s.name || s.device_id)}</option>`).join('');
@@ -2978,7 +3083,7 @@ function renderStereoRow_(devId) {
     const existing = document.getElementById('stereopick-' + devId);
     if (existing && existing.value) return;
     const others = (STATE.speakers || []).filter(s =>
-      s.device_id && s.device_id !== devId &&
+      s.device_id && s.device_id !== devId && !s.hidden &&
       /SoundTouch 10\b/i.test(s.model || '') && (s.status || '') !== 'OFFLINE');
     if (others.length === 0) { row.innerHTML = ''; return; }
     const opts = others.map(s =>
@@ -3136,6 +3241,9 @@ function startNowPlayingPoll() {
   const tick = () => {
     (STATE.speakers || []).forEach(s => {
       if (!s.device_id) return;
+      // Versteckte Speaker haben keine Card -> Polling komplett sparen
+      // (ausser der User hat den Reveal-Modus an).
+      if (s.hidden && !STATE.showHidden) return;
       pollNowPlaying(s.device_id);   // cache-served, cheap — every speaker
       // Zone is a live GET on the speaker; only fetch it for expanded cards
       // (the zone row is hidden on collapsed cards anyway). Bounds blocking load.
@@ -3616,6 +3724,7 @@ function refreshSidebarTargets() {
   const opts = [];
   if (caps.speakersOk) {
     for (const s of STATE.speakers) {
+      if (s.hidden) continue;   // versteckte Boxen nicht als Preview-Ziel anbieten
       const label = (s.name || s.device_id).replace(/[<>&"']/g, '');
       const dis = (s.status === 'offline') ? ' disabled' : '';
       const dot = (s.status === 'offline') ? '⚫' : '🔊';
@@ -3963,7 +4072,7 @@ STATE.dlnaItems           = { containers: [], items: [] };
 function refreshDlnaSpeakerPicker() {
   const sel = document.getElementById('dlna-speaker');
   if (!sel) return;
-  const speakers = STATE.speakers || [];
+  const speakers = (STATE.speakers || []).filter(s => !s.hidden);
   if (speakers.length === 0) {
     sel.innerHTML = '<option value="">No speakers known</option>';
     return;
@@ -4470,9 +4579,23 @@ async function actRebootWithProgress(devId) {
 }
 
 async function removeSpeaker(devId) {
-  if (!confirm('Remove speaker from ESP inventory? (The speaker itself is untouched.)')) return;
+  if (!confirm('Remove speaker from ESP inventory? (The speaker itself is untouched. '
+             + 'Note: discovery may re-add it — use Hide to keep it out of the list permanently.)')) return;
   try { await api('/api/speakers/'+encodeURIComponent(devId), {method:'DELETE'}); await loadSpeakers(); toast('Removed'); }
   catch(e) { toast(e.message, 'error'); }
+}
+
+async function setSpeakerHidden(devId, hidden) {
+  try {
+    await api('/api/speakers/hide', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({device_id: devId, hidden: !!hidden})
+    });
+    toast(hidden ? 'Speaker hidden — still served + monitored, just not shown'
+                 : 'Speaker visible again', 'success');
+    await loadSpeakers();
+  } catch (e) { toast('Hide failed: ' + e.message, 'error'); }
 }
 
 // ---- Per-speaker Export/Import preset-set ----
@@ -5096,9 +5219,10 @@ async function deletePreset() {
 function openGroupSyncModal() {
   const src = document.getElementById('g-source');
   const tgts = document.getElementById('g-targets');
-  src.innerHTML = STATE.speakers.map(s =>
+  const vis = STATE.speakers.filter(s => !s.hidden);   // wie Zone/Stereo/DLNA-Picker
+  src.innerHTML = vis.map(s =>
     `<option value="${s.device_id}">${esc(s.name)} (${s.ip})</option>`).join('');
-  tgts.innerHTML = STATE.speakers.map(s =>
+  tgts.innerHTML = vis.map(s =>
     `<option value="${s.device_id}">${esc(s.name)} (${s.ip})</option>`).join('');
   openModal('modal-group');
 }
@@ -5184,7 +5308,7 @@ function openModal(id) { document.getElementById(id).classList.add('open'); }
 function closeModal(id) { document.getElementById(id).classList.remove('open'); }
 
 // ---- Utility ----
-function esc(s) { return String(s||'').replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function esc(s) { return String(s||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 // ============================================================================
 // Progress modal helpers

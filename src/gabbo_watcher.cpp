@@ -260,6 +260,15 @@ void startGabboWatcher() {
     static bool started = false;
     if (started) return;
     started = true;
+    // Der s3-Build (qio_opi, BOARD_HAS_PSRAM) laeuft im Feld auch auf Boards
+    // OHNE bestuecktes PSRAM (S3-R2/FN8). Dort degradieren Spotify/mbedtls-
+    // Hook/Outbound-Floors bereits runtime — gabbo zieht als letztes nach:
+    // keine 4 Dauer-Sockets + 8KB-Task auf dem knappen internen Heap.
+    // g_supMtx bleibt nullptr -> gabboMarkSelfSelect() ist sauberes no-op.
+    if (ESP.getPsramSize() == 0) {
+        Serial.println("[gabbo] no PSRAM -> watcher disabled");
+        return;
+    }
     g_supMtx = xSemaphoreCreateMutex();
     BaseType_t r = xTaskCreate(watcherTask_, "gabbo-watch", 8192,
                                nullptr, tskIDLE_PRIORITY + 1, nullptr);

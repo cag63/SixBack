@@ -59,6 +59,11 @@ struct Speaker {
                             // nach einem einzelnen verfehlten Durchlauf (FHEM #49 fred).
     uint32_t lastSeenMs;
     String groupId;         // freitext, default ""
+    bool hidden = false;    // WebUI-Ausblendung (fremde/Nachbar-Boxen, FHEM
+                            // 144729). Reine Anzeige-Semantik: Auto-Mode/
+                            // Cloud-Mock/BMX bedienen den Speaker weiter.
+                            // Persistiert im Inventory-Blob; mergeSpeaker_
+                            // fasst es nicht an -> re-discovery-fest.
 
     // DLNA-Server-UUIDs die dieser Speaker via /listMediaServers sieht.
     // Werden vom Speaker bei jedem account/full erwartet als sourceAccount-
@@ -117,8 +122,12 @@ public:
     // Laedt persistierte Speaker aus NVS in den RAM-cache.
     void loadFromNVS();
 
-    // Persistiert aktuellen Cache.
-    void saveToNVS();
+    // Persistiert aktuellen Cache. false = NVS-Write fehlgeschlagen (zaehlt
+    // saveFails_ hoch — /api/status inventory.save_fails, UI-Badge).
+    bool saveToNVS();
+
+    // Fehlgeschlagene saveToNVS() seit Boot (runtime-only, kein NVS).
+    uint32_t saveFails() const { return saveFails_; }
 
     // Zweistufige Discovery: synchron werden knownIpProbe + SSDP-M-SEARCH
     // ausgefuehrt (~5 s), danach return. Der teure /24-Active-Scan laeuft
@@ -183,6 +192,10 @@ public:
     // Loescht einen Speaker aus dem Cache (nicht vom Geraet).
     bool remove(const String& deviceId);
 
+    // Setzt/loescht das WebUI-Ausblendungs-Flag (persistiert). false wenn
+    // deviceId unbekannt.
+    bool setHidden(const String& deviceId, bool hidden);
+
     // Setzt die Anzeige-Reihenfolge der Speaker. `deviceIdOrder` listet die
     // gewuenschte Reihenfolge; nicht genannte (neu entdeckte) Speaker bleiben
     // in ihrer bisherigen relativen Reihenfolge hinten angehaengt. Die Order
@@ -204,6 +217,7 @@ public:
 
 private:
     SpeakerInventory() = default;
+    uint32_t saveFails_ = 0;   // fehlgeschlagene saveToNVS() seit Boot
     void mergeSpeaker_(const Speaker& s);
     bool probeIp_(const String& ip, Speaker& out,
                   uint16_t connectMs = 800, uint16_t readMs = 1500,

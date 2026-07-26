@@ -79,13 +79,23 @@
     <b>Update existing</b> for a stick that already runs SixBack.
   </p>
   <div class="warn">
-    <strong>ESP32-S3-DevKitC-1 has two USB sockets — flash over the one labelled <code>UART</code>.</strong>
-    That socket appears as a <code>CH340</code>/<code>CH343</code> serial port. If you flash over
-    the board's other, native <code>USB</code> socket instead, the flash still succeeds, but the
-    browser's <b>“Connect device to Wi-Fi”</b> step afterwards will <em>not</em> appear — SixBack
-    answers the provisioning handshake only on the <code>UART</code> port. You'd then have to set up
-    WiFi through the <code>SixBack-…</code> hotspot the stick opens instead. Single-socket boards
-    (XIAO&nbsp;S3, ESP32-C3&nbsp;/&nbsp;C6&nbsp;/&nbsp;C5) have only one port and are unaffected.
+    <strong>ESP32-S3-DevKitC-1 has two USB sockets — since <b>v0.8.35</b> you can use either one.</strong>
+    The socket labelled <code>UART</code> appears as a <code>CH340</code>/<code>CH343</code> serial
+    port and also carries the console log. The board's native <code>USB</code> socket now works for
+    the complete run as well — factory flash <em>and</em> the <b>“Connect device to Wi-Fi”</b> step
+    have been verified end-to-end over it, because this image answers the provisioning handshake on
+    both ports. <b>Releases before v0.8.35 answered on the <code>UART</code> port only.</b>
+    <br><br>
+    Two harmless things you may notice in the browser's developer console: an
+    <em>“Error fetching current state: TIMEOUT”</em> appears at roughly 88&nbsp;% of the flash — that
+    is the tool's provisioning check timing out while the chip is still in download mode, the flash
+    continues and completes normally. And on the native <code>USB</code> socket the console log
+    shares the port with the handshake, so in rare cases the browser may report <em>“Improv Wi-Fi
+    Serial not detected”</em>; if that happens, or if a run stops at
+    <code>Hard resetting via RTS pin</code>, just retry, use the <code>UART</code> socket, or set up
+    Wi-Fi through the <code>SixBack-…</code> hotspot the stick opens. Single-socket boards
+    (XIAO&nbsp;S3, ESP32-C3&nbsp;/&nbsp;C6&nbsp;/&nbsp;C5) have only one port and are flashed and
+    provisioned over it as usual.
   </div>
   <hr style="border:none; border-top:1px solid var(--mute); opacity:.3; margin:1.2em 0">
   <h3 style="margin:.2em 0 .4em">ESP32-S3 with 8&nbsp;MB flash (Seeed XIAO ESP32S3 &amp; similar)</h3>

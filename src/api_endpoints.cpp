@@ -36,6 +36,7 @@
 #include <esp_heap_caps.h>
 #include "speaker_diagnostic.h"
 #include "diag_settings.h"
+#include "host_settings.h"
 #include "spotify_player.h"
 #include "stream_library.h"
 #include <Arduino.h>
@@ -319,7 +320,7 @@ void handleStatus(AsyncWebServerRequest* req) {
     wifi["channel"]   = WiFi.channel();
     wifi["band"]      = (WiFi.getBand() == WIFI_BAND_5G) ? "5GHz" : "2.4GHz";
     wifi["mac"]       = WiFi.macAddress();
-    wifi["hostname"]  = String(MDNS_HOSTNAME) + ".local";
+    wifi["hostname"]  = sixback::hostname() + ".local";
     wifi["improv_active"]   = sixback::improvIsActive();
     wifi["improv_window_s"] = sixback::improvWindowRemainingS();
     wifi["captive_active"]   = sixback::captiveIsActive();
@@ -374,6 +375,10 @@ void handleStatus(AsyncWebServerRequest* req) {
         pstore["save_fails"] = ps.saveFails();
         pstore["speakers"]   = (uint32_t)ps.speakerCount();
     }
+    // Analog fuer das Speaker-Inventory (hidden/order/ownership-Writes):
+    // die Callsites antworten 200 auch bei NVS-Fail — der Zaehler macht das
+    // im Status + UI-Badge sichtbar.
+    doc["inventory"]["save_fails"] = sixback::SpeakerInventory::instance().saveFails();
 
     // Health-Snapshot: boot/crash-counter, last reset reason, watchdog state
     JsonObject health = doc["health"].to<JsonObject>();
@@ -406,6 +411,7 @@ void emitSpeakers(AsyncWebServerRequest* req, JsonDocument& doc) {
         o["sources_ready"] = s.sourcesReady;  // Issue #10: false = migriert aber
                                               // TUNEIN-Source fehlt -> Re-Sync noetig
         o["group_id"]    = s.groupId;
+        o["hidden"]      = s.hidden;   // WebUI-Ausblendung (Anzeige-Semantik)
         // Anzahl belegter Preset-Slots
         int n = 0;
         for (auto& p : ps.getForSpeaker(s.deviceId)) {
@@ -539,6 +545,23 @@ void handleSpeakersOrder(AsyncWebServerRequest* req, JsonDocument& body) {
     }
     sixback::SpeakerInventory::instance().reorder(ids);
     req->send(200, "application/json", "{\"ok\":true}");
+}
+
+// POST /api/speakers/hide  body {"device_id":"...","hidden":true|false}
+// Blendet einen Speaker in der WebUI aus (fremde/Nachbar-Boxen, FHEM 144729).
+// Reine Anzeige-Semantik: Auto-Mode, Cloud-Mock und BMX bedienen den Speaker
+// unveraendert weiter; das Flag lebt im Inventory (reboot- + re-discovery-fest,
+// mergeSpeaker_ fasst es nicht an).
+void handleSpeakerHide(AsyncWebServerRequest* req, JsonDocument& body) {
+    if (!body["device_id"].is<const char*>() || !body["hidden"].is<bool>()) {
+        req->send(400, "application/json",
+                  "{\"error\":\"device_id string + hidden bool required\"}");
+        return;
+    }
+    bool ok = sixback::SpeakerInventory::instance().setHidden(
+        body["device_id"].as<String>(), body["hidden"].as<bool>());
+    req->send(ok ? 200 : 404, "application/json",
+              ok ? "{\"ok\":true}" : "{\"error\":\"not found\"}");
 }
 
 // -----------------------------------------------------------------------------
@@ -3656,6 +3679,51 @@ void handlePutDiagShare(AsyncWebServerRequest* req, JsonDocument& body) {
 }
 
 // -----------------------------------------------------------------------------
+// Konfigurierbarer mDNS-/DHCP-Hostname (Zwei-Stick-Betrieb, FHEM 144729).
+// PUT persistiert nur — mDNS + DHCP-Hostname greifen beim naechsten Boot
+// (reboot_required:true), Live-Restart des mDNS-Stacks ist bewusst nicht
+// implementiert (ungetestet gegen laufende AsyncWebServer-Verbindungen).
+// -----------------------------------------------------------------------------
+void handleGetHostname(AsyncWebServerRequest* req) {
+    // hostname = persistierter NVS-Wert (nach PUT ggf. noch nicht aktiv),
+    // active = was seit Boot laeuft. Ohne die Trennung springt das UI-Feld
+    // nach einem Save auf den Boot-Wert zurueck (Review-Fund v0.8.35).
+    JsonDocument doc;
+    String persisted = sixback::persistedHostname();
+    doc["hostname"]       = persisted;
+    doc["active"]         = sixback::hostname();
+    doc["pending_reboot"] = (persisted != sixback::hostname());
+    doc["default"]        = MDNS_HOSTNAME;
+    String b; serializeJson(doc, b);
+    req->send(200, "application/json", b);
+}
+
+void handlePutHostname(AsyncWebServerRequest* req, JsonDocument& body) {
+    if (!body["hostname"].is<const char*>()) {
+        req->send(400, "application/json", "{\"error\":\"hostname string required\"}");
+        return;
+    }
+    String h = body["hostname"].as<String>();
+    JsonDocument resp;
+    if (h.length()) {                      // Leerstring = Reset auf Default
+        String err;
+        if (!sixback::isValidHostname(h, err)) {
+            resp["error"] = err;
+            String b; serializeJson(resp, b);
+            req->send(400, "application/json", b);
+            return;
+        }
+    }
+    bool saved = sixback::saveHostname(h);
+    resp["ok"] = saved;
+    resp["hostname"] = h.length() ? h : String(MDNS_HOSTNAME);
+    resp["reboot_required"] = true;
+    if (!saved) resp["error"] = "nvs write failed — setting not persisted";
+    String b; serializeJson(resp, b);
+    req->send(saved ? 200 : 500, "application/json", b);
+}
+
+// -----------------------------------------------------------------------------
 // Issue #31 — optionaler Web-UI-Zugriffsschutz (Digest, default AUS).
 // Gated wird ueber die Middleware am uiServer; diese Endpoints verwalten nur
 // die Konfiguration. GET gibt NIE den Passwort-Hash heraus.
@@ -4282,6 +4350,7 @@ void registerApiEndpoints(AsyncWebServer& ui) {
     ui.on("/api/speakers/discover",   HTTP_POST,   handleDiscover);
     routeJsonBody(ui, "/api/speakers/add", HTTP_POST, handleSpeakerAdd);
     routeJsonBody(ui, "/api/speakers/order", HTTP_POST, handleSpeakersOrder);
+    routeJsonBody(ui, "/api/speakers/hide", HTTP_POST, handleSpeakerHide);
     routeT(ui, "^/api/speakers/([^/]+)$",  HTTP_DELETE, handleSpeakerDelete);
 
     // Stream-Library (custom radio-stream tiles) — device-side, not Spotify-gated.
@@ -4363,6 +4432,9 @@ void registerApiEndpoints(AsyncWebServer& ui) {
 
     ui.on("/api/diag-share",         HTTP_GET,  handleGetDiagShare);
     routeJsonBody(ui, "/api/diag-share", HTTP_PUT, handlePutDiagShare);
+
+    ui.on("/api/hostname",           HTTP_GET,  handleGetHostname);
+    routeJsonBody(ui, "/api/hostname", HTTP_PUT, handlePutHostname);
 
     ui.on("/api/ui-auth",            HTTP_GET,  handleGetUiAuth);
     routeJsonBody(ui, "/api/ui-auth", HTTP_PUT, handlePutUiAuth);
